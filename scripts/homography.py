@@ -25,8 +25,10 @@ import argparse
 import json
 import math
 import os
+import sys
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -51,6 +53,11 @@ except Exception as e:
         "camera_handler module is required (scripts.camera_handler).\n\n"
         f"Import error: {e}"
     )
+
+
+def log(msg: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 
 #file functions
@@ -508,19 +515,28 @@ def run_once(base_dir: Path) -> None:
     if not cfg_path.exists():
         raise SystemExit(f"Missing config file: {cfg_path}")
 
+    log(f"run_once starting (base_dir={base_dir})")
     config = load_json(cfg_path)
 
     if "CharucoBoard" not in config or not isinstance(config["CharucoBoard"], dict):
         raise SystemExit("Missing required config section: CharucoBoard")
     cbcfg = config["CharucoBoard"]
     if not bool(cbcfg["BeginScanning"]):
-        print("CharucoBoard.BeginScanning is false; nothing to do.")
+        log("CharucoBoard.BeginScanning is false; nothing to do.")
         return
 
+    completed = False
     try:
         if "Board" not in cbcfg or not isinstance(cbcfg["Board"], dict):
             raise SystemExit("Missing required config section: CharucoBoard.Board")
         board_spec = board_from_new_config(cbcfg)
+
+        log(
+            "Charuco board loaded: "
+            f"SquaresX={board_spec.squares_x}, SquaresY={board_spec.squares_y}, "
+            f"SquareSize={board_spec.square_length}, ArucoSize={board_spec.marker_length}, "
+            f"Dictionary={board_spec.dictionary_name}"
+        )
 
         # Tuning parameters. Provide defaults so older/minimal config.json still works.
         # If RansacReprojThresholdPx isn't present, choose a default relative to square size.
@@ -546,10 +562,15 @@ def run_once(base_dir: Path) -> None:
 
         board, aruco_dict = build_charuco_board(board_spec)
 
+        log("Querying camera_handler for cameras...")
         states = camera_handler.get_camera_states()
         available_macs = list(states.keys())
         cam_keys = enabled_camera_macs(config, available_macs)
-        print(f"Running scan for {len(cam_keys)} camera(s).")
+        log(f"Running scan for {len(cam_keys)} camera(s).")
+        if not cam_keys:
+            log("No cameras selected for scanning.")
+            completed = True
+            return
 
         out_dir = base_dir / "homographies"
         ensure_dir(out_dir)
@@ -557,12 +578,12 @@ def run_once(base_dir: Path) -> None:
         for cam_key in cam_keys:
             cam = camera_handler.get_camera(cam_key)
             if cam is None:
-                print(f"[{cam_key}] missing camera from camera_handler")
+                log(f"[{cam_key}] missing camera from camera_handler")
                 continue
 
             rtsp = getattr(cam, "rtsp", None)
             if not isinstance(rtsp, str) or not rtsp.strip():
-                print(f"[{cam_key}] missing rtsp")
+                log(f"[{cam_key}] missing rtsp")
                 continue
 
             K_raw = getattr(cam, "camera_matrix", None)
@@ -590,14 +611,14 @@ def run_once(base_dir: Path) -> None:
 
             undistorter = FrameUndistorter(K_np, dist_np, expected_size=declared_size)
             if undistorter.ready():
-                print(f"[{cam_key}] using intrinsics from camera_handler (undistort enabled)")
+                log(f"[{cam_key}] using intrinsics from camera_handler (undistort enabled)")
             else:
-                print(f"[{cam_key}] intrinsics missing/invalid (undistort disabled)")
+                log(f"[{cam_key}] intrinsics missing/invalid (undistort disabled)")
 
-            print(f"[{cam_key}] opening stream...")
+            log(f"[{cam_key}] opening stream...")
             cap = open_capture(rtsp)
             if not cap.isOpened():
-                print(f"[{cam_key}] failed to open rtsp")
+                log(f"[{cam_key}] failed to open rtsp")
                 continue
 
             try:
@@ -606,7 +627,7 @@ def run_once(base_dir: Path) -> None:
                 cap.release()
 
             if not frames:
-                print(f"[{cam_key}] no frames received")
+                log(f"[{cam_key}] no frames received")
                 continue
 
             best: Optional[HomographyResult] = None
@@ -631,7 +652,7 @@ def run_once(base_dir: Path) -> None:
                     best_frame = f_use
 
             if best is None:
-                print(f"[{cam_key}] board not detected / homography failed")
+                log(f"[{cam_key}] board not detected / homography failed")
                 continue
 
             out_name = f"{safe_filename(cam_key)}_homography.yml"
@@ -661,21 +682,31 @@ def run_once(base_dir: Path) -> None:
                     )
                     topdown_path = out_dir / topdown_filename_for_mac(cam_key)
                     cv2.imwrite(str(topdown_path), topdown)
-                    print(f"[{cam_key}] top-down saved: {topdown_path}")
+                    log(f"[{cam_key}] top-down saved: {topdown_path}")
             except Exception as e:
-                print(f"[{cam_key}] top-down render failed: {e}")
+                log(f"[{cam_key}] top-down render failed: {e}")
 
-            print(f"[{cam_key}] saved: {out_path} (inliers={best.inliers}, rmse={best.rmse_board:.3f})")
+            log(f"[{cam_key}] saved: {out_path} (inliers={best.inliers}, rmse={best.rmse_board:.3f})")
+
+        completed = True
+    except SystemExit:
+        raise
+    except Exception as e:
+        log(f"run_once failed: {e}")
+        traceback.print_exc(file=sys.stdout)
     finally:
         # Only config.json write this script performs.
         _set_begin_scanning_false(cfg_path)
 
-    print("Scan complete. CharucoBoard.BeginScanning set to false.")
+    if completed:
+        log("Scan complete. CharucoBoard.BeginScanning set to false.")
+    else:
+        log("Scan aborted. CharucoBoard.BeginScanning set to false.")
 
 
 def run_service(base_dir: Path, poll_seconds: float) -> None:
     cfg_path = base_dir / "config" / "config.json"
-    print(f"Watching: {cfg_path}")
+    log(f"Watching: {cfg_path}")
     last_begin_scanning: Optional[bool] = None
     last_cfg_mtime: Optional[float] = None
     while True:
@@ -707,10 +738,11 @@ def run_service(base_dir: Path, poll_seconds: float) -> None:
                     if should_trigger:
                         run_once(base_dir=base_dir)
         except KeyboardInterrupt:
-            print("Exiting.")
+            log("Exiting.")
             return
         except Exception as e:
-            print(f"Error in homography service loop: {e}")
+            log(f"Error in homography service loop: {e}")
+            traceback.print_exc(file=sys.stdout)
             # Best-effort crash control: only flip BeginScanning back to false.
             try:
                 _set_begin_scanning_false(cfg_path)
