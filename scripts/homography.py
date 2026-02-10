@@ -198,6 +198,70 @@ def dict_constant_from_name(name: str):
         raise ValueError(f"Unknown ArUco dictionary constant: {name}")
     return getattr(aruco, name)
 
+
+def _set_attr_if_present(obj, name: str, value) -> None:
+    try:
+        if hasattr(obj, name):
+            setattr(obj, name, value)
+    except Exception:
+        pass
+
+
+def _create_detector_params():
+    """Create and tune detector parameters for more robust marker detection."""
+    try:
+        params = aruco.DetectorParameters_create()  # type: ignore[attr-defined]
+    except Exception:
+        params = aruco.DetectorParameters()  # type: ignore[call-arg]
+
+    # These defaults are intentionally conservative; they mainly help with
+    # blur/low-contrast and reduce missed detections.
+    _set_attr_if_present(params, "adaptiveThreshWinSizeMin", 3)
+    _set_attr_if_present(params, "adaptiveThreshWinSizeMax", 53)
+    _set_attr_if_present(params, "adaptiveThreshWinSizeStep", 4)
+    _set_attr_if_present(params, "minDistanceToBorder", 3)
+    _set_attr_if_present(params, "minMarkerPerimeterRate", 0.03)
+    _set_attr_if_present(params, "maxMarkerPerimeterRate", 4.0)
+    _set_attr_if_present(params, "polygonalApproxAccuracyRate", 0.03)
+    _set_attr_if_present(params, "minCornerDistanceRate", 0.05)
+    _set_attr_if_present(params, "minMarkerDistanceRate", 0.05)
+    _set_attr_if_present(params, "perspectiveRemoveIgnoredMarginPerCell", 0.13)
+    _set_attr_if_present(params, "maxErroneousBitsInBorderRate", 0.35)
+    _set_attr_if_present(params, "errorCorrectionRate", 0.6)
+
+    # Corner refinement improves ChArUco interpolation stability.
+    try:
+        refine = getattr(aruco, "CORNER_REFINE_SUBPIX", None)
+        if refine is not None:
+            _set_attr_if_present(params, "cornerRefinementMethod", int(refine))
+    except Exception:
+        pass
+    _set_attr_if_present(params, "cornerRefinementWinSize", 5)
+    _set_attr_if_present(params, "cornerRefinementMaxIterations", 50)
+    _set_attr_if_present(params, "cornerRefinementMinAccuracy", 0.1)
+
+    return params
+
+
+def _detect_markers(gray: np.ndarray, aruco_dict, detector_params):
+    """Detect ArUco markers using either the new ArucoDetector API or legacy detectMarkers."""
+    try:
+        detector = aruco.ArucoDetector(aruco_dict, detector_params)  # type: ignore[attr-defined]
+        corners, ids, rejected = detector.detectMarkers(gray)
+        return corners, ids, rejected
+    except Exception:
+        corners, ids, rejected = aruco.detectMarkers(gray, aruco_dict, parameters=detector_params)
+        return corners, ids, rejected
+
+
+def _maybe_clahe(gray: np.ndarray) -> np.ndarray:
+    """Lightweight contrast boost to help marker detection in dim scenes."""
+    try:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        return clahe.apply(gray)
+    except Exception:
+        return gray
+
 @dataclass
 class BoardSpec:
     dictionary_name: str
@@ -231,6 +295,9 @@ class HomographyResult:
     rmse_board: float
     corners_used: int
     frame_size: Tuple[int, int] #(w,h)
+    markers_detected: int
+    charuco_detected: int
+    used_undistorted_image: bool
 
 def build_charuco_board(board_spec: BoardSpec):
     dict_const = dict_constant_from_name(board_spec.dictionary_name)
@@ -253,32 +320,61 @@ def build_charuco_board(board_spec: BoardSpec):
         )
     return board, aruco_dict
 
-def detect_charuco(gray: np.ndarray, aruco_dict, board) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]: #return corners and ID
-    corners, ids, _ = aruco.detectMarkers(gray, aruco_dict)
+def detect_charuco(
+    gray: np.ndarray,
+    aruco_dict,
+    board,
+    detector_params,
+    camera_matrix: Optional[np.ndarray] = None,
+    dist_coeffs: Optional[np.ndarray] = None,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], int]:
+    """Return (charuco_corners, charuco_ids, markers_detected)."""
+    corners, ids, _ = _detect_markers(gray, aruco_dict, detector_params)
+    markers_detected = 0 if ids is None else int(len(ids))
     if ids is None or len(ids) == 0:
-        return None, None
+        return None, None, markers_detected
 
-    n, charuco_corners, charuco_ids = aruco.interpolateCornersCharuco(
-        markerCorners=corners,
-        markerIds=ids,
-        image=gray,
-        board=board,
-    )
+    # Some OpenCV builds accept cameraMatrix/distCoeffs here; others don't.
+    try:
+        n, charuco_corners, charuco_ids = aruco.interpolateCornersCharuco(
+            markerCorners=corners,
+            markerIds=ids,
+            image=gray,
+            board=board,
+            cameraMatrix=camera_matrix,
+            distCoeffs=dist_coeffs,
+        )
+    except TypeError:
+        n, charuco_corners, charuco_ids = aruco.interpolateCornersCharuco(
+            markerCorners=corners,
+            markerIds=ids,
+            image=gray,
+            board=board,
+        )
+
     if charuco_ids is None or charuco_corners is None or int(n) <= 0:
-        return None, None
-    return charuco_corners, charuco_ids
+        return None, None, markers_detected
+    return charuco_corners, charuco_ids, markers_detected
 
 def compute_homography_from_frame(
     frame_bgr: np.ndarray,
     board,
     aruco_dict,
+    detector_params,
     ransac_thresh_px: float,
     min_corners: int,
+    camera_matrix: Optional[np.ndarray] = None,
+    dist_coeffs: Optional[np.ndarray] = None,
+    use_undistorted_image: bool = True,
 ) -> Optional[HomographyResult]:
     h_img, w_img = frame_bgr.shape[:2]
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
-    charuco_corners, charuco_ids = detect_charuco(gray, aruco_dict, board)
+    # First try marker/charuco detection on the provided frame.
+    gray2 = _maybe_clahe(gray)
+    charuco_corners, charuco_ids, markers_detected = detect_charuco(
+        gray2, aruco_dict, board, detector_params, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs
+    )
     if charuco_ids is None or charuco_corners is None:
         return None
 
@@ -293,6 +389,14 @@ def compute_homography_from_frame(
     dst_local = chess[ids]  # (N,2)
 
     src_pts = np.asarray(charuco_corners, dtype=np.float64)  # (N,1,2)
+    # If detection was performed on a distorted frame (i.e., not an already-undistorted image),
+    # undistort the points before solving. This accounts for lens distortion without requiring
+    # image warping that can harm detection.
+    if (not use_undistorted_image) and camera_matrix is not None and dist_coeffs is not None:
+        try:
+            src_pts = cv2.undistortPoints(src_pts, camera_matrix, dist_coeffs, P=camera_matrix)
+        except Exception:
+            pass
     dst_pts = dst_local.reshape(-1, 1, 2).astype(np.float64)  # (N,1,2)
 
     H, mask = cv2.findHomography(src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=ransac_thresh_px)
@@ -314,6 +418,9 @@ def compute_homography_from_frame(
         rmse_board=rmse,
         corners_used=int(len(ids)),
         frame_size=(w_img, h_img),
+        markers_detected=int(markers_detected),
+        charuco_detected=int(len(ids)),
+        used_undistorted_image=bool(use_undistorted_image),
     )
 
 
@@ -354,6 +461,16 @@ class FrameUndistorter:
         K2[1, 1] *= ry
         K2[1, 2] *= ry
         return K2
+
+    def scaled_intrinsics_for_size(self, size: Tuple[int, int]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if not self.ready():
+            return None, None
+        try:
+            K_use = self._scaled_K_for_size(size)
+            dist_use = np.array(self.dist, dtype=np.float64).reshape(-1) if self.dist is not None else None
+            return K_use, dist_use
+        except Exception:
+            return None, None
 
     def _ensure_maps(self, frame: np.ndarray) -> None:
         if not self.ready():
@@ -468,6 +585,9 @@ def save_homography_yaml(
         fs.write("rmse_board", float(result.rmse_board))
         fs.write("ransac_thresh_px", float(ransac_thresh_px))
         fs.write("undistorted", int(1 if undistorted else 0))
+        fs.write("markers_detected", int(getattr(result, "markers_detected", 0)))
+        fs.write("charuco_detected", int(getattr(result, "charuco_detected", 0)))
+        fs.write("used_undistorted_image", int(1 if getattr(result, "used_undistorted_image", False) else 0))
 
         fs.write("board_dictionary", board_spec.dictionary_name)
         fs.write("board_squares", np.array([board_spec.squares_x, board_spec.squares_y], dtype=np.int32))
@@ -561,6 +681,7 @@ def run_once(base_dir: Path) -> None:
             res_w, res_h = 0, 0
 
         board, aruco_dict = build_charuco_board(board_spec)
+        detector_params = _create_detector_params()
 
         log("Querying camera_handler for cameras...")
         states = camera_handler.get_camera_states()
@@ -632,27 +753,104 @@ def run_once(base_dir: Path) -> None:
 
             best: Optional[HomographyResult] = None
             best_frame: Optional[np.ndarray] = None
+            max_markers = 0
+            max_charuco = 0
             for f in frames:
+                res: Optional[HomographyResult] = None
                 try:
-                    f_use = undistorter.undistort(f)
+                    # Preferred path: undistort image before ChArUco detection.
+                    f_undist = undistorter.undistort(f)
+                    K_use, dist_use = undistorter.scaled_intrinsics_for_size((f.shape[1], f.shape[0]))
+
+                    # Update diagnostics even if we can't solve a homography.
+                    try:
+                        gray_u = cv2.cvtColor(f_undist, cv2.COLOR_BGR2GRAY)
+                        _, ids_u, markers_u = detect_charuco(
+                            _maybe_clahe(gray_u),
+                            aruco_dict,
+                            board,
+                            detector_params,
+                            camera_matrix=None,
+                            dist_coeffs=None,
+                        )
+                        charuco_u = 0 if ids_u is None else int(len(ids_u.reshape(-1)))
+                        max_markers = max(max_markers, int(markers_u))
+                        max_charuco = max(max_charuco, int(charuco_u))
+                    except Exception:
+                        pass
+
+                    try:
+                        gray_r = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+                        _, ids_r, markers_r = detect_charuco(
+                            _maybe_clahe(gray_r),
+                            aruco_dict,
+                            board,
+                            detector_params,
+                            camera_matrix=K_use,
+                            dist_coeffs=dist_use,
+                        )
+                        charuco_r = 0 if ids_r is None else int(len(ids_r.reshape(-1)))
+                        max_markers = max(max_markers, int(markers_r))
+                        max_charuco = max(max_charuco, int(charuco_r))
+                    except Exception:
+                        pass
+
                     res = compute_homography_from_frame(
-                        frame_bgr=f_use,
+                        frame_bgr=f_undist,
                         board=board,
                         aruco_dict=aruco_dict,
+                        detector_params=detector_params,
                         ransac_thresh_px=ransac_thresh_px,
                         min_corners=min_corners,
+                        camera_matrix=None,
+                        dist_coeffs=None,
+                        use_undistorted_image=True,
                     )
+
+                    # If undistorted-image detection fails, try raw detection and undistort points.
+                    if res is None:
+                        res = compute_homography_from_frame(
+                            frame_bgr=f,
+                            board=board,
+                            aruco_dict=aruco_dict,
+                            detector_params=detector_params,
+                            ransac_thresh_px=ransac_thresh_px,
+                            min_corners=min_corners,
+                            camera_matrix=K_use,
+                            dist_coeffs=dist_use,
+                            use_undistorted_image=False,
+                        )
+                        if res is not None:
+                            # Keep best_frame consistent with homography domain (undistorted pixels).
+                            best_frame = f_undist
                 except Exception:
                     res = None
+
+                # Track best observed detection stats even if homography fails.
+                if res is not None:
+                    max_markers = max(max_markers, int(res.markers_detected))
+                    max_charuco = max(max_charuco, int(res.charuco_detected))
 
                 if res is None:
                     continue
                 if best is None or res.rmse_board < best.rmse_board:
                     best = res
-                    best_frame = f_use
+                    if best_frame is None:
+                        # When the successful solve came from the undistorted-image path,
+                        # use that undistorted frame for top-down rendering.
+                        try:
+                            best_frame = undistorter.undistort(f)
+                        except Exception:
+                            best_frame = f
 
             if best is None:
-                log(f"[{cam_key}] board not detected / homography failed")
+                # Diagnostic hint: distinguish dictionary mismatch vs board config mismatch.
+                log(
+                    f"[{cam_key}] board not detected / homography failed "
+                    f"(max_markers={max_markers}, max_charuco={max_charuco}). "
+                    "If max_markers is 0 across all frames, the ArUco Dictionary likely doesn't match the printed board, "
+                    "or the board isn't visible / is too small/blurred."
+                )
                 continue
 
             out_name = f"{safe_filename(cam_key)}_homography.yml"
