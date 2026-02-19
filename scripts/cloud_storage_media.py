@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import dotenv
+import logging
 import requests
 
 from scripts.json_models.cloud_storage import (
@@ -19,6 +20,63 @@ from scripts.json_models.cloud_storage import (
 
 
 DEFAULT_ENV_PATH = "/opt/p2bp/camera/config/agent.env"
+
+
+def _build_logger() -> logging.Logger:
+    logger = logging.getLogger("p2bp.cloud_storage")
+    if logger.handlers:
+        return logger
+
+    level_name = os.getenv("P2BP_LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logger.setLevel(level)
+
+    handler = logging.StreamHandler()
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+logger = _build_logger()
+
+
+def _redact_url(url: str) -> str:
+    # Signed URLs include secrets in query params; never log those.
+    if not url:
+        return ""
+    q = url.find("?")
+    return url if q < 0 else url[:q] + "?<redacted>"
+
+
+def _truncate(text: str, limit: int = 2000) -> str:
+    if text is None:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"… <truncated {len(text) - limit} chars>"
+
+
+def _log_http_failure(prefix: str, method: str, url: str, response: Optional[requests.Response]) -> None:
+    if response is None:
+        logger.warning("%s failed: %s %s (no response)", prefix, method, _redact_url(url))
+        return
+
+    body: str = ""
+    try:
+        body = response.text or ""
+    except Exception:
+        body = ""
+
+    logger.warning(
+        "%s failed: %s %s -> HTTP %s; body=%s",
+        prefix,
+        method,
+        _redact_url(url),
+        response.status_code,
+        _truncate(body),
+    )
 
 
 def _normalize_endpoint(endpoint: str) -> str:
@@ -124,11 +182,34 @@ def _request_json_with_retries(
         try:
             r = requests.request(method, url, headers=headers, json=json_body, timeout=timeout_s)
             if r.status_code == 429 or r.status_code >= 500:
+                _log_http_failure("Backend request", method, url, r)
                 raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
-            r.raise_for_status()
-            return r.json()
+            try:
+                r.raise_for_status()
+            except requests.HTTPError:
+                _log_http_failure("Backend request", method, url, r)
+                raise
+
+            try:
+                return r.json()
+            except ValueError:
+                _log_http_failure("Backend JSON parse", method, url, r)
+                raise
         except (requests.RequestException, ValueError) as e:
             last_exc = e
+
+            # Best-effort logging for errors that didn't produce a response.
+            resp = getattr(e, "response", None)
+            if isinstance(resp, requests.Response):
+                _log_http_failure("Backend request", method, url, resp)
+            else:
+                logger.warning(
+                    "Backend request exception: %s %s (%s)",
+                    method,
+                    _redact_url(url),
+                    str(e)[:500],
+                )
+
             if attempt >= max_attempts:
                 break
             time.sleep(_sleep_backoff_seconds(attempt))
@@ -168,6 +249,7 @@ def request_upload_url(
     )
     resp = UploadUrlResponseDto.from_dict(data if isinstance(data, dict) else {})
     if not resp.SignedUrl:
+        logger.warning("Backend returned empty SignedUrl for %s: %s", remote_path, _truncate(str(data)))
         raise RuntimeError("Backend returned empty SignedUrl")
     return resp
 
@@ -187,7 +269,11 @@ def upload_to_signed_url(
             "Content-Type": "application/octet-stream",
         }
         r = requests.put(signed_url, data=f, headers=headers, timeout=(timeout_connect_s, timeout_read_s))
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except requests.HTTPError:
+            _log_http_failure("Signed upload", "PUT", signed_url, r)
+            raise
 
 
 def confirm_upload(
@@ -214,9 +300,20 @@ def confirm_upload(
             r = requests.post(url, headers=headers, json=dto.to_dict(), timeout=timeout_s)
             # Only retry on transient-ish failures.
             if r.status_code in {429} or r.status_code >= 500:
+                _log_http_failure("Confirm upload", "POST", url, r)
                 raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
-            r.raise_for_status()
-            data = r.json()
+
+            try:
+                r.raise_for_status()
+            except requests.HTTPError:
+                _log_http_failure("Confirm upload", "POST", url, r)
+                raise
+
+            try:
+                data = r.json()
+            except ValueError:
+                _log_http_failure("Confirm upload JSON parse", "POST", url, r)
+                raise
             media = MediaRecordResponseDto.from_dict(data if isinstance(data, dict) else {})
             return media
         except (requests.RequestException, ValueError) as e:
