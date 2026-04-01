@@ -1,0 +1,31 @@
+# P2BP override for /etc/logrotate.d/rsyslog
+# Replaces the default Ubuntu config which rotates weekly and keeps 4 copies
+# (can accumulate 10+ GB). We rotate daily, cap at 100 MB, and keep 3 copies.
+
+/var/log/syslog
+/var/log/mail.info
+/var/log/mail.warn
+/var/log/mail.err
+/var/log/mail.log
+/var/log/daemon.log
+/var/log/kern.log
+/var/log/auth.log
+/var/log/user.log
+/var/log/lpr.log
+/var/log/cron.log
+/var/log/debug
+/var/log/messages
+{
+	su root syslog
+	rotate 3
+	daily
+	maxsize 100M
+	missingok
+	notifempty
+	compress
+	delaycompress
+	sharedscripts
+	postrotate
+		/usr/lib/rsyslog/rsyslog-rotate
+	endscript
+}
