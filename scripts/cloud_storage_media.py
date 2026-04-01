@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import posixpath
 import random
 import time
@@ -52,7 +53,9 @@ def _redact_url(url: str) -> str:
 
 def _truncate(text: str, limit: int = 2000) -> str:
     if text is None:
-        return ""
+        return "<empty>"
+    if not str(text).strip():
+        return "<empty>"
     if len(text) <= limit:
         return text
     return text[:limit] + f"… <truncated {len(text) - limit} chars>"
@@ -76,6 +79,28 @@ def _log_http_failure(prefix: str, method: str, url: str, response: Optional[req
         _redact_url(url),
         response.status_code,
         _truncate(body),
+    )
+
+
+def _log_request_context(prefix: str, method: str, url: str, json_body: Optional[Dict[str, Any]], attempt: Optional[int]) -> None:
+    attempt_part = f" attempt={attempt}" if attempt is not None else ""
+    if json_body is None:
+        payload_part = "<none>"
+    else:
+        try:
+            # Use real JSON encoding so logs show double quotes.
+            payload_part = _truncate(
+                json.dumps(json_body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            )
+        except Exception:
+            payload_part = _truncate(str(json_body))
+    logger.warning(
+        "%s context:%s %s %s payload=%s",
+        prefix,
+        attempt_part,
+        method,
+        _redact_url(url),
+        payload_part,
     )
 
 
@@ -182,17 +207,20 @@ def _request_json_with_retries(
         try:
             r = requests.request(method, url, headers=headers, json=json_body, timeout=timeout_s)
             if r.status_code == 429 or r.status_code >= 500:
+                _log_request_context("Backend request", method, url, json_body, attempt)
                 _log_http_failure("Backend request", method, url, r)
                 raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
             try:
                 r.raise_for_status()
             except requests.HTTPError:
+                _log_request_context("Backend request", method, url, json_body, attempt)
                 _log_http_failure("Backend request", method, url, r)
                 raise
 
             try:
                 return r.json()
             except ValueError:
+                _log_request_context("Backend JSON parse", method, url, json_body, attempt)
                 _log_http_failure("Backend JSON parse", method, url, r)
                 raise
         except (requests.RequestException, ValueError) as e:
@@ -201,6 +229,7 @@ def _request_json_with_retries(
             # Best-effort logging for errors that didn't produce a response.
             resp = getattr(e, "response", None)
             if isinstance(resp, requests.Response):
+                _log_request_context("Backend request", method, url, json_body, attempt)
                 _log_http_failure("Backend request", method, url, resp)
             else:
                 logger.warning(
@@ -291,7 +320,7 @@ def confirm_upload(
     }
     url = _join_url(endpoint, "/api/files/confirm-upload")
 
-    max_retries = _env_int("P2BP_CLOUDSTORAGE_CONFIRM_MAX_RETRIES", 0)  # 0 == infinite
+    max_retries = _env_int("P2BP_CLOUDSTORAGE_CONFIRM_MAX_RETRIES", 8)
     attempt = 0
     last_exc: Optional[BaseException] = None
     while True:
@@ -300,18 +329,21 @@ def confirm_upload(
             r = requests.post(url, headers=headers, json=dto.to_dict(), timeout=timeout_s)
             # Only retry on transient-ish failures.
             if r.status_code in {429} or r.status_code >= 500:
+                _log_request_context("Confirm upload", "POST", url, dto.to_dict(), attempt)
                 _log_http_failure("Confirm upload", "POST", url, r)
                 raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
 
             try:
                 r.raise_for_status()
             except requests.HTTPError:
+                _log_request_context("Confirm upload", "POST", url, dto.to_dict(), attempt)
                 _log_http_failure("Confirm upload", "POST", url, r)
                 raise
 
             try:
                 data = r.json()
             except ValueError:
+                _log_request_context("Confirm upload JSON parse", "POST", url, dto.to_dict(), attempt)
                 _log_http_failure("Confirm upload JSON parse", "POST", url, r)
                 raise
             media = MediaRecordResponseDto.from_dict(data if isinstance(data, dict) else {})
@@ -325,12 +357,12 @@ def confirm_upload(
                 if status < 500 and status != 429:
                     raise RuntimeError(f"Confirm upload failed (HTTP {status})") from e
 
-            if max_retries and attempt > max_retries:
+            if attempt >= max_retries:
                 break
 
             time.sleep(_sleep_backoff_seconds(attempt, base=1.0, cap=60.0))
 
-    raise RuntimeError("Confirm upload failed after retries") from last_exc
+    raise RuntimeError(f"Confirm upload failed after {max_retries} attempts") from last_exc
 
 
 def upload(

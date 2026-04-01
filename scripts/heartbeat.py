@@ -9,6 +9,7 @@ import hashlib
 import requests
 import dotenv
 import logging
+from pathlib import Path
 import scripts.json_models.heartbeat_payload as heartbeat_payload
 import scripts.systemd_services as systemd_services
 import scripts.system_stats as system_stats
@@ -50,7 +51,9 @@ logger = _build_logger()
 CONFIG_PATH = "/opt/p2bp/camera/config/config.json"
 SIGNAL_DIR = "/run/p2bp"
 DEFAULT_HEARTBEAT_INTERVAL = 10  # seconds
-MIN_HEARTBEAT_INTERVAL = 5  # seconds (prevents accidental busy loops)
+MIN_HEARTBEAT_INTERVAL = 2  # seconds (prevents accidental busy loops)
+FAST_HEARTBEAT_INTERVAL = 2.0   # seconds, used during active operations or after a config change
+CONFIG_CHANGE_FAST_WINDOW_S = 15.0  # seconds to stay on fast interval after any config change
 
 # Log a compact "heartbeat OK" line at most this often.
 DEFAULT_LOG_EVERY_SECONDS = 300
@@ -88,6 +91,20 @@ def get_heartbeat_interval_seconds(config: Optional[Dict[str, Any]]) -> float:
     if interval < MIN_HEARTBEAT_INTERVAL:
         return float(MIN_HEARTBEAT_INTERVAL)
     return interval
+
+
+def _is_active_operation(config: Optional[Dict[str, Any]]) -> bool:
+    """Return True when any operation flag that warrants a fast heartbeat is set."""
+    if not isinstance(config, dict):
+        return False
+    charuco = config.get("CharucoBoard") or {}
+    aruco = config.get("ArucoLock") or {}
+    intrinsics = config.get("Intrinsics") or {}
+    return (
+        bool(charuco.get("BeginScanning"))
+        or bool(aruco.get("BeginScanning"))
+        or bool(intrinsics.get("BeginCalibration"))
+    )
 
 
 def sanitize_camera_state_for_heartbeat(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -156,10 +173,39 @@ def send_heartbeat(api_key, endpoint, payload): # send a health report heartbeat
     except ValueError:
         raise RuntimeError("Backend returned invalid JSON")
 
+_DISK_STATE_PATH = "/opt/p2bp/camera/run/disk_state.json"
+_INTRINSICS_STATE_PATH = "/opt/p2bp/camera/run/intrinsics_calibration_state.json"
+
+
+def _load_disk_state() -> list:
+    try:
+        p = Path(_DISK_STATE_PATH)
+        if p.exists():
+            with p.open("r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def _load_intrinsics_state() -> dict:
+    try:
+        p = Path(_INTRINSICS_STATE_PATH)
+        if p.exists():
+            with p.open("r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
 def create_heartbeat_payload(): # create a payload for the heartbeat request
     services = systemd_services.get_all_service_states()
     system = system_stats.get_system_stats()
     camera_dicts = camera_handler.get_camera_states()
+
+    # Attach disk state written by disk_monitor.py (empty list if service not running yet).
+    system.Disk = _load_disk_state()
 
     # Convert dicts to CameraState dataclasses
     cameras = {
@@ -171,6 +217,7 @@ def create_heartbeat_payload(): # create a payload for the heartbeat request
         services=services,
         system=system,
         cameras=cameras,
+        intrinsics_calibration=_load_intrinsics_state(),
     ).to_dict()
 
     return payload
@@ -181,6 +228,7 @@ def main():
     last_interval: Optional[float] = None
     last_ok_log_ts = 0.0
     last_config_hash: Optional[str] = None
+    last_config_change_ts = 0.0
     last_error_key: Optional[str] = None
     last_error_log_ts = 0.0
 
@@ -218,6 +266,7 @@ def main():
                         logger.info("Config received (hash=%s)", cfg_hash)
                         logger.debug("New config: %s", new_config)
                         last_config_hash = cfg_hash
+                        last_config_change_ts = now
 
             if old_config != new_config:
                 config_io.write_config_atomic(CONFIG_PATH, new_config)
@@ -234,9 +283,19 @@ def main():
                 last_error_log_ts = now
 
         # Drive cadence from latest config when available.
-        interval = get_heartbeat_interval_seconds(new_config if isinstance(new_config, dict) else old_config)
+        base_config = new_config if isinstance(new_config, dict) else old_config
+        base_interval = get_heartbeat_interval_seconds(base_config)
+        active = _is_active_operation(base_config)
+        in_change_window = (time.time() - last_config_change_ts) < CONFIG_CHANGE_FAST_WINDOW_S
+        fast = active or in_change_window
+        interval = FAST_HEARTBEAT_INTERVAL if fast else base_interval
         if last_interval is None or interval != last_interval:
-            logger.info("Heartbeat interval: %ss", interval)
+            if active:
+                logger.info("Heartbeat interval: %ss (active operation)", interval)
+            elif in_change_window:
+                logger.info("Heartbeat interval: %ss (config changed)", interval)
+            else:
+                logger.info("Heartbeat interval: %ss", interval)
             last_interval = interval
 
         time.sleep(interval)

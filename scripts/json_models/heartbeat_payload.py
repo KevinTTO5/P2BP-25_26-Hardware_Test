@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List
+from typing import Any, Dict, List
 import time
 
 @dataclass
@@ -30,6 +30,7 @@ class SystemStats:
 #    CpuPct: float
     Gpu: GpuStats = field(default_factory=GpuStats)
     Memory: MemoryStats = field(default_factory=MemoryStats)
+    Disk: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -38,6 +39,7 @@ class HeartbeatPayload:
     Services: Dict[str, ServiceState]
     Cameras: Dict[str, CameraState]
     System: SystemStats
+    IntrinsicsCalibration: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -47,10 +49,12 @@ class HeartbeatPayload:
         services: Dict[str, ServiceState],
         cameras: Dict[str, CameraState],
         system: SystemStats,
+        intrinsics_calibration: Dict[str, Any] | None = None,
     ) -> "HeartbeatPayload":
         return HeartbeatPayload(
             Timestamp=int(time.time()),
             Services=services,
             Cameras=cameras,
             System=system,
+            IntrinsicsCalibration=intrinsics_calibration or {},
         )

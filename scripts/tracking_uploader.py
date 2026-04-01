@@ -91,19 +91,38 @@ def _remote_path(remote_dir: str, filename: str) -> str:
     return f"{remote_dir_norm}/{filename}"
 
 
+def _in_cooldown(entry: Optional[Dict[str, Any]], max_attempts: int, cooldown_s: float) -> bool:
+    """Return True if this file has hit the failure threshold and is still within its cooldown window."""
+    if entry is None:
+        return False
+    fails = int(entry.get("failed_attempts") or 0)
+    if fails < max_attempts:
+        return False
+    last_failed = entry.get("last_failed_at")
+    if last_failed is None:
+        return False
+    return (time.time() - float(last_failed)) < cooldown_s
+
+
 def main() -> None:
     upload_dir = os.getenv("P2BP_TRACKING_UPLOAD_DIR", "/opt/p2bp/camera/tracks")
     remote_dir = os.getenv("P2BP_TRACKING_UPLOAD_REMOTE_DIR", "/vision/tracks-raw")
     state_path = os.getenv("P2BP_TRACKING_UPLOAD_STATE_PATH", os.path.join(upload_dir, ".uploaded_state.json"))
 
     scan_interval_s = max(5.0, _env_float("P2BP_TRACKING_UPLOAD_SCAN_INTERVAL_S", 240.0))
-    # Default to 0 so active files can be uploaded/re-uploaded.
     min_age_s = max(0.0, _env_float("P2BP_TRACKING_UPLOAD_MIN_AGE_S", 0.0))
+    max_attempts = max(1, int(_env_float("P2BP_TRACKING_UPLOAD_MAX_ATTEMPTS", 5)))
+    cooldown_s = max(0.0, _env_float("P2BP_TRACKING_UPLOAD_COOLDOWN_S", 1800.0))
 
     logger.info("Tracking uploader started (dir=%s remote=%s)", upload_dir, remote_dir)
 
     # State file format:
-    #   { "file.jsonl": {"size": <bytes>, "mtime": <unix>, "uploaded_at": <unix>} }
+    #   {
+    #     "file.jsonl": {
+    #       "size": <bytes>, "mtime": <unix>, "uploaded_at": <unix>,
+    #       "failed_attempts": <int>, "last_failed_at": <unix|null>
+    #     }
+    #   }
     # Back-compat: older versions stored { "file.jsonl": <uploaded_at> }.
     state: Dict[str, Any] = {}
     try:
@@ -143,9 +162,9 @@ def main() -> None:
                     continue
 
                 entry = _state_entry(state, fname)
+
                 if entry is not None and "size" not in entry and "mtime" not in entry:
-                    # If we have an old-format entry, hydrate it so future comparisons work,
-                    # but do not force a re-upload just because the format changed.
+                    # Hydrate old-format entry; don't force re-upload.
                     entry = {
                         **entry,
                         "size": fp["size"],
@@ -155,12 +174,18 @@ def main() -> None:
                     _write_state_atomic(state_path, state)
                     continue
 
+                if _in_cooldown(entry, max_attempts, cooldown_s):
+                    last_failed = float((entry or {}).get("last_failed_at") or 0)
+                    retry_at = time.strftime("%H:%M:%S", time.localtime(last_failed + cooldown_s))
+                    logger.debug("Skipping %s — in cooldown until %s", fname, retry_at)
+                    continue
+
                 needs_upload = entry is None
                 if entry is not None:
                     try:
                         prev_size = float(entry.get("size"))
                         prev_mtime = float(entry.get("mtime"))
-                        # Reupload if the file content likely changed (grew or was rewritten).
+                        # Re-upload if the file content likely changed (grew or was rewritten).
                         if fp["size"] != prev_size or fp["mtime"] > prev_mtime + 1e-6:
                             needs_upload = True
                     except (TypeError, ValueError):
@@ -172,15 +197,36 @@ def main() -> None:
                 remote_path = _remote_path(remote_dir, fname)
                 logger.info("Uploading %s -> %s", local_path, remote_path)
 
-                result = upload(local_path, remote_path)
-                state[fname] = {
-                    "size": fp["size"],
-                    "mtime": fp["mtime"],
-                    "uploaded_at": time.time(),
-                }
-                _write_state_atomic(state_path, state)
-                logger.info("Upload confirmed (media_id=%s)", result.media.Id if result.media else "")
-                uploaded_any = True
+                try:
+                    result = upload(local_path, remote_path)
+                    state[fname] = {
+                        "size": fp["size"],
+                        "mtime": fp["mtime"],
+                        "uploaded_at": time.time(),
+                        "failed_attempts": 0,
+                        "last_failed_at": None,
+                    }
+                    _write_state_atomic(state_path, state)
+                    logger.info("Upload confirmed: %s (media_id=%s)", fname, result.media.Id if result.media else "")
+                    uploaded_any = True
+                except Exception as e:
+                    fails = int((entry or {}).get("failed_attempts") or 0) + 1
+                    state[fname] = {
+                        **({} if entry is None else entry),
+                        "size": fp["size"],
+                        "mtime": fp["mtime"],
+                        "failed_attempts": fails,
+                        "last_failed_at": time.time(),
+                    }
+                    _write_state_atomic(state_path, state)
+                    if fails >= max_attempts:
+                        retry_at = time.strftime("%H:%M:%S", time.localtime(time.time() + cooldown_s))
+                        logger.warning(
+                            "Upload failed %d/%d times for %s; cooling down until %s. Error: %s",
+                            fails, max_attempts, fname, retry_at, e,
+                        )
+                    else:
+                        logger.warning("Upload failed for %s (attempt %d/%d): %s", fname, fails, max_attempts, e)
 
             if not uploaded_any:
                 logger.debug("No eligible tracking files to upload")

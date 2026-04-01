@@ -1,0 +1,28 @@
+[Unit]
+Description=P2BP ArUco Scanner (inter-camera homography locking)
+After=network-online.target heartbeat.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -s -m scripts.aruco_scanner
+WorkingDirectory=/opt/p2bp/camera
+Restart=always
+RestartSec=10
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/p2bp/camera
+RuntimeDirectory=p2bp
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+EnvironmentFile=/opt/p2bp/camera/config/agent.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

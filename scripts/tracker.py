@@ -110,6 +110,8 @@ DEFAULT_EXPORT_INTERVAL_SEC = 2.0
 DEFAULT_MAX_TRACK_POINTS = 5000
 DEFAULT_MAX_VECTORS = 300
 DEFAULT_EVENTS_LOG_FLUSH_SEC = 1.0
+DEFAULT_SEGMENT_MAX_AGE_S = 3600.0       # 1 hour; set SegmentMaxAgeSecs: 0 to disable
+DEFAULT_SEGMENT_MAX_BYTES = 100_000_000  # 100 MB; set SegmentMaxBytes: 0 to disable
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -407,9 +409,18 @@ def _write_json_atomic(path: str, data: Any) -> None:
 
 
 class _EventLogger:
-    def __init__(self, path: str, flush_interval_sec: float = DEFAULT_EVENTS_LOG_FLUSH_SEC) -> None:
+    def __init__(
+        self,
+        path: str,
+        flush_interval_sec: float = DEFAULT_EVENTS_LOG_FLUSH_SEC,
+        max_segment_age_s: float = 0.0,
+        max_segment_bytes: int = 0,
+    ) -> None:
         self.path = path
+        self._tracks_dir = os.path.dirname(path) or "."
         self.flush_interval_sec = max(0.0, float(flush_interval_sec))
+        self._max_segment_age_s = max(0.0, float(max_segment_age_s))
+        self._max_segment_bytes = max(0, int(max_segment_bytes))
         self._q: "Queue[Optional[Dict[str, Any]]]" = Queue(maxsize=20000)
         self._error: Optional[BaseException] = None
         self._error_lock = threading.Lock()
@@ -429,6 +440,17 @@ class _EventLogger:
         except Exception:
             pass
 
+    def _make_segment_path(self) -> str:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        return os.path.join(self._tracks_dir, f"tracks_events-{stamp}.jsonl")
+
+    def _should_rotate(self, segment_start: float, bytes_written: int) -> bool:
+        if self._max_segment_age_s > 0 and (time.time() - segment_start) >= self._max_segment_age_s:
+            return True
+        if self._max_segment_bytes > 0 and bytes_written >= self._max_segment_bytes:
+            return True
+        return False
+
     def log(self, event: Dict[str, Any]) -> None:
         with self._error_lock:
             err = self._error
@@ -439,16 +461,21 @@ class _EventLogger:
         self._q.put(event)
 
     def _run(self) -> None:
+        segment_start = time.time()
+        bytes_written = 0
         last_flush = time.time()
         # Line-buffered for timely writes; still explicitly flush periodically.
-        with open(self.path, "a", encoding="utf-8", buffering=1) as f:
+        f = open(self.path, "a", encoding="utf-8", buffering=1)
+        try:
             while True:
                 item = self._q.get()
                 if item is None:
                     break
 
                 try:
-                    f.write(json.dumps(item, separators=(",", ":")) + "\n")
+                    line = json.dumps(item, separators=(",", ":")) + "\n"
+                    f.write(line)
+                    bytes_written += len(line.encode("utf-8"))
                 except Exception as e:
                     # Do not silently drop events. Record error and stop.
                     with self._error_lock:
@@ -465,10 +492,35 @@ class _EventLogger:
                             pass
                         last_flush = now
 
+                if self._should_rotate(segment_start, bytes_written):
+                    try:
+                        f.flush()
+                        os.fsync(f.fileno())
+                        f.close()
+                    except Exception:
+                        pass
+                    new_path = self._make_segment_path()
+                    self.path = new_path
+                    try:
+                        f = open(new_path, "a", encoding="utf-8", buffering=1)
+                    except Exception as e:
+                        with self._error_lock:
+                            self._error = e
+                        return
+                    segment_start = time.time()
+                    bytes_written = 0
+                    last_flush = time.time()
+                    print(f"[INFO] Event log rotated to {new_path}")
+
             # Final flush on shutdown/error.
             try:
                 f.flush()
                 os.fsync(f.fileno())
+            except Exception:
+                pass
+        finally:
+            try:
+                f.close()
             except Exception:
                 pass
 
@@ -906,7 +958,14 @@ def main():
     session_stamp = time.strftime("%Y%m%d-%H%M%S")
     events_path = os.path.join(tracks_dir, f"tracks_events-{session_stamp}.jsonl")
     events_flush = _safe_float(tracking_cfg.get("EventsLogFlushSeconds"), DEFAULT_EVENTS_LOG_FLUSH_SEC)
-    event_logger = _EventLogger(events_path, flush_interval_sec=events_flush)
+    segment_max_age = _safe_float(tracking_cfg.get("SegmentMaxAgeSecs"), DEFAULT_SEGMENT_MAX_AGE_S)
+    segment_max_bytes = int(_safe_float(tracking_cfg.get("SegmentMaxBytes"), float(DEFAULT_SEGMENT_MAX_BYTES)))
+    event_logger = _EventLogger(
+        events_path,
+        flush_interval_sec=events_flush,
+        max_segment_age_s=segment_max_age,
+        max_segment_bytes=segment_max_bytes,
+    )
     event_logger.start()
     try:
         event_logger.log({"type": "session_start", "time": int(time.time() * 1000)})

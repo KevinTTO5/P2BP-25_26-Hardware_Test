@@ -54,6 +54,10 @@ except Exception as e:
         f"Import error: {e}"
     )
 
+import requests
+from scripts import cloud_storage_media
+from scripts.json_models.homography_upload import LocalHomographyResponseDto, SubmitLocalHomographyDto
+
 
 def log(msg: str) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -663,24 +667,23 @@ def enabled_camera_macs(config: Dict, available_macs: List[str]) -> List[str]:
     return list(available_macs)
 
 
-def _set_begin_scanning_false(cfg_path: Path) -> None:
-    try:
-        config = load_json(cfg_path)
-    except Exception:
-        return
-    if not isinstance(config, dict):
-        return
-    cb = config.get("CharucoBoard")
-    if not isinstance(cb, dict):
-        return
-    if cb.get("BeginScanning") is False:
-        return
-    cb["BeginScanning"] = False
-    config["CharucoBoard"] = cb
-    try:
-        atomic_write_json(cfg_path, config)
-    except Exception:
-        pass
+def _submit_local_homography(api_key: str, endpoint: str, dto: SubmitLocalHomographyDto) -> None:
+    url = cloud_storage_media._join_url(endpoint, "/api/Homography/submit-local")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(url, headers=headers, json=dto.to_dict(), timeout=10)
+            r.raise_for_status()
+            return
+        except Exception as e:
+            if attempt < 3:
+                time.sleep(float(2 ** attempt))
+            else:
+                raise
+
 
 def run_once(base_dir: Path) -> None:
     cfg_path = base_dir / "config" / "config.json"
@@ -745,6 +748,14 @@ def run_once(base_dir: Path) -> None:
             log("No cameras selected for scanning.")
             completed = True
             return
+
+        # Load upload credentials once for all cameras (best-effort; scan continues if unavailable).
+        _api_key: Optional[str] = None
+        _endpoint: Optional[str] = None
+        try:
+            _api_key, _endpoint = cloud_storage_media.load_env()
+        except Exception as _cred_err:
+            log(f"Upload credentials unavailable, server sync disabled: {_cred_err}")
 
         out_dir = base_dir / "homographies"
         ensure_dir(out_dir)
@@ -978,6 +989,54 @@ def run_once(base_dir: Path) -> None:
                 undistorted=undistorter.ready(),
             )
 
+            # Upload raw undistorted snapshot to cloud storage for the puzzle-piece UI.
+            snapshot_path: Optional[str] = None
+            if best_frame is not None and _api_key is not None:
+                try:
+                    remote_snapshot = f"/homography-snapshots/{safe_filename(cam_key)}.jpg"
+                    tmp_fd, tmp_snap = tempfile.mkstemp(suffix=".jpg")
+                    try:
+                        os.close(tmp_fd)
+                        cv2.imwrite(tmp_snap, best_frame)
+                        upload_result = cloud_storage_media.upload(
+                            tmp_snap, remote_snapshot, api_key=_api_key, endpoint=_endpoint
+                        )
+                        snapshot_path = upload_result.remote_path
+                        log(f"[{cam_key}] snapshot uploaded: {snapshot_path}")
+                    finally:
+                        try:
+                            os.unlink(tmp_snap)
+                        except OSError:
+                            pass
+                except Exception as e:
+                    log(f"[{cam_key}] snapshot upload failed (continuing): {e}")
+
+            # Submit local homography matrix + metadata to server.
+            if _api_key is not None and _endpoint is not None:
+                try:
+                    dto = SubmitLocalHomographyDto(
+                        CameraMac=cam_key,
+                        Matrix=best.H.tolist(),
+                        FrameSize=list(best.frame_size),
+                        Inliers=best.inliers,
+                        RmseBoard=best.rmse_board,
+                        CornersUsed=best.corners_used,
+                        MarkersDetected=best.markers_detected,
+                        ArucoDict=board_spec.dictionary_name,
+                        SquaresX=board_spec.squares_x,
+                        SquaresY=board_spec.squares_y,
+                        SquareLength=board_spec.square_length,
+                        MarkerLength=board_spec.marker_length,
+                        TimestampUnix=time.time(),
+                        SnapshotPath=snapshot_path,
+                        CameraMatrix=K_np.tolist() if K_np is not None else None,
+                        DistortionCoefficients=dist_np.tolist() if dist_np is not None else None,
+                    )
+                    _submit_local_homography(_api_key, _endpoint, dto)
+                    log(f"[{cam_key}] homography submitted to server")
+                except Exception as e:
+                    log(f"[{cam_key}] homography submit failed (continuing): {e}")
+
             # Render a quick top-down confirmation image using the same (undistorted) frame.
             try:
                 if best_frame is not None:
@@ -1003,14 +1062,11 @@ def run_once(base_dir: Path) -> None:
     except Exception as e:
         log(f"run_once failed: {e}")
         traceback.print_exc(file=sys.stdout)
-    finally:
-        # Only config.json write this script performs.
-        _set_begin_scanning_false(cfg_path)
 
     if completed:
-        log("Scan complete. CharucoBoard.BeginScanning set to false.")
+        log("Scan complete.")
     else:
-        log("Scan aborted. CharucoBoard.BeginScanning set to false.")
+        log("Scan aborted.")
 
 
 def run_service(base_dir: Path, poll_seconds: float) -> None:
@@ -1052,11 +1108,6 @@ def run_service(base_dir: Path, poll_seconds: float) -> None:
         except Exception as e:
             log(f"Error in homography service loop: {e}")
             traceback.print_exc(file=sys.stdout)
-            # Best-effort crash control: only flip BeginScanning back to false.
-            try:
-                _set_begin_scanning_false(cfg_path)
-            except Exception:
-                pass
 
         time.sleep(poll_seconds)
 
