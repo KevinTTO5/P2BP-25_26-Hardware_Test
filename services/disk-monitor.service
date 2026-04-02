@@ -1,30 +1,26 @@
 [Unit]
-Description=P2BP Homography Agent
-After=network-online.target camera-scanner.service
+Description=P2BP Disk Monitor
+After=network-online.target
 Wants=network-online.target
-Requires=camera-scanner.service
 
 [Service]
 Type=simple
+ExecStart=/usr/bin/python3 -s -m scripts.disk_monitor
 WorkingDirectory=/opt/p2bp/camera
-ExecStart=/usr/bin/python3 -s -m scripts.homography
-Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=/opt/p2bp/camera/config/agent.env
-
 Restart=always
-RestartSec=5
-
+RestartSec=10
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+Environment=PYTHONUNBUFFERED=1
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-
-ReadWritePaths=/opt/p2bp/camera /run/p2bp
-
+ReadWritePaths=/opt/p2bp/camera /var/log
 RuntimeDirectory=p2bp
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
-
+EnvironmentFile=/opt/p2bp/camera/config/agent.env
 StandardOutput=journal
 StandardError=journal
 

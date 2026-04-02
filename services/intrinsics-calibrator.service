@@ -1,28 +1,26 @@
 [Unit]
-Description=P2BP Heartbeat Agent
-After=network-online.target
+Description=P2BP Intrinsics Calibrator (camera lens calibration)
+After=network-online.target heartbeat.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -s -m scripts.heartbeat
+ExecStart=/usr/bin/python3 -s -m scripts.intrinsics_calibrator
 WorkingDirectory=/opt/p2bp/camera
 Restart=always
-RestartSec=5
-
-# Safety net: prevent stdout/stderr floods from exploding journald/syslog.
+RestartSec=10
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=200
-
-# Ensure runtime signal dir exists
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/p2bp/camera
 RuntimeDirectory=p2bp
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
-
-# Environment
 EnvironmentFile=/opt/p2bp/camera/config/agent.env
-
-# Logging
 StandardOutput=journal
 StandardError=journal
 

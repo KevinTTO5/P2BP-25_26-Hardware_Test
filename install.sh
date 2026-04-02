@@ -29,6 +29,8 @@ sudo apt install python3-pip -y
 sudo apt install -y python3-opencv
 sudo apt install -y arp-scan
 sudo apt install -y ffmpeg
+sudo apt install -y libavif13
+sudo apt install -y logrotate
 
 # Create canonical directory and structure
 echo "Creating application directories..."
@@ -80,6 +82,14 @@ fi
 if [ -z "$API_KEY" ] || [ -z "$API_ENDPOINT" ]; then
   echo "Error: API Key and Endpoint must not be empty"
   exit 1
+fi
+
+# Normalize endpoint so scripts can safely append routes.
+# Users sometimes paste URLs like https://host/api or https://host/api/.
+API_ENDPOINT="${API_ENDPOINT%/}"
+if [[ "${API_ENDPOINT,,}" == */api ]]; then
+  API_ENDPOINT="${API_ENDPOINT%/api}"
+  API_ENDPOINT="${API_ENDPOINT%/}"
 fi
 
 # Write environment file
@@ -153,6 +163,18 @@ else
 fi
 
 sudo systemctl daemon-reload
+
+# Best-effort: ensure logrotate runs (Ubuntu may use a systemd timer).
+sudo systemctl enable --now logrotate.timer >/dev/null 2>&1 || true
+
+# Deploy tightened rsyslog logrotate config (daily + 100 MB cap, 3 rotations).
+# Replaces the Ubuntu default which rotates weekly and can accumulate 10+ GB.
+if [ -f "services/logrotate-rsyslog" ]; then
+  sudo cp services/logrotate-rsyslog /etc/logrotate.d/rsyslog
+  echo "Installed logrotate config for rsyslog."
+else
+  echo "Warning: services/logrotate-rsyslog not found; skipping rsyslog logrotate config."
+fi
 
 # Enable all services (Scripts each have their own conditions for starting)
 echo "Enabling services..."
