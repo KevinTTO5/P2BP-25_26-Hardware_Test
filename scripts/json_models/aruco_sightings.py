@@ -17,6 +17,7 @@ class SubmitArucoSightingsDto:
     CapturedAt: str                    # ISO 8601 UTC
     Markers: List[ArucoMarkerSighting] = field(default_factory=list)
     SessionId: Optional[str] = None    # None = server creates a fresh session
+    LocalHomographyHash: Optional[str] = None  # SHA256[:16] of raw local H matrix; server uses to filter stale sightings
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

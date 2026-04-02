@@ -8,6 +8,8 @@ Requires=camera-scanner.service
 Type=simple
 WorkingDirectory=/opt/p2bp/camera
 ExecStart=/usr/bin/python3 -s -m scripts.homography
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/p2bp/camera/config/agent.env
 
 Restart=always
 RestartSec=5

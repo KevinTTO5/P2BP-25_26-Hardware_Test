@@ -430,16 +430,6 @@ def run_collection(base_dir: Path, cfg_path: Path, config: dict) -> None:
     _write_calibration_state(base_dir, cam_states)
 
     while True:
-        # Re-read config to detect BeginCalibration being cleared.
-        try:
-            with cfg_path.open("r", encoding="utf-8") as f:
-                current_config = json.load(f)
-            if not bool((current_config.get("Intrinsics") or {}).get("BeginCalibration")):
-                log("BeginCalibration cleared — stopping collection")
-                return
-        except Exception:
-            pass
-
         for mac in cam_macs:
             cam = camera_handler.get_camera(mac)
             if cam is None:

@@ -1127,6 +1127,18 @@ def main():
             log(f"OPENCV_FFMPEG_CAPTURE_OPTIONS={ff}")
     except Exception:
         pass
+    try:
+        import sys as _sys
+        log(f"Python binary: {_sys.executable}")
+        log(f"Python version: {_sys.version.splitlines()[0]}")
+        import cv2 as _cv2_diag
+        log(f"cv2 version: {_cv2_diag.__version__}")
+        _ = _cv2_diag.aruco.DICT_4X4_50
+        log("cv2.aruco: available")
+    except AttributeError:
+        log("cv2.aruco: MISSING — ArUco module not built into this cv2")
+    except Exception as _e:
+        log(f"cv2.aruco: ERROR — {_e}")
     if args.once:
         run_once(base_dir=base_dir)
     else:

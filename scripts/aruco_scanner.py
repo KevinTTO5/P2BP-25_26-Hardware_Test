@@ -26,6 +26,7 @@ To run:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -86,6 +87,32 @@ def _aruco_dict_id(name: str) -> int:
     if attr is None:
         raise ValueError(f"Unknown ArUco dictionary: {name!r}")
     return int(attr)
+
+
+def _load_homography_hash(mac: str, homographies_dir: str) -> Optional[str]:
+    """Load the raw (unscaled) local homography YAML for a camera and return a short hash.
+
+    We read the YAML directly rather than using camera_handler because camera_handler
+    stores a resolution-scaled copy of the matrix. The hash must be based on the
+    canonical unscaled values so it stays stable across resolution config changes.
+    Returns None if the YAML is missing or the matrix can't be read.
+    """
+    safe_mac = "".join(ch if ch.isalnum() or ch in ("_", "-", ".") else "_" for ch in mac)
+    path = os.path.join(homographies_dir, f"{safe_mac}_homography.yml")
+    if not os.path.exists(path):
+        return None
+    try:
+        fs = cv2.FileStorage(path, cv2.FILE_STORAGE_READ)
+        try:
+            mat = fs.getNode("homography").mat()
+        finally:
+            fs.release()
+        if mat is None:
+            return None
+        flat = ",".join(f"{round(float(v), 4):.4f}" for v in mat.flatten())
+        return hashlib.sha256(flat.encode()).hexdigest()[:16]
+    except Exception:
+        return None
 
 
 def _detect_aruco(image_bgr: np.ndarray, aruco_dict_id: int) -> Dict[int, np.ndarray]:
@@ -163,6 +190,14 @@ def run_once(base_dir: Path) -> None:
     )
 
     log(f"Scanning {len(cam_macs)} camera(s) for ArUco markers (dict={dict_name}, min_frames={min_frames})")
+
+    homographies_dir = str(base_dir / "homographies")
+    homography_hashes: Dict[str, Optional[str]] = {
+        mac: _load_homography_hash(mac, homographies_dir) for mac in cam_macs
+    }
+    for mac, h in homography_hashes.items():
+        if h is None:
+            log(f"[{mac}] WARNING: no local homography found — sighting will be filtered at compute-lock time")
 
     session_id: Optional[str] = None
     captured_at = datetime.now(timezone.utc).isoformat()
@@ -249,6 +284,7 @@ def run_once(base_dir: Path) -> None:
             CapturedAt=captured_at,
             Markers=sightings,
             SessionId=session_id,
+            LocalHomographyHash=homography_hashes.get(mac),
         )
 
         try:

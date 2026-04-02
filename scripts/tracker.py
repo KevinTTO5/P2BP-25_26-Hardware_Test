@@ -2,12 +2,11 @@ import json
 import os
 import signal
 import sys
-import tempfile
 import threading
 import time
 from collections import deque
 from queue import Queue
-from typing import Any, Dict, List, Optional, Tuple
+from typing import IO, Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -104,12 +103,9 @@ DEFAULT_CONF_THRESH = 0.35
 DEFAULT_MAX_FPS = 30
 DEFAULT_IMG_SIZE = 640
 DEFAULT_MIN_BOX = 56
-DEFAULT_TRACK_TTL = 60.0
 EMBED_INTERVAL_SEC = 1.0
-DEFAULT_EXPORT_INTERVAL_SEC = 2.0
-DEFAULT_MAX_TRACK_POINTS = 5000
-DEFAULT_MAX_VECTORS = 300
 DEFAULT_EVENTS_LOG_FLUSH_SEC = 1.0
+TRACK_RETENTION_SEC = 30.0           # prune tracks_local entries idle longer than this
 DEFAULT_SEGMENT_MAX_AGE_S = 3600.0       # 1 hour; set SegmentMaxAgeSecs: 0 to disable
 DEFAULT_SEGMENT_MAX_BYTES = 100_000_000  # 100 MB; set SegmentMaxBytes: 0 to disable
 
@@ -390,23 +386,6 @@ def _try_load_intrinsics_json(path: str) -> Optional[Tuple[np.ndarray, np.ndarra
     return K, dist
 
 
-def _write_json_atomic(path: str, data: Any) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", dir=os.path.dirname(path) or ".")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-        tmp_path = ""
-    finally:
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-
 
 class _EventLogger:
     def __init__(
@@ -424,10 +403,13 @@ class _EventLogger:
         self._q: "Queue[Optional[Dict[str, Any]]]" = Queue(maxsize=20000)
         self._error: Optional[BaseException] = None
         self._error_lock = threading.Lock()
+        self._camera_meta: List[Dict[str, Any]] = []
+        self._started = False
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self._started = True
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
@@ -439,6 +421,26 @@ class _EventLogger:
             self._thread.join(timeout=timeout)
         except Exception:
             pass
+
+    def set_camera_meta(self, cameras: List[Dict[str, Any]]) -> None:
+        """Store per-camera metadata written as the first line of every segment.
+
+        Must be called before start() so the initial segment gets the header.
+        cameras: list of {"mac": str, "resolution": [w, h] | null}
+        """
+        self._camera_meta = list(cameras)
+
+    def _open_segment(self, path: str) -> "IO[str]":
+        """Open a segment file and write the meta header line if camera metadata is set."""
+        f = open(path, "a", encoding="utf-8", buffering=1)
+        if self._camera_meta:
+            meta = {
+                "type": "meta",
+                "time": int(time.time() * 1000),
+                "cameras": self._camera_meta,
+            }
+            f.write(json.dumps(meta, separators=(",", ":")) + "\n")
+        return f
 
     def _make_segment_path(self) -> str:
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -465,7 +467,7 @@ class _EventLogger:
         bytes_written = 0
         last_flush = time.time()
         # Line-buffered for timely writes; still explicitly flush periodically.
-        f = open(self.path, "a", encoding="utf-8", buffering=1)
+        f = self._open_segment(self.path)
         try:
             while True:
                 item = self._q.get()
@@ -502,7 +504,7 @@ class _EventLogger:
                     new_path = self._make_segment_path()
                     self.path = new_path
                     try:
-                        f = open(new_path, "a", encoding="utf-8", buffering=1)
+                        f = self._open_segment(new_path)
                     except Exception as e:
                         with self._error_lock:
                             self._error = e
@@ -524,54 +526,6 @@ class _EventLogger:
             except Exception:
                 pass
 
-
-def _export_tracks_by_camera(cams: List["CameraThread"], track_ttl_seconds: float) -> Dict[str, Dict[str, Any]]:
-    export: Dict[str, Dict[str, Any]] = {}
-    cutoff = time.time() - float(track_ttl_seconds)
-    for c in cams:
-        export[c.mac] = {}
-        for sid, data in c.output_tracks.items():
-            track = data.get("track", [])
-            if not track:
-                continue
-
-            # Best-effort TTL cleanup before export. (track times are ms)
-            last_t = float(track[-1].get("time", 0)) / 1000.0
-            if last_t < cutoff:
-                continue
-
-            export[c.mac][str(sid)] = {
-                "track": list(track) if isinstance(track, deque) else track,
-                "vectors": list(data.get("vectors", [])) if isinstance(data.get("vectors", []), deque) else data.get("vectors", []),
-            }
-    return export
-
-
-def _start_exporter_thread(
-    cams: List["CameraThread"],
-    output_path: str,
-    track_ttl_seconds: float,
-    export_interval_seconds: float,
-    stop_event: threading.Event,
-) -> threading.Thread:
-    def _run() -> None:
-        # Give camera threads a moment to warm up before the first write.
-        next_write = time.time() + max(0.1, float(export_interval_seconds))
-        while not stop_event.is_set():
-            now = time.time()
-            if now >= next_write:
-                try:
-                    export = _export_tracks_by_camera(cams, track_ttl_seconds)
-                    _write_json_atomic(output_path, export)
-                except Exception:
-                    # Best-effort: avoid crashing the tracker due to exporter issues.
-                    pass
-                next_write = now + max(0.1, float(export_interval_seconds))
-            time.sleep(0.1)
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    return t
 
 
 class Undistorter:
@@ -660,9 +614,6 @@ class CameraThread(threading.Thread):
         max_fps: int,
         min_box: int,
         undistorter: Undistorter,
-        output_retention_sec: float,
-        max_track_points: int,
-        max_vectors: int,
         event_logger: Optional[_EventLogger],
         stop_event: threading.Event,
     ):
@@ -684,11 +635,6 @@ class CameraThread(threading.Thread):
         self.bt_to_sid: Dict[int, int] = {}
         self.next_sid = 0
         self.tracks_local: Dict[int, Dict[str, Any]] = {}
-        self.output_tracks: Dict[int, Dict[str, Any]] = {}
-
-        self.output_retention_sec = float(output_retention_sec)
-        self.max_track_points = max(1, int(max_track_points))
-        self.max_vectors = max(1, int(max_vectors))
         self.event_logger = event_logger
 
         # Per-camera YOLO instance so ByteTrack state does not bleed across cameras.
@@ -705,6 +651,8 @@ class CameraThread(threading.Thread):
                 self.homography = np.array(self.homography, dtype=np.float64)
             except Exception:
                 self.homography = None
+
+        self._last_resolution: Optional[Tuple[int, int]] = None
 
         self._reader_thread = threading.Thread(target=self.read_frames, daemon=True)
         self._reader_thread.start()
@@ -772,6 +720,22 @@ class CameraThread(threading.Thread):
             self.frame_id += 1
             now = time.time()
 
+            # Detect resolution changes (including first frame). Log before any processing
+            # so the event timestamp precedes any tracks captured at the new resolution.
+            h, w = frame.shape[:2]
+            if (w, h) != self._last_resolution:
+                self._last_resolution = (w, h)
+                if self.event_logger is not None:
+                    try:
+                        self.event_logger.log({
+                            "type": "cam_resolution",
+                            "mac": self.mac,
+                            "resolution": [w, h],
+                            "time": int(now * 1000),
+                        })
+                    except Exception:
+                        pass
+
             # Limit processing rate.
             min_dt = 1.0 / float(self.max_fps)
             if now - last_process < min_dt:
@@ -820,16 +784,6 @@ class CameraThread(threading.Thread):
                 else:
                     gx, gy = float(feet[0]), float(feet[1])
 
-                out = self.output_tracks.get(sid)
-                if out is None:
-                    out = self.output_tracks[sid] = {
-                        "track": deque(maxlen=self.max_track_points),
-                        "vectors": deque(maxlen=self.max_vectors),
-                        "mac": self.mac,
-                    }
-                out["track"].append({"time": int(now * 1000), "x": gx, "y": gy})
-                out["last_ms"] = int(now * 1000)
-
                 if self.event_logger is not None:
                     try:
                         self.event_logger.log({
@@ -854,10 +808,6 @@ class CameraThread(threading.Thread):
                     feat = osnet.get_features([crop])[0].tolist()
 
                     t["feats"].append(feat)
-                    out["vectors"].append({
-                        "time": int(now * 1000),
-                        "vector": [float(x) for x in feat],
-                    })
                     t["last_embed"] = now
 
                     if self.event_logger is not None:
@@ -884,27 +834,17 @@ class CameraThread(threading.Thread):
             # Periodically prune stale tracks to bound memory.
             if now - last_prune >= 1.0:
                 last_prune = now
-                if self.output_retention_sec > 0:
-                    cutoff = now - self.output_retention_sec
-
-                    # Remove stale bytetrack ids and free their SIDs.
-                    stale_bt_ids: List[int] = []
-                    for bt_id2, t2 in self.tracks_local.items():
-                        try:
-                            if (now - float(t2.get("last", 0.0))) > self.output_retention_sec:
-                                stale_bt_ids.append(bt_id2)
-                        except Exception:
+                stale_bt_ids: List[int] = []
+                for bt_id2, t2 in self.tracks_local.items():
+                    try:
+                        if (now - float(t2.get("last", 0.0))) > TRACK_RETENTION_SEC:
                             stale_bt_ids.append(bt_id2)
+                    except Exception:
+                        stale_bt_ids.append(bt_id2)
 
-                    for bt_id2 in stale_bt_ids:
-                        t2 = self.tracks_local.pop(bt_id2, None)
-                        sid2 = None
-                        if isinstance(t2, dict):
-                            sid2 = t2.get("sid")
-                        if bt_id2 in self.bt_to_sid:
-                            sid2 = self.bt_to_sid.pop(bt_id2, sid2)
-                        if isinstance(sid2, int):
-                            self.output_tracks.pop(sid2, None)
+                for bt_id2 in stale_bt_ids:
+                    self.tracks_local.pop(bt_id2, None)
+                    self.bt_to_sid.pop(bt_id2, None)
 
         try:
             self.cap.release()
@@ -948,10 +888,6 @@ def main():
 
     cams: List[CameraThread] = []
 
-    export_path = os.path.join(BASE_DIR, "tracks_by_camera.json")
-    export_interval = _safe_float(tracking_cfg.get("ExportIntervalSeconds"), DEFAULT_EXPORT_INTERVAL_SEC)
-    export_ttl = _safe_float(tracking_cfg.get("ExportTrackTtlSeconds"), DEFAULT_TRACK_TTL)
-
     # Append-only full history log (JSONL). This is the durable source of truth.
     tracks_dir = os.path.join(BASE_DIR, "tracks")
     os.makedirs(tracks_dir, exist_ok=True)
@@ -966,18 +902,6 @@ def main():
         max_segment_age_s=segment_max_age,
         max_segment_bytes=segment_max_bytes,
     )
-    event_logger.start()
-    try:
-        event_logger.log({"type": "session_start", "time": int(time.time() * 1000)})
-    except Exception:
-        pass
-
-    # Bound in-memory growth.
-    max_track_points_default = int(max(1.0, export_ttl) * max(1, max_fps)) + 100
-    max_vectors_default = int(max(1.0, export_ttl) / max(EMBED_INTERVAL_SEC, 0.1)) + 10
-    max_track_points = _safe_int(tracking_cfg.get("MaxTrackPoints"), min(DEFAULT_MAX_TRACK_POINTS, max_track_points_default))
-    max_vectors = _safe_int(tracking_cfg.get("MaxVectors"), min(DEFAULT_MAX_VECTORS, max_vectors_default))
-    exporter_thread: Optional[threading.Thread] = None
 
     def _handle_stop(signum, frame):  # type: ignore
         STOP_EVENT.set()
@@ -1074,9 +998,6 @@ def main():
                 max_fps=max_fps,
                 min_box=DEFAULT_MIN_BOX,
                 undistorter=undistorter,
-                output_retention_sec=export_ttl,
-                max_track_points=max_track_points,
-                max_vectors=max_vectors,
                 event_logger=event_logger,
                 stop_event=STOP_EVENT,
             )
@@ -1087,13 +1008,22 @@ def main():
             print("[WARN] No camera threads started; exiting.")
             return
 
-        exporter_thread = _start_exporter_thread(
-            cams=cams,
-            output_path=export_path,
-            track_ttl_seconds=export_ttl,
-            export_interval_seconds=export_interval,
-            stop_event=STOP_EVENT,
-        )
+        # Build per-camera metadata for the JSONL header, then start the logger.
+        # set_camera_meta must be called before start() so the first segment gets the header.
+        camera_meta = []
+        for c in cams:
+            cam = camera_handler.get_camera(c.mac)
+            res = getattr(cam, "resolution", None) if cam is not None else None
+            camera_meta.append({
+                "mac": c.mac,
+                "resolution": res if isinstance(res, list) and len(res) == 2 else None,
+            })
+        event_logger.set_camera_meta(camera_meta)
+        event_logger.start()
+        try:
+            event_logger.log({"type": "session_start", "time": int(time.time() * 1000)})
+        except Exception:
+            pass
 
         while not STOP_EVENT.is_set():
             if show_preview:
@@ -1128,20 +1058,12 @@ def main():
                 pass
 
         # Stop event logger after camera threads stop producing events.
-        try:
-            event_logger.log({"type": "session_stop", "time": int(time.time() * 1000)})
-        except Exception:
-            pass
-        event_logger.stop(timeout=5.0)
-
-    # Final export on shutdown (best-effort). Exporter thread may already have written.
-    try:
-        export = _export_tracks_by_camera(cams, export_ttl)
-        _write_json_atomic(export_path, export)
-    except Exception:
-        pass
-
-    print("[INFO] Saved tracks_by_camera.json")
+        if event_logger._started:
+            try:
+                event_logger.log({"type": "session_stop", "time": int(time.time() * 1000)})
+            except Exception:
+                pass
+            event_logger.stop(timeout=5.0)
 
 if __name__ == "__main__":
     main()
