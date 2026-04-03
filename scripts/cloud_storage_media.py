@@ -153,8 +153,8 @@ def _join_url(base: str, path: str) -> str:
 
 def load_env(env_path: str = DEFAULT_ENV_PATH) -> Tuple[str, str]:
     dotenv.load_dotenv(env_path)
-    api_key = os.getenv("API_KEY")
-    endpoint = os.getenv("ENDPOINT")
+    api_key = (os.getenv("API_KEY") or "").strip()
+    endpoint = (os.getenv("ENDPOINT") or "").strip()
 
     if not api_key:
         raise RuntimeError("Missing API_KEY")

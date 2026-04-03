@@ -146,8 +146,8 @@ def _payload_summary(payload: Dict[str, Any]) -> str:
 def load_env():
     #dotenv.load_dotenv("../config/agent.env") # for local testing
     dotenv.load_dotenv("/opt/p2bp/camera/config/agent.env")
-    api_key = os.getenv("API_KEY")
-    endpoint = os.getenv("ENDPOINT")
+    api_key = (os.getenv("API_KEY") or "").strip()
+    endpoint = (os.getenv("ENDPOINT") or "").strip()
 
     if not api_key:
         raise RuntimeError("Missing API_KEY")
@@ -205,7 +205,11 @@ def create_heartbeat_payload(): # create a payload for the heartbeat request
     camera_dicts = camera_handler.get_camera_states()
 
     # Attach disk state written by disk_monitor.py (empty list if service not running yet).
-    system.Disk = _load_disk_state()
+    disk_state = _load_disk_state()
+    if isinstance(system, dict):
+        system["Disk"] = disk_state
+    else:
+        system.Disk = disk_state
 
     # Convert dicts to CameraState dataclasses
     cameras = {
