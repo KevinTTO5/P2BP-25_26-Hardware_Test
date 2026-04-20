@@ -1,0 +1,93 @@
+%YAML:1.0
+# laptop/deepstream/config_tracker_NvMOT.yml
+#
+# NvMultiObjectTracker configuration for the DS 9.0 MV3DT laptop pipeline.
+# Enables NvDCF (IOU + appearance) + ReID + SV3DT + MV3DT so a single
+# deepstream-app can produce both per-camera 3D tracks and fused multi-view
+# global IDs on localhost Mosquitto.
+#
+# Schema verified via the deepstream-9-docs skill:
+#   - Context7 /websites/nvidia_metropolis_deepstream_dev-guide
+#   - WebFetch https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvtracker.html
+#   - WebFetch https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html
+#   - Sample: NVIDIA-AI-IOT/deepstream_reference_apps/deepstream-tracker-3d-multi-view
+#
+# calibrationDirectory is populated by laptop/scripts/40_export_watcher.sh
+# from AMC's export (Notion §8.7). The rendered deepstream_app_config.txt
+# points `ll-config-file` at this file from
+# laptop/deepstream/ working directory, so paths are relative to that
+# directory.
+
+BaseConfig:
+  minDetectorConfidence: 0.4
+  minTrackerConfidence: 0.5
+  maxTargetsPerStream: 150
+
+TargetManagement:
+  preserveStreamUpdateOrder: 0
+  maxShadowTrackingAge: 80
+  probationAge: 3
+  earlyTerminationAge: 1
+
+TrajectoryManagement:
+  useUniqueID: 1
+
+DataAssociator:
+  dataAssociatorType: 0
+  associationMatcherType: 1
+  checkClassMatch: 1
+  minMatchingScore4Overall: 0.0
+  minMatchingScore4SizeSimilarity: 0.4
+  minMatchingScore4Iou: 0.1
+
+StateEstimator:
+  stateEstimatorType: 1
+  processNoiseVar4Loc: 2.0
+  processNoiseVar4Size: 1.0
+  processNoiseVar4Vel: 0.1
+  measurementNoiseVar4Detector: 4.0
+  measurementNoiseVar4Tracker: 16.0
+
+VisualTracker:
+  visualTrackerType: 1
+  useColorNames: 1
+  useHog: 1
+  featureImgSizeLevel: 2
+  SearchRegionPaddingScale: 1.5
+
+ReID:
+  reidType: 2
+  batchSize: 100
+  workspaceSize: 1000
+  reidFeatureSize: 256
+  reidHistorySize: 100
+  inferDims: [256, 128, 3]
+  networkMode: 1
+  inputOrder: 1
+  colorFormat: 0
+  offsets: [0.0, 0.0, 0.0]
+  netScaleFactor: 1.0
+  inputBlobName: "input"
+  outputBlobName: "output"
+  modelEngineFile: "/opt/nvidia/deepstream/deepstream-9.0/samples/models/Tracker/resnet50_market1501.engine"
+  keepAspc: 1
+  addFeatureNormalization: 1
+
+# Single-View 3D Tracking. AMC (§8.6 Execute + §8.7 Export) writes one
+# per-camera calibration YAML under calibration/<LOCATION_ID>/camera<N>.yml.
+SV3DT:
+  enable: 1
+  calibrationDirectory: calibration/${LOCATION_ID}
+  projectionType: homography
+
+# Multi-View 3D Tracking. Each laptop publishes sv3d per-camera tracks and
+# listens for peers on the same broker; with a single laptop in this harness
+# MV3DT fuses the 8 local SV3DT streams into a global ID space. The broker
+# auth/topic base are consumed from env at render-time by 40_export_watcher.sh.
+MV3DT:
+  enable: 1
+  mqttBrokerIP: 127.0.0.1
+  mqttBrokerPort: 1883
+  nodeID: ${LOCATION_ID}
+  fusionUpdateRate: 30
+  globalIDNegotiationTimeout: 100

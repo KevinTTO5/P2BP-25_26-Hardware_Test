@@ -1,0 +1,37 @@
+# laptop/deepstream/msgconv_config.txt
+#
+# Gst-nvmsgconv configuration for the DS 9.0 MV3DT laptop pipeline. Consumed
+# by [sink1] in deepstream_app_config.txt (msg-conv-config=msgconv_config.txt),
+# then handed to libnvds_mqtt_proto.so for publication to Mosquitto.
+#
+# Field names verified via the deepstream-9-docs skill:
+#   - Context7 /websites/nvidia_metropolis_deepstream_dev-guide
+#   - WebFetch https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvmsgconv.html
+#   - WebFetch https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html
+#
+# Per the DS 9.0 Gst-nvmsgconv reference, the [sensorN]/[placeN]/[analyticsN]
+# blocks seed a single per-sensor payload; the tracker plugin fills in the
+# per-object fields at run time.
+
+[sensor0]
+enable=1
+type=Camera
+id=laptop-ds9
+description=Laptop DS9 scripted testing harness
+location=0.0;0.0;0.0
+coordinate=0.0;0.0;0.0
+
+[place0]
+enable=1
+id=laptop-site
+type=lab
+name=laptop-lab
+location=0.0;0.0;0.0
+coordinate=0.0;0.0;0.0
+
+[analytics0]
+enable=1
+id=mv3dt
+description=MV3DT multi-view 3D tracking
+source=DeepStream-NvMultiObjectTracker
+version=9.0

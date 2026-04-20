@@ -1,0 +1,20 @@
+# Nested gitignore for the laptop/ subtree.
+#
+# This file intentionally lives at laptop/.gitignore (NOT at the repo root)
+# so the DS 9.0 laptop-side testing harness stays isolated from the Jetson
+# tree and does not force a change to the root .gitignore.
+
+# Operator-authored env (written by 00_bootstrap.sh). The committed template
+# is laptop/config/laptop.env.example.
+config/laptop.env
+
+# Generated per-location calibration artifacts (populated by AMC and copied
+# in by 40_export_watcher.sh). We keep the parent dir via .gitkeep so the
+# layout survives a fresh clone.
+deepstream/calibration/*/
+
+# Downloaded NGC detection models (populated by 25_prepare_models.sh).
+deepstream/models/*/
+
+# Rendered pipeline config produced by 40_export_watcher.sh from the template.
+deepstream/deepstream_app_config.rendered.txt
