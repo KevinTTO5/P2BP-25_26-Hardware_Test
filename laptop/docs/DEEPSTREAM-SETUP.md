@@ -14,23 +14,34 @@ field and config fact was cross-checked against Context7 (library
 [`deepstream-9-docs`](../../.cursor/skills/deepstream-9-docs/SKILL.md) skill
 before being written.
 
-This doc **does not read from or write to** [`my-docs/`](../../my-docs/).
-The legacy DS 8.0 doc at
-[`my-docs/02-LAPTOP-DEEPSTREAM-SETUP.md`](../../my-docs/02-LAPTOP-DEEPSTREAM-SETUP.md)
-is left untouched; retiring it is a separate housekeeping PR.
+This doc and [`my-docs/02-LAPTOP-DEEPSTREAM-SETUP.md`](../../my-docs/02-LAPTOP-DEEPSTREAM-SETUP.md)
+are both DS 9.0 references kept in sync against the
+[DS 9.0 Installation page](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html).
+This doc is scoped to the scripted harness under [`laptop/scripts/`](../scripts/);
+`my-docs/02` is the long-form operator manual. The two share the same driver /
+CUDA / TensorRT / DS 9.0 pins (§4, §5) — if one is edited, re-sync the other.
 
 ## Overview
 
-Target platform:
+Target platform (versions are **equality pins** from the
+[DeepStream 9.0 Installation page](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html),
+`dGPU Setup for Ubuntu → Prerequisites`; DS 9.0 will not start against older
+driver / CUDA / TRT minors):
 
 - Ubuntu 24.04 dual-boot (§3)
-- Ampere-or-newer NVIDIA dGPU (§1–2)
-- NVIDIA driver ≥ 550 (§4)
-- CUDA Toolkit 12.4+ (§4)
-- cuDNN 9.x (§4)
-- TensorRT 10.x (§4)
-- DeepStream 9.0 + GStreamer 1.24 (§5)
-- Mosquitto 2.x (§6)
+- Ampere-or-newer NVIDIA dGPU (§1–2); Turing is supported per the DS 9.0
+  Platform Compatibility table but is not the reference configuration for this
+  harness
+- NVIDIA driver **590.48.01** (§4) — from the `.run` installer at
+  [nvidia.com/en-us/drivers/details/259258](https://www.nvidia.com/en-us/drivers/details/259258/)
+- CUDA Toolkit **13.1** (§4) — `cuda-toolkit-13-1` from NVIDIA's
+  `ubuntu2404/x86_64` apt repo
+- TensorRT **10.14.1.48-1+cuda13.0** (§4) — all `libnvinfer*` packages pinned
+  to this version
+- cuDNN **9.18.0** (§4) — per the DS 9.0 dGPU compatibility table
+- DeepStream 9.0 + GStreamer 1.24.2 (§5) — `deepstream-9.0_9.0.0-1_amd64.deb`
+  from [NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/resources/deepstream)
+- Mosquitto 2.x broker + `libmosquitto1` client lib (§6)
 - 8× IP cameras on `192.168.10.101..108` (§7.2)
 - Docker Engine + NVIDIA Container Toolkit (§8.2) — for AMC
 - `NVIDIA-AI-IOT/auto-magic-calib` (§8.3) — cloned into `$HOME/auto-magic-calib/`
@@ -60,46 +71,175 @@ apt full-upgrade`.
 
 ### §4 NVIDIA driver + CUDA + cuDNN + TensorRT
 
-Use NVIDIA's official `cuda-keyring` repo for all four components. Minimum
-versions:
+Follow the
+[DeepStream 9.0 Installation page](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html)
+`dGPU Setup for Ubuntu` section exactly. The version numbers below are the
+values that section pins for DS 9.0; these are **not** minimums — DS 9.0's
+runtime loader refuses older or newer minors of `libnvinfer*` and the driver.
 
-| Component | Minimum | Verify with |
-|-----------|---------|-------------|
-| NVIDIA driver | 550 | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` |
-| CUDA Toolkit | 12.4 | `nvcc --version` |
-| cuDNN | 9.0 | `dpkg -l \| grep libcudnn9` |
-| TensorRT | 10.0 | `dpkg -l \| grep -E 'libnvinfer10\|tensorrt'` |
+| Component | Pinned version | Verify with |
+|-----------|----------------|-------------|
+| NVIDIA driver | `590.48.01` | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` |
+| CUDA Toolkit | `13.1` (`cuda-toolkit-13-1`) | `nvcc --version` |
+| TensorRT | `10.14.1.48-1+cuda13.0` | `dpkg -l \| grep libnvinfer10` |
+| cuDNN | `9.18.0` | `dpkg -l \| grep libcudnn9` |
+| GStreamer | `1.24.2` | `gst-inspect-1.0 --version` |
 
-Reference installation guidance:
+The exact commands (transcribed from the DS 9.0 Installation page, in the
+required order):
 
-- DS 9.0 Installation (lists the exact supported driver/CUDA/cuDNN/TRT
-  matrix): <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html>
-- Platform & OS compatibility:
-  <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html#platform-and-os-compatibility>
+```bash
+# 4.1 — Prerequisite packages (note: libmosquitto1 is required for the DS
+#       MQTT protocol lib; do not omit it)
+sudo apt install \
+    libssl3 libssl-dev libcurl4-openssl-dev libgles2-mesa-dev \
+    libgstreamer1.0-0 gstreamer1.0-tools gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
+    libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-0 \
+    libjansson4 libyaml-cpp-dev libjsoncpp-dev protobuf-compiler \
+    libmosquitto1 gcc make git python3
 
-Reboot after installing the driver so the kernel module is live. If
-`nvidia-smi` returns a valid output and the four `dpkg -l` queries above all
-succeed, §1–4 are complete.
+# 4.2 — CUDA 13.1
+sudo apt-key adv --fetch-keys \
+    https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/3bf863cc.pub
+sudo add-apt-repository \
+    "deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/ /"
+sudo apt-get update
+sudo apt-get install cuda-toolkit-13-1
+
+# 4.3 — NVIDIA driver 590.48.01 (stop GDM/LightDM/Xorg first!)
+#       Download NVIDIA-Linux-x86_64-590.48.01.run from
+#       https://www.nvidia.com/en-us/drivers/details/259258/
+sudo service gdm stop || sudo service lightdm stop
+sudo pkill -9 Xorg || true
+chmod 755 NVIDIA-Linux-x86_64-590.48.01.run
+sudo ./NVIDIA-Linux-x86_64-590.48.01.run --no-cc-version-check
+sudo reboot
+
+# 4.4 — TensorRT (all libnvinfer* pinned to the same version)
+version="10.14.1.48-1+cuda13.0"
+sudo apt-get install \
+    libnvinfer-dev=${version} libnvinfer-dispatch-dev=${version} \
+    libnvinfer-dispatch10=${version} libnvinfer-headers-dev=${version} \
+    libnvinfer-headers-plugin-dev=${version} libnvinfer-lean-dev=${version} \
+    libnvinfer-lean10=${version} libnvinfer-plugin-dev=${version} \
+    libnvinfer-plugin10=${version} libnvinfer-vc-plugin-dev=${version} \
+    libnvinfer-vc-plugin10=${version} libnvinfer10=${version} \
+    libnvonnxparsers-dev=${version} libnvonnxparsers10=${version} \
+    tensorrt-dev=${version}
+```
+
+If `nvidia-smi` reports driver `590.48.01`, `nvcc --version` reports release
+`13.1`, and `dpkg -l | grep libnvinfer10` shows `10.14.1.48-1+cuda13.0`,
+§1–4 are complete.
+
+> **Pitfall — do not use `cuda-keyring` alone.** The DS 9.0 Installation page
+> uses the older `apt-key adv --fetch-keys` + `add-apt-repository` flow above.
+> Installing `cuda-keyring_1.1-1_all.deb` alone does not pull in the DS 9.0
+> `.deb` from that repo — DS 9.0's SDK is **not** published under
+> `developer.download.nvidia.com`; it is only on
+> [NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/resources/deepstream) (§5).
+> That is the root cause of `apt install deepstream-9.0` returning "Unable to
+> locate package" on a fresh Ubuntu 24.04 laptop.
+
+### §4 first-install caveats (not in NVIDIA's DS 9.0 Installation page)
+
+The DS 9.0 Installation page assumes a freshly-installed Ubuntu 24.04
+workstation with the standard dev toolchain, no previous NVIDIA stack,
+Secure Boot disabled, and `nouveau` already out of the way. A first-time
+laptop install almost always hits at least one of the following — fix them
+**before** running the `.run` installer in `4.3`. The long-form operator
+manual [`my-docs/02-LAPTOP-DEEPSTREAM-SETUP.md` §4.7](../../my-docs/02-LAPTOP-DEEPSTREAM-SETUP.md#47-first-install-caveats-not-in-nvidias-ds-90-installation-page)
+has the expanded version; this is the condensed checklist for the scripted
+harness.
+
+| Pitfall | Fix |
+|---------|-----|
+| `.run` installer needs kernel headers to build `nvidia.ko` | `sudo apt install -y build-essential dkms linux-headers-$(uname -r)` |
+| `add-apt-repository` / `apt-key` missing on minimal 24.04 | `sudo apt install -y software-properties-common ca-certificates gnupg curl` |
+| Distro `nvidia-driver-5xx` preinstalled by Ubuntu installer conflicts with `.run` | `sudo apt purge -y 'nvidia-*' 'libnvidia-*' && sudo apt autoremove -y && sudo reboot` |
+| `nouveau` loaded — `.run` installer will abort | Write `/etc/modprobe.d/blacklist-nouveau.conf` (`blacklist nouveau` + `options nouveau modeset=0`), `sudo update-initramfs -u`, reboot |
+| Secure Boot enabled → `nvidia.ko` unsigned after install | Either disable Secure Boot in BIOS, or let the `.run` installer generate a MOK keypair and complete MOK Manager enrollment on the next boot (`mokutil --sb-state` to check) |
+| `.run` installer fails under GNOME/KDE even after `service gdm stop` | `Ctrl+Alt+F3` → log in at TTY → run `sudo ./NVIDIA-Linux-x86_64-590.48.01.run --no-cc-version-check` from there |
+| `deepstream-9.0_9.0.0-1_amd64.deb` (§5.1) is not `curl`-able anonymously | Sign in at [catalog.ngc.nvidia.com](https://catalog.ngc.nvidia.com/orgs/nvidia/resources/deepstream), download in the browser, `scp` onto the laptop if needed |
+| `cuda-toolkit-13-1` does not touch `PATH` / `LD_LIBRARY_PATH` | Append `export PATH=/usr/local/cuda-13.1/bin:$PATH` and `export LD_LIBRARY_PATH=/usr/local/cuda-13.1/lib64:$LD_LIBRARY_PATH` to `~/.bashrc` |
+| `apt-key` deprecation warning on 24.04 | Cosmetic — the key is installed. 24.04-native equivalent: write the de-armoured key to `/etc/apt/keyrings/nvidia-cuda.gpg` and reference it via `[signed-by=...]` in a `sources.list.d/` file |
+| Disk space | Budget ≥ 12 GB free after Ubuntu install (CUDA ~5 GB, DS SDK ~2 GB, TRT ~1.5 GB, AMC Docker images ~4 GB, PeopleNet ~1 GB) |
+| Optimus / hybrid graphics | Enable discrete GPU as primary renderer in BIOS; `xrandr --setprovideroutputsource` if HDMI-out is needed |
 
 **At this point you may clone this repo and run
 `sudo bash laptop/scripts/00_bootstrap.sh`.** Everything from §5 onward is
-automated.
+automated (with the DS 9.0 .deb install noted in §5 below).
 
-## §5  DeepStream 9.0 + GStreamer 1.24  _(automated by `00_bootstrap.sh`)_
+## §5  DeepStream 9.0 + GStreamer 1.24  _(semi-automated by `00_bootstrap.sh`)_
 
-`00_bootstrap.sh` installs the following via apt:
+The
+[DS 9.0 Installation page](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html)
+documents **three** install methods for x86_64: the NGC Debian package, the
+NGC tar archive, and the DeepStream Docker image. There is no `apt install
+deepstream-9.0` entry — DS 9.0 is not published in
+`developer.download.nvidia.com`'s apt tree.
 
-- `deepstream-9.0`, `deepstream-9.0-reference-graphs`,
-  `deepstream-9.0-samples`.
-- The GStreamer 1.24 plugin set (`gstreamer1.0-{tools,plugins-*,libav,rtsp}`,
-  `libgstrtspserver-1.0-0`).
-- `/etc/profile.d/deepstream.sh` exporting `DEEPSTREAM_DIR`,
-  `/opt/nvidia/deepstream/deepstream-9.0/{bin,lib}` onto `PATH` /
+### §5.1  Manual step (before `00_bootstrap.sh` can finish DS install)
+
+1. Sign in at
+   [catalog.ngc.nvidia.com/orgs/nvidia/resources/deepstream](https://catalog.ngc.nvidia.com/orgs/nvidia/resources/deepstream)
+   and download `deepstream-9.0_9.0.0-1_amd64.deb` to the laptop (any
+   directory is fine — place it next to the cloned repo so the bootstrap
+   script can find it).
+2. Install it with apt so prereqs from §4.1 are resolved as transitive
+   dependencies:
+
+   ```bash
+   sudo apt-get install ./deepstream-9.0_9.0.0-1_amd64.deb
+   ```
+
+3. After the .deb install, apply NVIDIA's RTSP jitter-buffer workaround
+   (from the "Install prerequisite packages" note on the Installation page):
+
+   ```bash
+   sudo /opt/nvidia/deepstream/deepstream/update_rtpmanager.sh
+   ```
+
+> **Tar-archive alternative** (Method 2 on the Installation page):
+>
+> ```bash
+> sudo tar -xvf deepstream_sdk_v9.0.0_x86_64.tbz2 -C /
+> cd /opt/nvidia/deepstream/deepstream-9.0/
+> sudo ./install.sh
+> sudo ldconfig
+> ```
+
+### §5.2  What `00_bootstrap.sh` does after §5.1
+
+Run `00_bootstrap.sh` **after** you have already installed DS 9.0 from the
+NGC `.deb` in §5.1. The script:
+
+- Preflights §1–4 (Ubuntu 24.04, NVIDIA driver, CUDA, cuDNN, TensorRT
+  presence) and refuses to continue if the driver / CUDA / TRT are not
+  detected.
+- Installs the GStreamer 1.24 plugin set (`gstreamer1.0-{tools,plugins-*,libav,rtsp}`,
+  `libgstrtspserver-1.0-0`) — typically a no-op because the DS 9.0 prereq
+  list in §4.1 already pulls these in.
+- Writes `/etc/profile.d/deepstream.sh` exporting `DEEPSTREAM_DIR` and
+  prepending `/opt/nvidia/deepstream/deepstream-9.0/{bin,lib}` onto `PATH` /
   `LD_LIBRARY_PATH`.
+- Installs `mosquitto`, `mosquitto-clients`, Docker Engine, and the NVIDIA
+  Container Toolkit (§6 + §8.2).
+
+> **Known drift between the current script and this doc.** The script's
+> preflight currently accepts driver ≥ 550 and CUDA ≥ 12.4, and its DS
+> install step still attempts `apt install deepstream-9.0` via the CUDA
+> keyring repo — both of which pre-date the DS 9.0 GA release. With DS 9.0
+> the driver / CUDA pins are `590.48.01` / `13.1` and DS itself is only on
+> NGC (see §5.1 above). Re-sync `laptop/scripts/00_bootstrap.sh` against the
+> DS 9.0 Installation page values in §4 before running it end-to-end.
 
 Reference docs (via the skill catalog):
 
-- DS 9.0 Quickstart:
+- DS 9.0 Installation (the authoritative source for §4 and §5.1):
+  <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html>
+- DS 9.0 Quickstart (sample-app smoke test on x86):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Quickstart.html>
 - DS 9.0 deepstream-app:
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_ref_app_deepstream.html>

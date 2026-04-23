@@ -24,7 +24,7 @@ and fail fast with a pointer back to this doc if anything is missing.
 |---|-------------|
 | 1–2 | Hardware (Ampere-or-newer NVIDIA GPU) and BIOS: Secure Boot / virt extensions as per motherboard vendor. |
 | 3 | Dual-boot Ubuntu 24.04 (Rufus / balenaEtcher USB, Windows partition shrink, Ubuntu installer). |
-| 4 | NVIDIA driver ≥ 550, CUDA Toolkit 12.4+, cuDNN 9.x, TensorRT 10.x. |
+| 4 | NVIDIA driver `590.48.01`, CUDA Toolkit `13.1`, cuDNN `9.18.0`, TensorRT `10.14.1.48-1+cuda13.0` (exact pins per the [DS 9.0 Installation page](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html) → dGPU Setup for Ubuntu). |
 
 See [`DEEPSTREAM-SETUP.md`](DEEPSTREAM-SETUP.md) §1–4 for the step-by-step
 procedure.
@@ -66,7 +66,7 @@ below is idempotent — re-runs are safe.
 
 ```mermaid
 flowchart TD
-  N1["Manual (Notion §1-4, OUTSIDE repo)<br/>Ubuntu 24.04 + driver 550+<br/>CUDA 12.4+ / cuDNN 9 / TRT 10"] --> C["git clone repo onto laptop"]
+  N1["Manual (Notion §1-4, OUTSIDE repo)<br/>Ubuntu 24.04 + driver 590.48.01<br/>CUDA 13.1 / cuDNN 9.18.0 / TRT 10.14.1.48<br/>+ DS 9.0 .deb from NGC"] --> C["git clone repo onto laptop"]
   C --> B["00_bootstrap.sh<br/>preflight §1-4<br/>install §5 + §6 + §8.2<br/>write laptop/config/laptop.env"]
   B --> M["10_setup_mosquitto.sh<br/>drop-in mv3dt.conf (§6.2)<br/>systemctl enable/restart"]
   M --> V["20_verify_cameras.sh<br/>ping + ffprobe C1..C8 (§7.5)"]
