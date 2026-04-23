@@ -1,0 +1,66 @@
+# laptop/config/cameras.yml
+#
+# Per-camera static assignment for the DS 9.0 laptop scripted testing
+# harness. Seeded from Notion page 337b5d58-7212-81e1-b07a-d510d9605bbb
+# Section 7.2 (C1..C8 on 192.168.10.101..108).
+#
+# Consumed by:
+#   - laptop/scripts/20_verify_cameras.sh: ping + ffprobe each entry, emit
+#     a pass/fail table (Notion §7.5).
+#   - laptop/scripts/40_export_watcher.sh: when rendering
+#     laptop/deepstream/deepstream_app_config.txt from the template, one
+#     [sourceN] block per enabled entry (in order).
+#   - laptop/scripts/50_start_pipeline.sh: ping-sweep before starting
+#     deepstream-app (Notion §10.1).
+#
+# Fields:
+#   id         - short label (c1..c8); must match [sourceN] ordering below.
+#   ip         - IPv4 address on the camera LAN.
+#   position   - free-form human label (used in the verify-cameras table and
+#                in doc comments inside the rendered deepstream_app_config.txt).
+#   rtsp_path  - RTSP path served by the camera. `/stream1` is the Notion §7.2
+#                default for the reference camera model; overridable per entry
+#                for mixed fleets.
+#   enabled    - set to false to skip a camera without deleting its row.
+
+cameras:
+  - id: c1
+    ip: 192.168.10.101
+    position: "entry-north"
+    rtsp_path: /stream1
+    enabled: true
+  - id: c2
+    ip: 192.168.10.102
+    position: "entry-south"
+    rtsp_path: /stream1
+    enabled: true
+  - id: c3
+    ip: 192.168.10.103
+    position: "aisle-a-west"
+    rtsp_path: /stream1
+    enabled: true
+  - id: c4
+    ip: 192.168.10.104
+    position: "aisle-a-east"
+    rtsp_path: /stream1
+    enabled: true
+  - id: c5
+    ip: 192.168.10.105
+    position: "aisle-b-west"
+    rtsp_path: /stream1
+    enabled: true
+  - id: c6
+    ip: 192.168.10.106
+    position: "aisle-b-east"
+    rtsp_path: /stream1
+    enabled: true
+  - id: c7
+    ip: 192.168.10.107
+    position: "back-corner-left"
+    rtsp_path: /stream1
+    enabled: true
+  - id: c8
+    ip: 192.168.10.108
+    position: "back-corner-right"
+    rtsp_path: /stream1
+    enabled: true
