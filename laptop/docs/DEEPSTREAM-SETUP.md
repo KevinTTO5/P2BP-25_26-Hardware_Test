@@ -47,12 +47,14 @@ driver / CUDA / TRT minors):
 - `NVIDIA-AI-IOT/auto-magic-calib` (§8.3) — cloned into `$HOME/auto-magic-calib/`
 - PeopleNet v2.6.3 deployable (§9.3, only detector this harness installs)
 
-## §1–4  Manual prerequisites (out of scope for every script)
+## §1–4  Manual prerequisites
 
-The laptop must be booted into Ubuntu 24.04 with the full NVIDIA stack in
-place **before** cloning this repo. None of the scripts under
-[`laptop/scripts/`](../scripts/) install any of these; `00_bootstrap.sh` only
-preflights them.
+The laptop must be booted into Ubuntu 24.04 **before** cloning this repo.
+Sections §1–§3 (hardware, BIOS, dual-boot) are manual. The full NVIDIA driver,
+CUDA, cuDNN, and TensorRT stack in §4 is **automated** by
+[`laptop/scripts/00_bootstrap.sh`](../scripts/00_bootstrap.sh) (Phases 2b–3, 4,
+8) once you place the required `.deb` files in `LOCAL_DEB_DIR`; see the callout
+in §4 below.
 
 ### §1 Overview / §2 Hardware & BIOS
 
@@ -70,6 +72,15 @@ installer use the freed space. After first boot, `sudo apt update && sudo
 apt full-upgrade`.
 
 ### §4 NVIDIA driver + CUDA + cuDNN + TensorRT
+
+> **Automated by `laptop/scripts/00_bootstrap.sh` — drop these `.deb` filenames
+> into `LOCAL_DEB_DIR`** (default: `~/Downloads` for the invoking user when you
+> run `sudo bash laptop/scripts/00_bootstrap.sh`): `nvidia-driver-local-repo-ubuntu2404-590.48.01_*_amd64.deb`,
+> `cuda-keyring_1.1-1_all.deb`. Phases 2b–3, 4, and 8 install and verify the
+> driver, CUDA 13.1, cuDNN 9.18, TensorRT 10.14, and GStreamer 1.24. DeepStream
+> `deepstream-9.0_9.0.0-1_amd64.deb` is downloaded in Phase 6 via NGC CLI into
+> the same directory. See the script header and `laptop/config/laptop.env.example`
+> for `LOCAL_DEB_DIR`.
 
 Follow the
 [DeepStream 9.0 Installation page](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html)
@@ -440,7 +451,7 @@ Reference:
    `${LOCATION_ID}` and rewriting each `[sourceN]` `uri=...` with the per-
    camera URL from [`cameras.yml`](../config/cameras.yml).
 
-## §9  MV3DT directory layout + models  _(automated by `25_prepare_models.sh`)_
+## §9  MV3DT directory layout + models  _(PeopleNet: Phase 10 of `00_bootstrap.sh`)_
 
 ### §9.2  Directory layout
 
@@ -456,13 +467,13 @@ laptop/deepstream/
     <LOCATION_ID>/                       # written by 40_export_watcher.sh
   models/
     .gitkeep
-    peoplenet/                           # written by 25_prepare_models.sh
+    peoplenet/                           # written by 00_bootstrap.sh Phase 10
 ```
 
 ### §9.3  Detector model
 
 **PeopleNet only** — matches NVIDIA's DS 9.0 MV3DT reference documentation
-and is intentionally enforced by this plan. `25_prepare_models.sh` runs:
+and is intentionally enforced by this plan. `00_bootstrap.sh` (Phase 10) runs:
 
 ```bash
 ngc registry model download-version "$PEOPLENET_NGC_TAG"

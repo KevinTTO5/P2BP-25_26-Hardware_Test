@@ -16,9 +16,10 @@ companion doc [`DEEPSTREAM-SETUP.md`](DEEPSTREAM-SETUP.md).
 ## Prerequisites (manual, outside this repo)
 
 Complete Notion page `337b5d58-7212-81e1-b07a-d510d9605bbb` **Sections 1–4**
-on the laptop before cloning this repo. No script under
-[`laptop/scripts/`](../scripts/) installs any of these; they only preflight
-and fail fast with a pointer back to this doc if anything is missing.
+on the laptop before cloning this repo (or use `00_bootstrap.sh` with the
+pre-downloaded `.deb` files listed in [`DEEPSTREAM-SETUP.md`](DEEPSTREAM-SETUP.md) §4
+to install the NVIDIA stack and DS 9.0 in phases). Scripts preflight and
+fail fast with a pointer back to this doc if anything is missing.
 
 | § | Manual step |
 |---|-------------|
@@ -40,10 +41,11 @@ cp laptop/config/laptop.env.example laptop/config/laptop.env   # optional; 00 al
 sudo bash laptop/scripts/00_bootstrap.sh
 ```
 
-`00_bootstrap.sh` runs the §1–4 preflight, installs DS 9.0 + GStreamer 1.24
-(Notion §5) + Mosquitto (§6) + Docker/NVIDIA Container Toolkit (§8.2), writes
-`/etc/profile.d/deepstream.sh`, and interactively populates
-[`laptop/config/laptop.env`](../config/laptop.env.example).
+`00_bootstrap.sh` runs phased install: local `.deb` verification, NVIDIA
+driver/CUDA/cuDNN/TRT, runtime (GStreamer, Mosquitto, Docker, NCT), NGC
+DeepStream 9.0 `.deb`, post-install + version audit, `laptop.env`, and
+PeopleNet ONNX into [`laptop/deepstream/models/peoplenet/`](../deepstream/models/).
+See [`DEEPSTREAM-SETUP.md`](DEEPSTREAM-SETUP.md) §4–§5.
 
 ## Script order
 
@@ -52,10 +54,9 @@ below is idempotent — re-runs are safe.
 
 | # | Script | Notion § | What it does | sudo? |
 |---|--------|----------|--------------|-------|
-| 00 | [`00_bootstrap.sh`](../scripts/00_bootstrap.sh) | §5 + §8.2 (preflight §1–4) | Verify §1–4, install DS 9.0 + GStreamer + Mosquitto + Docker + NCT, write `laptop.env`. | yes |
+| 00 | [`00_bootstrap.sh`](../scripts/00_bootstrap.sh) | §4–§5 + §6 + §8.2 + §9.3 | Phased install (NVIDIA stack from local `.debs`, DS 9.0 via NGC, GStreamer, Mosquitto, Docker, NCT), version audit, `laptop.env`, PeopleNet ONNX. | yes |
 | 10 | [`10_setup_mosquitto.sh`](../scripts/10_setup_mosquitto.sh) | §6 | Install [`laptop/mosquitto/mv3dt.conf`](../mosquitto/mv3dt.conf) into `/etc/mosquitto/conf.d/`, enable/restart the service. `--with-firewall` opens 1883/9001 via ufw. | yes |
 | 20 | [`20_verify_cameras.sh`](../scripts/20_verify_cameras.sh) | §7.5 | Ping + `ffprobe` each enabled row in [`laptop/config/cameras.yml`](../config/cameras.yml); pass/fail table. `--allow-partial` to exit 0 on misses. | no |
-| 25 | [`25_prepare_models.sh`](../scripts/25_prepare_models.sh) | §9.2–9.3 | Download the pinned PeopleNet NGC tag (only detector this harness installs) into [`laptop/deepstream/models/peoplenet/`](../deepstream/models/). | no |
 | 30 | [`30_start_amc.sh`](../scripts/30_start_amc.sh) | §8.3–8.5 | Clone `NVIDIA-AI-IOT/auto-magic-calib` into `$HOME/auto-magic-calib/` (never under this repo), template `compose/.env`, `docker compose up -d`, open `http://localhost:5000`. | no (docker group) |
 | — | _human_ | §8.6 | Complete the AMC 6-step workflow in the browser: Project Setup → Video Upload → Parameters → Manual Align → Execute → Results / Export. | — |
 | 40 | [`40_export_watcher.sh`](../scripts/40_export_watcher.sh) | §8.7 | Watch `$HOME/auto-magic-calib/projects/$PROJECT_NAME/exports/`, try upstream `scripts/export_mv3dt.py` (fall back to raw copy), land artefacts in `laptop/deepstream/calibration/$LOCATION_ID/`, render `deepstream_app_config.rendered.txt`. `--oneshot` for single pass. | no |
@@ -67,11 +68,10 @@ below is idempotent — re-runs are safe.
 ```mermaid
 flowchart TD
   N1["Manual (Notion §1-4, OUTSIDE repo)<br/>Ubuntu 24.04 + driver 590.48.01<br/>CUDA 13.1 / cuDNN 9.18.0 / TRT 10.14.1.48<br/>+ DS 9.0 .deb from NGC"] --> C["git clone repo onto laptop"]
-  C --> B["00_bootstrap.sh<br/>preflight §1-4<br/>install §5 + §6 + §8.2<br/>write laptop/config/laptop.env"]
+  C --> B["00_bootstrap.sh<br/>phased install + laptop.env<br/>PeopleNet → models/peoplenet/ (§9.3)"]
   B --> M["10_setup_mosquitto.sh<br/>drop-in mv3dt.conf (§6.2)<br/>systemctl enable/restart"]
   M --> V["20_verify_cameras.sh<br/>ping + ffprobe C1..C8 (§7.5)"]
-  V --> D["25_prepare_models.sh<br/>NGC download PeopleNet (§9.3)<br/>laptop/deepstream/models/peoplenet/"]
-  D --> A["30_start_amc.sh<br/>clone AMC to $HOME/auto-magic-calib<br/>docker compose up (§8.3-8.5)<br/>open http://localhost:5000"]
+  V --> A["30_start_amc.sh<br/>clone AMC to $HOME/auto-magic-calib<br/>docker compose up (§8.3-8.5)<br/>open http://localhost:5000"]
   A --> H["Human: AMC 6 steps in browser (§8.6)"]
   H --> W["40_export_watcher.sh<br/>ingest AMC exports (§8.7)<br/>render deepstream_app_config.rendered.txt"]
   W --> P["50_start_pipeline.sh (§10.1)<br/>deepstream-app -c ..."]
@@ -86,7 +86,7 @@ gitignored via the nested [`laptop/.gitignore`](../.gitignore)):
 | Path | Owner | Gitignored |
 |------|-------|------------|
 | `laptop/config/laptop.env` | `00_bootstrap.sh` | yes |
-| `laptop/deepstream/models/peoplenet/` | `25_prepare_models.sh` | yes (the NGC download is ~100 MB) |
+| `laptop/deepstream/models/peoplenet/` | `00_bootstrap.sh` (Phase 10) | yes (the NGC download is ~100 MB) |
 | `laptop/deepstream/calibration/<LOCATION_ID>/` | `40_export_watcher.sh` | yes (parent dir kept via `.gitkeep`) |
 | `laptop/deepstream/deepstream_app_config.rendered.txt` | `40_export_watcher.sh` | yes |
 

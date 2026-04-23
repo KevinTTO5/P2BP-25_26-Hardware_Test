@@ -5,7 +5,8 @@
 # drop-in configuration for the DS 9.0 laptop scripted testing harness.
 #
 # Responsibilities (only this, matching the plan):
-#   1. Verify mosquitto was already installed by 00_bootstrap.sh.
+#   1. Ensure mosquitto (broker + clients + libmosquitto1 per DS 9.0 dGPU docs)
+#      is installed via apt when missing.
 #   2. Install laptop/mosquitto/mv3dt.conf into /etc/mosquitto/conf.d/mv3dt.conf
 #      (atomic replace; idempotent).
 #   3. Enable + restart the mosquitto service.
@@ -13,15 +14,16 @@
 #      operators who have ufw enabled. Default posture skips ufw to match the
 #      "simple testing" harness.
 #
-# This script never installs mosquitto itself (00_bootstrap.sh does that), and
-# never reaches outside the laptop/ subtree except to write under /etc/ and
-# call `systemctl` / `ufw`.
+# This script never reaches outside the laptop/ subtree except to write under
+# /etc/ and call `apt-get` / `systemctl` / `ufw`.
 #
 # References (via .cursor/skills/deepstream-9-docs/):
 #   - DS 9.0 IoT / Edge-to-Cloud Messaging:
 #     https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_IoT.html
 #   - Gst-nvmsgbroker (MQTT proto lib):
 #     https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvmsgbroker.html
+#   - DS 9.0 dGPU prerequisites (libmosquitto1):
+#     https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html
 
 set -euo pipefail
 
@@ -29,19 +31,48 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 
+# Pauses so the operator can read a generated config file before the script
+# continues. Prints location, purpose, contents, and customisation hints.
+# Usage: pause_for_config_review <path> <one-line-purpose> <customisation-hint>
+pause_for_config_review() {
+  local path="$1" purpose="$2" hints="$3"
+  cat >&2 <<EOF
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONFIG FILE REVIEW — please read before continuing
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Location : $path
+Purpose  : $purpose
+
+Contents:
+$(sed 's/^/  /' "$path")
+
+How to customise for this project:
+$hints
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EOF
+  if [[ "${NONINTERACTIVE:-0}" -eq 0 ]]; then
+    read -r -p "Press Enter to continue (Ctrl-C to abort)..." _dummy </dev/tty || true
+  else
+    log_info "Non-interactive mode: skipping pause for $path."
+  fi
+}
+
 WITH_FIREWALL=0
+NONINTERACTIVE=0
 
 usage() {
   cat <<'EOF'
-Usage: 10_setup_mosquitto.sh [--with-firewall] [-h|--help]
+Usage: 10_setup_mosquitto.sh [--with-firewall] [--non-interactive] [-h|--help]
 
-Installs the laptop/mosquitto/mv3dt.conf drop-in into /etc/mosquitto/conf.d/
-and restarts the mosquitto service. Must be run with sudo.
+Installs mosquitto packages if needed, drops laptop/mosquitto/mv3dt.conf into
+/etc/mosquitto/conf.d/, and restarts the mosquitto service. Must be run with sudo.
 
 Options:
   --with-firewall   Also open 1883/tcp and 9001/tcp via ufw (Notion §6.3).
                     Skipped by default because the simple-testing posture
                     does not assume ufw is active.
+  --non-interactive Skip the post-config "Press Enter" pause (for CI/scripted runs).
   -h, --help        Show this help and exit.
 EOF
 }
@@ -49,6 +80,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --with-firewall) WITH_FIREWALL=1 ;;
+    --non-interactive) NONINTERACTIVE=1 ;;
     -h|--help) usage; exit 0 ;;
     *) log_error "Unknown argument: $1"; usage; exit 2 ;;
   esac
@@ -58,6 +90,25 @@ done
 require_root
 require_tool systemctl
 require_tool install
+
+# DS 9.0 dGPU prerequisite: libmosquitto1 (MQTT adapter library for libnvds_mqtt_proto.so)
+# Source: https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html
+#   "Install prerequisite packages" → libmosquitto1
+# Also install the broker (mosquitto) and CLI tools (mosquitto-clients) needed by this
+# testing harness.
+if ! dpkg -s mosquitto >/dev/null 2>&1; then
+  log_info "Installing mosquitto, mosquitto-clients, libmosquitto1 (DS 9.0 dGPU prereq)"
+  apt-get install -y --no-install-recommends \
+    libmosquitto1 \
+    mosquitto \
+    mosquitto-clients
+else
+  log_info "mosquitto already installed; skipping apt install."
+  # Ensure libmosquitto1 is present even if mosquitto was pre-installed without it.
+  dpkg -s libmosquitto1 >/dev/null 2>&1 || \
+    apt-get install -y --no-install-recommends libmosquitto1
+fi
+
 require_tool mosquitto
 
 SRC_CONF="$(repo_root)/laptop/mosquitto/mv3dt.conf"
@@ -76,6 +127,14 @@ cp "$SRC_CONF" "$TMP_CONF"
 chmod 0644 "$TMP_CONF"
 chown root:root "$TMP_CONF"
 mv -f "$TMP_CONF" "$DST_CONF"
+
+pause_for_config_review "$DST_CONF" \
+  "Drop-in broker config for DeepStream 9.0 MV3DT / nvmsgbroker MQTT telemetry (listeners, limits, anonymous access for lab use)." \
+  "- listener 1883 0.0.0.0 — change 0.0.0.0 to 127.0.0.1 to restrict MQTT to localhost only
+- listener 9001 / protocol websockets — comment out or remove if no browser-based MQTT inspector is needed
+- allow_anonymous true — set to false and add a password_file for production hardening
+- max_inflight_messages, max_queued_messages — tune if the nvmsgbroker sink drops messages under load
+- MQTT_HOST, MQTT_PORT, MQTT_TOPIC_BASE in laptop/config/laptop.env must match what 50_start_pipeline.sh passes to the DeepStream nvmsgbroker sink"
 
 log_info "Enabling mosquitto service"
 systemctl enable mosquitto >/dev/null

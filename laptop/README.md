@@ -12,36 +12,36 @@ DS 9.0 setup reference: [`laptop/docs/DEEPSTREAM-SETUP.md`](docs/DEEPSTREAM-SETU
 ## Prerequisites (manual, outside this repo)
 
 Complete Notion page `337b5d58-7212-81e1-b07a-d510d9605bbb` **Sections 1–4**
-before running anything here. Scripts in `laptop/scripts/` only _preflight_
-these and never install them:
+as needed. You can do the full NVIDIA + DS stack with `00_bootstrap.sh` and
+the pre-downloaded `.deb` files listed in
+[`laptop/docs/DEEPSTREAM-SETUP.md`](docs/DEEPSTREAM-SETUP.md) §4, or install
+the §1–4 pins manually and use bootstrap for the rest. Summary:
 
 - §1–2: Hardware (Ampere-or-newer NVIDIA GPU) and BIOS.
 - §3: Dual-boot Ubuntu 24.04.
-- §4: NVIDIA driver ≥ 550, CUDA Toolkit ≥ 12.4, cuDNN 9.x, TensorRT 10.x.
-
-See [`laptop/docs/DEEPSTREAM-SETUP.md`](docs/DEEPSTREAM-SETUP.md) §1–4 for
-the step-by-step manual procedure.
+- §4: Driver `590.48.01`, CUDA `13.1`, cuDNN `9.18.0`, TRT `10.14.1.48-1+cuda13.0` (exact pins in that doc).
 
 ## Minimal post-clone sequence
 
 ```bash
 cd P2BP-25_26-Hardware_Test
 cp laptop/config/laptop.env.example laptop/config/laptop.env
-bash laptop/scripts/00_bootstrap.sh
+sudo bash laptop/scripts/00_bootstrap.sh
 ```
 
-`00_bootstrap.sh` preflights §1–4, installs Notion §5 (DS 9.0 + GStreamer
-1.24), §6 (Mosquitto), and §8.2 (Docker + NVIDIA Container Toolkit), then
-writes `laptop/config/laptop.env` interactively.
+`00_bootstrap.sh` performs a phased install: pre-downloaded NVIDIA `.debs` (see
+`docs/DEEPSTREAM-SETUP.md` §4), driver/CUDA/cuDNN/TensorRT, GStreamer, Mosquitto,
+Docker, NVIDIA Container Toolkit, DeepStream 9.0 from NGC, version audit,
+`laptop/config/laptop.env`, and PeopleNet ONNX into `laptop/deepstream/models/peoplenet/`.
+Re-runs are resumable via `/var/lib/mv3dt-laptop-bootstrap.state`.
 
 ## Script order
 
 | # | Script | Notion § | Purpose |
 |---|--------|----------|---------|
-| 00 | [`scripts/00_bootstrap.sh`](scripts/00_bootstrap.sh) | §5 + §8.2 (preflight §1–4) | Preflight + install DS 9.0, GStreamer, Mosquitto, Docker, NCT |
+| 00 | [`scripts/00_bootstrap.sh`](scripts/00_bootstrap.sh) | §4–§5 + §6 + §8.2 + §9.3 | Phased full stack + `laptop.env` + PeopleNet |
 | 10 | [`scripts/10_setup_mosquitto.sh`](scripts/10_setup_mosquitto.sh) | §6 | Install `mv3dt.conf` into `/etc/mosquitto/conf.d/`, enable service |
 | 20 | [`scripts/20_verify_cameras.sh`](scripts/20_verify_cameras.sh) | §7.5 | Ping + `ffprobe` C1..C8, print pass/fail table |
-| 25 | [`scripts/25_prepare_models.sh`](scripts/25_prepare_models.sh) | §9.2–9.3 | Download PeopleNet into `laptop/deepstream/models/peoplenet/` |
 | 30 | [`scripts/30_start_amc.sh`](scripts/30_start_amc.sh) | §8.3–8.5 | Clone AMC into `$HOME/auto-magic-calib/`, `docker compose up -d`, open UI |
 | — | _human_ | §8.6 | AMC 6-step workflow in the browser |
 | 40 | [`scripts/40_export_watcher.sh`](scripts/40_export_watcher.sh) | §8.7 | Ingest AMC exports, render pipeline config |
@@ -63,7 +63,7 @@ laptop/
 │   ├── config_tracker_NvMOT.yml     # NvDCF + ReID + SV3DT + MV3DT
 │   ├── msgconv_config.txt
 │   ├── calibration/<LOCATION_ID>/   # written by 40_export_watcher.sh (gitignored)
-│   └── models/peoplenet/            # written by 25_prepare_models.sh (gitignored)
+│   └── models/peoplenet/            # written by 00_bootstrap.sh Phase 10 (gitignored)
 └── scripts/
     ├── lib/common.sh                # env loader + logging + require-tool helpers
     ├── 00_bootstrap.sh ... 99_stop_all.sh

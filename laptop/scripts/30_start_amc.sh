@@ -11,7 +11,9 @@
 #     ownership tweak from Notion §8.3.
 #   * writes $AMC_ROOT/compose/.env mapping HOST_IP, ports, PROJECT_DIR,
 #     MODEL_DIR, NVIDIA_VISIBLE_DEVICES=all from laptop/config/laptop.env.
+#   * interactive prompt (TTY) before docker compose pull/up; non-TTY auto-starts.
 #   * docker compose pull && docker compose up -d.
+#   * optional AMC UI readiness poll (curl) plus docker compose ps status banner.
 #   * xdg-open http://localhost:${AUTO_MAGIC_CALIB_UI_PORT} if on a desktop
 #     session; otherwise prints the URL.
 #
@@ -27,6 +29,33 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 SKIP_PULL=0
+
+# Poll until the AMC web UI answers or timeout (non-fatal).
+_wait_amc_ui() {
+  local url="$1" compose_dir="$2" timeout=30 i
+  shift 2
+  local -a dc=("$@")
+
+  if ! command -v curl >/dev/null 2>&1; then
+    log_warn "curl not found; skipping AMC UI readiness poll."
+    return 0
+  fi
+
+  log_info "Waiting for AMC UI at $url (up to ${timeout}s)..."
+  for (( i=1; i<=timeout; i++ )); do
+    if curl -sf --max-time 1 "$url" >/dev/null 2>&1; then
+      log_info "AMC UI responded after ${i}s."
+      return 0
+    fi
+    printf '  [%2ds] waiting...\r' "$i" >&2
+    sleep 1
+  done
+  printf '\n' >&2
+  local logs_hint
+  logs_hint="cd $(printf '%q' "$compose_dir") && ${dc[*]} logs"
+  log_warn "AMC UI did not respond within ${timeout}s. Check: $logs_hint"
+  return 0
+}
 
 usage() {
   cat <<'EOF'
@@ -158,6 +187,23 @@ mv -f "$TMP_ENV" "$ENV_FILE"
 
 mkdir -p "$PROJECT_DIR/$PROJECT_NAME"
 
+URL="http://localhost:${AUTO_MAGIC_CALIB_UI_PORT}"
+MS_URL="http://localhost:${AUTO_MAGIC_CALIB_MS_PORT}"
+MANUAL_UP="cd $(printf '%q' "$COMPOSE_DIR") && ${DC[*]} up -d"
+
+log_info "AMC stack is configured and ready."
+echo "  Compose dir : $COMPOSE_DIR" >&2
+echo "  UI port     : ${AUTO_MAGIC_CALIB_UI_PORT}  →  $URL" >&2
+echo "  MS port     : ${AUTO_MAGIC_CALIB_MS_PORT}  →  $MS_URL" >&2
+echo "" >&2
+if [[ -t 0 ]]; then
+  echo "Press [Enter] to start the AMC stack now (pull + up), or Ctrl-C to abort and start manually later." >&2
+  echo "  Manual start: $MANUAL_UP" >&2
+  read -rp ""
+else
+  log_info "Non-interactive stdin; starting AMC stack now without confirmation."
+fi
+
 if [[ "$SKIP_PULL" -ne 1 ]]; then
   log_info "docker compose pull (in $COMPOSE_DIR)"
   ( cd "$COMPOSE_DIR" && "${DC[@]}" pull ) || \
@@ -167,7 +213,8 @@ fi
 log_info "docker compose up -d (in $COMPOSE_DIR)"
 ( cd "$COMPOSE_DIR" && "${DC[@]}" up -d )
 
-URL="http://localhost:${AUTO_MAGIC_CALIB_UI_PORT}"
+_wait_amc_ui "$URL" "$COMPOSE_DIR" "${DC[@]}"
+
 log_info "AMC web UI should be reachable at $URL"
 
 if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
@@ -178,18 +225,37 @@ else
   log_info "Headless session detected; open $URL in your browser manually."
 fi
 
+STOP_SCRIPT="$REPO_ROOT/laptop/scripts/99_stop_all.sh"
+LOGS_CMD="cd $(printf '%q' "$COMPOSE_DIR") && ${DC[*]} logs -f"
+PSC_OUT="$(cd "$COMPOSE_DIR" && "${DC[@]}" ps 2>&1)" || PSC_OUT="(docker compose ps failed — run from $COMPOSE_DIR)"
+
 cat <<EOF
 
-AMC is now running. Complete the 6-step workflow in the browser
-(Notion §8.6, cross-referenced with the DS 9.0 AutoMagicCalib guide):
-  1. Project Setup   2. Video Upload   3. Parameters
-  4. Manual Align    5. Execute        6. Results / Export
-Reference: https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_AutoMagicCalib.html
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ AMC STATUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+$PSC_OUT
 
-VGGT note (via .cursor/skills/deepstream-9-docs/): if AMC times out during
-"Execute", the common cause is GPU VRAM pressure from the VGGT stage — see
-the AutoMagicCalib doc for the workaround.
+  Web UI  : $URL
+  API     : $MS_URL
 
-When AMC finishes export, start the watcher in a second shell:
-  laptop/scripts/40_export_watcher.sh
+ MANAGE
+  Logs    : $LOGS_CMD
+  Stop AMC only  : $STOP_SCRIPT --no-deepstream --no-mosquitto
+  Stop everything: $STOP_SCRIPT
+
+ NEXT STEP
+  Complete the 6-step AMC workflow in the browser (Notion §8.6,
+  cross-referenced with the DS 9.0 AutoMagicCalib guide):
+    1. Project Setup   2. Video Upload   3. Parameters
+    4. Manual Align    5. Execute        6. Results / Export
+  Reference: https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_AutoMagicCalib.html
+
+  VGGT note (via .cursor/skills/deepstream-9-docs/): if AMC times out during
+  "Execute", the common cause is GPU VRAM pressure from the VGGT stage — see
+  the AutoMagicCalib doc for the workaround.
+
+  When AMC finishes export, start the watcher in a second shell:
+    laptop/scripts/40_export_watcher.sh
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EOF

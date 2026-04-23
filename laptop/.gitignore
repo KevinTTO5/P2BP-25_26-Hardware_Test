@@ -13,7 +13,7 @@ config/laptop.env
 # layout survives a fresh clone.
 deepstream/calibration/*/
 
-# Downloaded NGC detection models (populated by 25_prepare_models.sh).
+# Downloaded NGC detection models (populated by 00_bootstrap.sh Phase 10).
 deepstream/models/*/
 
 # Rendered pipeline config produced by 40_export_watcher.sh from the template.
