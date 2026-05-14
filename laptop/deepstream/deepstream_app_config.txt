@@ -1,8 +1,7 @@
 # laptop/deepstream/deepstream_app_config.txt
 #
 # DeepStream 9.0 MV3DT pipeline template for the laptop-side scripted
-# testing harness. 8 RTSP sources (Notion page
-# 337b5d58-7212-81e1-b07a-d510d9605bbb §7.2 — C1..C8 at 192.168.10.101..108)
+# testing harness. Eight RTSP sources (C1..C8; IPs from laptop/config/cameras.yml)
 # through a single nvstreammux (batch=8) into nvinfer (PeopleNet only) into
 # the NvMultiObjectTracker shared library (NvDCF + ReID + SV3DT + MV3DT),
 # with an MQTT sink publishing SV3DT + fused MV3DT tracks to localhost.
@@ -37,7 +36,7 @@ enable=0
 [source0]
 enable=1
 type=4
-uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@192.168.10.101:554/stream1
+uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@169.254.9.14:554/Streaming/Channels/101
 num-sources=1
 gpu-id=0
 cudadec-memtype=0
@@ -46,7 +45,7 @@ camera-id=1
 [source1]
 enable=1
 type=4
-uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@192.168.10.102:554/stream1
+uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@169.254.124.198:554/Streaming/Channels/101
 num-sources=1
 gpu-id=0
 cudadec-memtype=0
@@ -55,7 +54,7 @@ camera-id=2
 [source2]
 enable=1
 type=4
-uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@192.168.10.103:554/stream1
+uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@169.254.102.152:554/Streaming/Channels/101
 num-sources=1
 gpu-id=0
 cudadec-memtype=0
@@ -64,7 +63,7 @@ camera-id=3
 [source3]
 enable=1
 type=4
-uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@192.168.10.104:554/stream1
+uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@169.254.33.142:554/Streaming/Channels/101
 num-sources=1
 gpu-id=0
 cudadec-memtype=0
@@ -73,7 +72,7 @@ camera-id=4
 [source4]
 enable=1
 type=4
-uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@192.168.10.105:554/stream1
+uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@169.254.33.155:554/Streaming/Channels/101
 num-sources=1
 gpu-id=0
 cudadec-memtype=0
@@ -82,7 +81,7 @@ camera-id=5
 [source5]
 enable=1
 type=4
-uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@192.168.10.106:554/stream1
+uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@169.254.19.210:554/Streaming/Channels/101
 num-sources=1
 gpu-id=0
 cudadec-memtype=0
@@ -91,7 +90,7 @@ camera-id=6
 [source6]
 enable=1
 type=4
-uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@192.168.10.107:554/stream1
+uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@169.254.72.24:554/Streaming/Channels/101
 num-sources=1
 gpu-id=0
 cudadec-memtype=0
@@ -100,7 +99,7 @@ camera-id=7
 [source7]
 enable=1
 type=4
-uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@192.168.10.108:554/stream1
+uri=rtsp://${CAM_USER}:${CAM_PASSWORD}@169.254.82.77:554/Streaming/Channels/101
 num-sources=1
 gpu-id=0
 cudadec-memtype=0
