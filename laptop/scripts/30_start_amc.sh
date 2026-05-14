@@ -70,7 +70,10 @@ Options:
   -h, --help    Show this help and exit.
 
 Environment used (laptop/config/laptop.env):
-  HOST_IP                    IPv4 on camera LAN (required).
+  HOST_IP                    Used by AMC UI as API host unless overridden below.
+  AUTO_MAGIC_CALIB_MS_API_URL Optional full API base (e.g. http://127.0.0.1:8000/v1)
+                             when the browser runs on this laptop but HOST_IP is a
+                             different LAN address — avoids UI hangs on wrong API host.
   LOCATION_ID / PROJECT_NAME Project label used by AMC.
   NGC_API_KEY                Enables non-interactive 'docker login nvcr.io'.
   AMC_ROOT                   AMC clone path (default $HOME/auto-magic-calib).
@@ -183,6 +186,10 @@ MODEL_DIR=${MODEL_DIR}
 NVIDIA_VISIBLE_DEVICES=all
 PROJECT_NAME=${PROJECT_NAME}
 EOF
+if [[ -n "${AUTO_MAGIC_CALIB_MS_API_URL:-}" ]]; then
+  printf '%s\n' "AUTO_MAGIC_CALIB_MS_API_URL=${AUTO_MAGIC_CALIB_MS_API_URL}" >> "$TMP_ENV"
+  log_info "AMC UI API_URL overridden via AUTO_MAGIC_CALIB_MS_API_URL (fixes hangs when HOST_IP is unreachable from this browser)."
+fi
 mv -f "$TMP_ENV" "$ENV_FILE"
 
 mkdir -p "$PROJECT_DIR/$PROJECT_NAME"
