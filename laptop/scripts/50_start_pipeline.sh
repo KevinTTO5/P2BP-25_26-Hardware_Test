@@ -17,6 +17,9 @@
 #      committed template if the rendered copy is missing and --force is
 #      passed, since the template still contains ${CAM_USER}/${CAM_PASSWORD}
 #      placeholders and is not directly runnable without render.
+#   5. Optional sponsor preview mode (`--preview`) deterministically patches
+#      the selected config into a display-enabled profile while keeping MQTT
+#      publishing enabled.
 #
 # On first line of pipeline output the script prints the Notion §10.2
 # validation helpers (mosquitto_sub + nvidia-smi watch) so the operator can
@@ -40,11 +43,12 @@ FORCE_TEMPLATE=0
 DRY_RUN=0
 CONFIG_OVERRIDE=""
 SKIP_PING=0
+PREVIEW=0
 PING_TIMEOUT="${CAMERA_PING_TIMEOUT:-2}"
 
 usage() {
   cat <<'EOF'
-Usage: 50_start_pipeline.sh [--config <path>] [--force-template]
+Usage: 50_start_pipeline.sh [--config <path>] [--force-template] [--preview]
                             [--skip-ping] [--dry-run] [-h|--help]
 
 Runs the DS 9.0 MV3DT pipeline for the laptop testing harness (Notion §10.1).
@@ -58,6 +62,9 @@ Options:
                     contains ${CAM_USER}/${CAM_PASSWORD} placeholders, so this
                     is only useful for syntax/structure smoke tests.
   --skip-ping       Skip the C1..C8 ping-sweep sanity check.
+  --preview         Generate and use a display-enabled preview config
+                    (deepstream_app_config.preview.txt) while preserving
+                    MQTT publishing. Use this for sponsor-facing demos.
   --dry-run         Print the final command and exit without launching
                     deepstream-app.
   -h, --help        Show this help and exit.
@@ -74,6 +81,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --force-template) FORCE_TEMPLATE=1 ;;
     --skip-ping) SKIP_PING=1 ;;
+    --preview) PREVIEW=1 ;;
     --dry-run) DRY_RUN=1 ;;
     -h|--help) usage; exit 0 ;;
     *) log_error "Unknown argument: $1"; usage; exit 2 ;;
@@ -92,6 +100,7 @@ REPO_ROOT="$(repo_root)"
 DS_DIR="$REPO_ROOT/laptop/deepstream"
 TEMPLATE="$DS_DIR/deepstream_app_config.txt"
 RENDERED="$DS_DIR/deepstream_app_config.rendered.txt"
+PREVIEW_RENDERED="$DS_DIR/deepstream_app_config.preview.txt"
 
 if [[ ! -d "$DS_DIR" ]]; then
   die "Missing $DS_DIR. This script expects to run from a fresh clone of the repo."
@@ -235,6 +244,133 @@ if [[ ! -f "$CONFIG" ]]; then
   die "Config file not found: $CONFIG"
 fi
 
+generate_preview_config() {
+  local src="$1"
+  local out="$2"
+  python3 - "$src" "$out" <<'PY'
+import math
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+src_path = Path(sys.argv[1])
+out_path = Path(sys.argv[2])
+
+lines = src_path.read_text(encoding="utf-8").splitlines()
+
+def section_ranges(text_lines):
+    starts = []
+    for idx, line in enumerate(text_lines):
+        m = re.match(r"^\[([^\]]+)\]\s*$", line.strip())
+        if m:
+            starts.append((m.group(1), idx))
+    ranges = []
+    for i, (name, start) in enumerate(starts):
+        end = starts[i + 1][1] if i + 1 < len(starts) else len(text_lines)
+        ranges.append((name, start, end))
+    return ranges
+
+def set_section_values(text_lines, section_name, updates):
+    ranges = section_ranges(text_lines)
+    lower = section_name.lower()
+    target = None
+    for name, start, end in ranges:
+        if name.lower() == lower:
+            target = (start, end)
+            break
+    if target is None:
+        if text_lines and text_lines[-1].strip():
+            text_lines.append("")
+        text_lines.append(f"[{section_name}]")
+        for key, value in updates.items():
+            text_lines.append(f"{key}={value}")
+        return
+
+    start, end = target
+    key_positions = {}
+    for idx in range(start + 1, end):
+        m = re.match(r"^([A-Za-z0-9_-]+)\s*=.*$", text_lines[idx].strip())
+        if m:
+            key = m.group(1)
+            if key not in key_positions:
+                key_positions[key] = idx
+
+    for key, value in updates.items():
+        if key in key_positions:
+            text_lines[key_positions[key]] = f"{key}={value}"
+
+    missing = [k for k in updates if k not in key_positions]
+    if missing:
+        insert_at = end
+        for offset, key in enumerate(missing):
+            text_lines.insert(insert_at + offset, f"{key}={updates[key]}")
+
+def count_enabled_sources(text_lines):
+    count = 0
+    for name, start, end in section_ranges(text_lines):
+        if not re.match(r"^source\d+$", name, flags=re.IGNORECASE):
+            continue
+        enabled = True
+        for idx in range(start + 1, end):
+            m = re.match(r"^enable\s*=\s*(.+)$", text_lines[idx].strip(), flags=re.IGNORECASE)
+            if m:
+                val = m.group(1).strip().lower()
+                enabled = val not in ("0", "false", "no")
+                break
+        if enabled:
+            count += 1
+    return max(count, 1)
+
+source_count = count_enabled_sources(lines)
+rows = math.ceil(math.sqrt(source_count))
+cols = math.ceil(source_count / rows)
+
+set_section_values(lines, "tiled-display", {
+    "enable": "1",
+    "rows": str(rows),
+    "columns": str(cols),
+    "width": "1920",
+    "height": "1080",
+})
+set_section_values(lines, "sink0", {
+    "enable": "1",
+    "type": "2",
+    "sync": "0",
+    "gpu-id": "0",
+})
+set_section_values(lines, "sink1", {"enable": "1"})
+set_section_values(lines, "osd", {
+    "enable": "1",
+    "gpu-id": "0",
+    "border-width": "2",
+    "text-size": "16",
+    "text-color": "1;1;1;1",
+    "text-bg-color": "0;0;0;0.5",
+    "font": "Serif",
+    "show-clock": "0",
+    "clock-x-offset": "40",
+    "clock-y-offset": "20",
+})
+
+header = (
+    "# Auto-generated by laptop/scripts/50_start_pipeline.sh --preview\n"
+    f"# Source config: {src_path}\n"
+    f"# Generated UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+    f"# Active sources: {source_count}  tiled rows x cols: {rows} x {cols}\n\n"
+)
+out_path.write_text(header + "\n".join(lines) + "\n", encoding="utf-8")
+print(out_path)
+PY
+}
+
+if [[ "$PREVIEW" -eq 1 ]]; then
+  require_tool python3
+  log_info "Generating sponsor preview config: $PREVIEW_RENDERED"
+  generate_preview_config "$CONFIG" "$PREVIEW_RENDERED"
+  CONFIG="$PREVIEW_RENDERED"
+fi
+
 cat <<EOF
 
 [validation helpers — Notion §10.2]
@@ -252,6 +388,9 @@ Run these in a second tty while the pipeline is active:
 EOF
 
 log_info "Launching: deepstream-app -c $(basename "$CONFIG") (cwd: $DS_DIR)"
+if [[ "$PREVIEW" -eq 1 ]]; then
+  log_info "Preview mode ON: DeepStream display sink enabled for live on-screen demo."
+fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "cd $DS_DIR && deepstream-app -c $CONFIG"

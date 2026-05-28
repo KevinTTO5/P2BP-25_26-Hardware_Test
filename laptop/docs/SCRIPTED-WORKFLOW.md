@@ -60,7 +60,9 @@ below is idempotent — re-runs are safe.
 | 30 | [`30_start_amc.sh`](../scripts/30_start_amc.sh) | §8.3–8.5 | Clone `NVIDIA-AI-IOT/auto-magic-calib` into `$HOME/auto-magic-calib/` (never under this repo), template `compose/.env`, `docker compose up -d`, open `http://localhost:5000`. | no (docker group) |
 | — | _human_ | §8.6 | Complete the AMC 6-step workflow in the browser: Project Setup → Video Upload → Parameters → Manual Align → Execute → Results / Export. | — |
 | 40 | [`40_export_watcher.sh`](../scripts/40_export_watcher.sh) | §8.7 | Watch `$HOME/auto-magic-calib/projects/$PROJECT_NAME/exports/`, try upstream `scripts/export_mv3dt.py` (fall back to raw copy), land artefacts in `laptop/deepstream/calibration/$LOCATION_ID/`, render `deepstream_app_config.rendered.txt`. `--oneshot` for single pass. | no |
-| 50 | [`50_start_pipeline.sh`](../scripts/50_start_pipeline.sh) | §10.1–10.2 | Ensure `mosquitto` is up, ping-sweep C1..C8, source `/etc/profile.d/deepstream.sh`, `exec deepstream-app -c ...` from `laptop/deepstream/`; prints §10.2 validation helpers. | no (sudo for mosquitto only if not already active) |
+| 50 | [`50_start_pipeline.sh`](../scripts/50_start_pipeline.sh) | §10.1–10.2 | Ensure `mosquitto` is up, ping-sweep C1..C8, source `/etc/profile.d/deepstream.sh`, `exec deepstream-app -c ...` from `laptop/deepstream/`; prints §10.2 validation helpers. Use `--preview` for sponsor-visible on-screen DeepStream output while keeping MQTT publish enabled. | no (sudo for mosquitto only if not already active) |
+| 60 | [`60_record_tracking.sh`](../scripts/60_record_tracking.sh) | §10.2 extension | Subscribe to `mv3dt/#` and persist local exports under `laptop/tracking_exports/<run_id>/`: `tracks.jsonl`, `tracks.csv`, `summary.json`. | no |
+| 70 | [`70_plot_floorplan.py`](../scripts/70_plot_floorplan.py) | sponsor artifact | Plot trajectories from `tracks.csv`/`tracks.jsonl` into `artifacts/floorplan_paths_*.png` (optional background image for floor plan). | no |
 | 99 | [`99_stop_all.sh`](../scripts/99_stop_all.sh) | — | Stop `deepstream-app` (SIGTERM → SIGKILL), `docker compose down` AMC, `systemctl stop mosquitto`. Per-step skip flags. | partial |
 
 ## End-to-end flow
@@ -117,6 +119,61 @@ systemctl status mosquitto --no-pager
 You should see one JSON-ish payload per tracked object per frame on the
 `mv3dt/<LOCATION_ID>/sv3d` topic and, once MV3DT fuses across cameras, on
 `mv3dt/<LOCATION_ID>/fused`.
+
+## Sponsor demo flow (visible + exportable)
+
+This flow gives you both sponsor-visible live DeepStream and local files for
+future floor plan / point cloud work:
+
+```bash
+# 1) Ensure latest calibration export was ingested and DS config rendered.
+bash laptop/scripts/40_export_watcher.sh --oneshot
+
+# 2) Start DeepStream in visible preview mode (windowed) while still publishing MQTT.
+bash laptop/scripts/50_start_pipeline.sh --preview
+```
+
+In another terminal:
+
+```bash
+# 3) Record tracking payloads to local files (Ctrl-C when done).
+bash laptop/scripts/60_record_tracking.sh
+```
+
+After recording stops:
+
+```bash
+# 4) Generate a presentation-ready path plot from the latest run.
+python3 laptop/scripts/70_plot_floorplan.py --run-dir laptop/tracking_exports/<run_id>
+
+# Optional: overlay onto an existing floor-plan image.
+python3 laptop/scripts/70_plot_floorplan.py \
+  --run-dir laptop/tracking_exports/<run_id> \
+  --floorplan-image /path/to/floorplan.png
+```
+
+Expected local outputs:
+
+- `laptop/tracking_exports/<run_id>/tracks.jsonl` (raw topic + payload envelope)
+- `laptop/tracking_exports/<run_id>/tracks.csv` (flattened XY rows for analysis)
+- `laptop/tracking_exports/<run_id>/summary.json` (message counts, timing, topic breakdown)
+- `laptop/tracking_exports/<run_id>/artifacts/floorplan_paths_*.png` (sponsor artifact)
+
+### Sponsor troubleshooting
+
+- **No DeepStream window appears**
+  - Use `--preview` on `50_start_pipeline.sh` (default is headless mode).
+  - Confirm desktop session/`DISPLAY` is available on the laptop.
+  - Check that `deepstream_app_config.preview.txt` was generated under `laptop/deepstream/`.
+- **Recorder creates files but `tracks.csv` is sparse/empty**
+  - Verify pipeline is running and publishing with `mosquitto_sub -h 127.0.0.1 -t 'mv3dt/#' -v`.
+  - Some payload variants may keep coordinates in nested fields; raw payload remains preserved in `tracks.jsonl`.
+- **Plot command says no valid trajectories**
+  - Try lower filter: `--min-points 1`.
+  - Confirm your recorded run has non-empty XY fields in `tracks.csv` or nested JSON in `tracks.jsonl`.
+- **Need to compare multiple demo runs**
+  - Each recorder session writes a separate timestamped run directory under `laptop/tracking_exports/`.
+  - Run plotter per run and use `artifacts/` images directly in sponsor decks.
 
 ## Detector policy
 

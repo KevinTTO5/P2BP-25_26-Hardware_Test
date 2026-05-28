@@ -18,6 +18,10 @@ deepstream/models/*/
 
 # Rendered pipeline config produced by 40_export_watcher.sh from the template.
 deepstream/deepstream_app_config.rendered.txt
+deepstream/deepstream_app_config.preview.txt
 
 # MP4 clips from record_cameras_mp4.sh (timestamped subdirs).
 recordings/
+
+# Local sponsor/demo tracking exports (JSONL/CSV/plots).
+tracking_exports/

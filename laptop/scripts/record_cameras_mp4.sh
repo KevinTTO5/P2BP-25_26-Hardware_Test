@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 
-DEFAULT_SECONDS=180
+DEFAULT_SECONDS=120
 
 usage() {
   cat <<EOF

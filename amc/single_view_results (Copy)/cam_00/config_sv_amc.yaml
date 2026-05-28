@@ -1,0 +1,18 @@
+focal_length:
+- 1833.43115234375
+- 1853.43115234375
+rotation_x:
+- -45.28001947828029
+- -34.330416007559556
+rotation_z:
+- -2.799038791439895
+- 2.0630010602692406
+translation_y:
+- 0.01
+- 100
+human_radius:
+- 0.3
+- 0.35
+iterations: 2000
+focal_length_init: 1843.43115234375
+weight_iou: 0.8

@@ -30,12 +30,12 @@ cameras:
     ip: 169.254.33.142
     position: "top-left"
     rtsp_path: /Streaming/Channels/101
-    enabled: true
+    enabled: false
   - id: c5
     ip: 169.254.33.155
     position: "bottom-left"
     rtsp_path: /Streaming/Channels/101
-    enabled: true
+    enabled: false
   - id: c6
     ip: 169.254.19.210
     position: "middle-bottom-left"
