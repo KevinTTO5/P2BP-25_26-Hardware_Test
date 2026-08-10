@@ -20,13 +20,21 @@ steps in order.
 
 2. **Validate every entry before merging anything.** For each entry, in
    the given order, run:
-   `gh pr view <id> --json number,title,baseRefName,headRefName,mergeable,reviewDecision,state`
-   Every entry must be `state: OPEN`, `reviewDecision: APPROVED`, and
-   `mergeable: MERGEABLE`. If any entry fails any of those three
-   conditions, stop immediately — report exactly which PR and which
-   condition failed — and do not merge anything from the list, including
-   entries earlier in the order that did pass. A partial merge of a
-   dependency chain is worse than no merge.
+   `gh pr view <id> --json number,title,baseRefName,headRefName,mergeable,state,comments`
+   Every entry must be `state: OPEN` and `mergeable: MERGEABLE`. For
+   approval, do **not** check `reviewDecision` — every agent in this
+   workflow shares one `gh` identity with the PR author, so GitHub blocks
+   formal self-approval and `reviewDecision` is never populated here.
+   Instead, scan `.comments[].body` in chronological order and take the
+   **last** one whose first line is exactly `REVIEW VERDICT: APPROVE` or
+   `REVIEW VERDICT: REQUEST_CHANGES` (a later verdict comment supersedes an
+   earlier one on the same PR — that's how the re-review loop in
+   `parallel-worktree-dev` records an iteration). The entry must resolve to
+   `APPROVE`. If any entry fails on state, mergeable, or verdict — including
+   "no verdict comment found at all" — stop immediately, report exactly
+   which PR and which condition failed, and do not merge anything from the
+   list, including entries earlier in the order that did pass. A partial
+   merge of a dependency chain is worse than no merge.
 
 3. **Print the resolved plan** before touching anything: a table of
    PR # → title → base branch → merge position in this run. Ask the user
