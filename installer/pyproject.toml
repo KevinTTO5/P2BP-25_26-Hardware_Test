@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mv3dt-installer"
+version = "0.1.0"
+description = "Single self-contained installer for the DeepStream 9.1 / AutoMagicCalib MV3DT workstation stack."
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+
+# Keep this list minimal: the binary is built with PyInstaller --onefile and
+# must boot fast on a bare TTY before the desktop session is up (doc 00 §2,
+# §4.1). `rich` is chosen over `questionary` because this installer's TUI
+# needs are limited to plain prompts, progress/status rendering, and the
+# boxed USER-ACTION block (doc 00 §9.3) — rich's Console/Prompt primitives
+# cover all of that without pulling in questionary's extra interactive-menu
+# machinery that this installer's plain-prompt-with-default UX doesn't use.
+dependencies = [
+    "rich>=13.7",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+# Deliberately no [project.scripts] console-script entry point: the binary
+# is built by PyInstaller targeting mv3dt_installer/__main__.py directly
+# (doc 00 §4.1), and a pip-installed `mv3dt-installer` console script would
+# shadow/conflate with that binary's name on operator PATHs. Local dev runs
+# via `python -m mv3dt_installer` instead, once __main__.py lands.
+
+[tool.setuptools.packages.find]
+include = ["mv3dt_installer*"]
+
+[tool.setuptools.package-data]
+mv3dt_installer = ["assets/**/*"]
