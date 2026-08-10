@@ -3,15 +3,22 @@
 Run from installer/: `python3 -m pytest tests/test_ngc.py -v`
 
 Never touches a real home dir or /opt/mv3dt: `install_dir` and the invoking
-user's `home` are always `tmp_path` locations, and `os.chown` is
-monkeypatched out (chowning to an arbitrary uid/gid requires root, which the
-test runner doesn't have and shouldn't need).
+user's `home` are always `tmp_path` locations. `store_key`'s `os.chown`
+(chowning to an arbitrary uid/gid requires root, which the test runner
+doesn't have and shouldn't need) is monkeypatched out via the `_no_chown`
+fixture. `configure_ngc_cli` never calls `os.chown` itself -- it goes
+through `privilege.run_as_user`, which most tests here monkeypatch directly
+(no real `sudo` involved); one test additionally runs the real script via
+`bash` with only the `sudo` wrapper skipped, to verify the actual file
+content/permissions it produces.
 """
 
 from __future__ import annotations
 
 import ast
+import os
 import pathlib
+import subprocess
 import sys
 
 import pytest
@@ -158,15 +165,149 @@ def test_load_key_returns_none_when_file_has_no_key_line(tmp_path):
 
 # ---------------------------------------------------------------------------
 # configure_ngc_cli
+#
+# doc 00 §9.2 requires anything under the user's home to run via
+# privilege.run_as_user(...) (equivalent to `sudo -u "$SUDO_USER" -H ...`),
+# "exactly as Phases 6/10 of 00_bootstrap.sh do for ngc" -- so
+# configure_ngc_cli must never write ~/.ngc/config (or chown it) from this
+# process directly. These tests assert against the run_as_user call itself.
 # ---------------------------------------------------------------------------
 
 
-def test_configure_ngc_cli_writes_expected_shape(tmp_path, monkeypatch, _no_chown):
+def test_configure_ngc_cli_calls_run_as_user_not_direct_chown(tmp_path, monkeypatch, _no_chown):
+    """The blocking finding this fixes: configure_ngc_cli must go through
+    privilege.run_as_user(...), and must never call os.chown() itself."""
     install_dir = tmp_path / "install"
     home_dir = tmp_path / "home"
     monkeypatch.setattr(ngc.privilege, "resolve", lambda: _fake_user(home_dir))
-
     ngc.store_key(_FAKE_KEY, install_dir)
+    # store_key legitimately chowns secrets/ngc.env -- clear that record so
+    # this test only inspects chown calls made by configure_ngc_cli itself.
+    _no_chown.clear()
+
+    captured = {}
+
+    def _fake_run_as_user(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ngc.privilege, "run_as_user", _fake_run_as_user)
+
+    result = ngc.configure_ngc_cli(install_dir)
+
+    assert result == home_dir / ".ngc" / "config"
+    assert captured["args"], "expected configure_ngc_cli to call privilege.run_as_user"
+    assert not _no_chown, (
+        "configure_ngc_cli must not call os.chown() directly -- the write "
+        "(and its ownership) must happen entirely inside the run_as_user "
+        "child process, per doc 00 §9.2"
+    )
+
+
+def test_configure_ngc_cli_run_as_user_shape(tmp_path, monkeypatch, _no_chown):
+    install_dir = tmp_path / "install"
+    home_dir = tmp_path / "home"
+    monkeypatch.setattr(ngc.privilege, "resolve", lambda: _fake_user(home_dir))
+    ngc.store_key(_FAKE_KEY, install_dir)
+
+    captured = {}
+
+    def _fake_run_as_user(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ngc.privilege, "run_as_user", _fake_run_as_user)
+
+    ngc.configure_ngc_cli(install_dir)
+
+    args = captured["args"]
+    secrets_path = install_dir / "secrets" / "ngc.env"
+
+    # Mirrors 00_bootstrap.sh Phase 10's `sudo -u "$SUDO_USER" -H env
+    # BOOTSTRAP_ENV_FILE=... bash -s <<INNER` shape: the key travels via an
+    # env-file path handed to `env`, then sourced inside the script -- never
+    # as a bare CLI argument.
+    assert args[0] == "env"
+    assert args[1] == f"NGC_ENV_FILE={secrets_path}"
+    assert args[2] == "bash"
+    assert args[3] == "-lc"
+    script = args[4]
+    assert 'set -a; . "$NGC_ENV_FILE"; set +a' in script
+    assert 'mkdir -p "$HOME/.ngc"' in script
+    assert 'chmod 700 "$HOME/.ngc"' in script
+    assert "<<NGCINI" in script
+    assert "[CURRENT]" in script
+    assert "apikey = ${NGC_API_KEY}" in script
+    assert "format_type = ascii" in script
+    assert 'chmod 600 "$HOME/.ngc/config"' in script
+
+    # The raw key must never appear as a literal anywhere in the call --
+    # neither in argv nor in the script text itself.
+    for arg in args:
+        assert _FAKE_KEY not in arg
+
+    assert captured["kwargs"].get("capture_output") is True
+    assert captured["kwargs"].get("text") is True
+
+
+def test_configure_ngc_cli_returns_none_without_stored_key(tmp_path, monkeypatch):
+    install_dir = tmp_path / "install-no-key"
+    home_dir = tmp_path / "home-no-key"
+    monkeypatch.setattr(ngc.privilege, "resolve", lambda: _fake_user(home_dir))
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("run_as_user must not be called with no stored key")
+
+    monkeypatch.setattr(ngc.privilege, "run_as_user", _boom)
+
+    result = ngc.configure_ngc_cli(install_dir)
+
+    assert result is None
+    assert not (home_dir / ".ngc" / "config").exists()
+
+
+def test_configure_ngc_cli_returns_none_when_run_as_user_fails(tmp_path, monkeypatch, _no_chown):
+    install_dir = tmp_path / "install"
+    home_dir = tmp_path / "home"
+    monkeypatch.setattr(ngc.privilege, "resolve", lambda: _fake_user(home_dir))
+    ngc.store_key(_FAKE_KEY, install_dir)
+
+    def _fake_run_as_user(*args, **kwargs):
+        return subprocess.CompletedProcess(args=args, returncode=1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(ngc.privilege, "run_as_user", _fake_run_as_user)
+
+    result = ngc.configure_ngc_cli(install_dir)
+
+    assert result is None
+
+
+def test_configure_ngc_cli_end_to_end_writes_expected_config_file(tmp_path, monkeypatch, _no_chown):
+    """Bypasses only the sudo(8) wrapper (not available/needed for an
+    unprivileged test run) so the real script this module builds actually
+    executes via bash and can be checked against real file output --
+    stronger than asserting on the script string alone."""
+    install_dir = tmp_path / "install"
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    monkeypatch.setattr(ngc.privilege, "resolve", lambda: _fake_user(home_dir))
+    ngc.store_key(_FAKE_KEY, install_dir)
+
+    def _run_without_sudo(*args, **kwargs):
+        # privilege.run_as_user would prepend ["sudo", "-u", name, "-H"];
+        # skip that (no sudo available/appropriate in a test) but keep the
+        # rest of the invocation identical, with HOME pinned at the fake
+        # home dir the same way `sudo -H` would pin it for real.
+        env = dict(os.environ)
+        env["HOME"] = str(home_dir)
+        run_kwargs = dict(kwargs)
+        run_kwargs["env"] = env
+        return subprocess.run(args, **run_kwargs)
+
+    monkeypatch.setattr(ngc.privilege, "run_as_user", _run_without_sudo)
+
     result = ngc.configure_ngc_cli(install_dir)
 
     config_path = home_dir / ".ngc" / "config"
@@ -178,17 +319,6 @@ def test_configure_ngc_cli_writes_expected_shape(tmp_path, monkeypatch, _no_chow
     )
     assert (config_path.stat().st_mode & 0o777) == 0o600
     assert (config_path.parent.stat().st_mode & 0o777) == 0o700
-
-
-def test_configure_ngc_cli_returns_none_without_stored_key(tmp_path, monkeypatch, _no_chown):
-    install_dir = tmp_path / "install-no-key"
-    home_dir = tmp_path / "home-no-key"
-    monkeypatch.setattr(ngc.privilege, "resolve", lambda: _fake_user(home_dir))
-
-    result = ngc.configure_ngc_cli(install_dir)
-
-    assert result is None
-    assert not (home_dir / ".ngc" / "config").exists()
 
 
 # ---------------------------------------------------------------------------

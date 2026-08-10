@@ -37,15 +37,22 @@ keeps the doc-quoted zero-arg call sites (`load_key()`, `configure_ngc_cli()`)
 working today while still letting tests (and, later, config.py) point the
 lookup elsewhere without touching a real `/opt/mv3dt`.
 
-Design note on `configure_ngc_cli` (doc 00 §10.2 leaves the mechanism to the
-implementer -- "via `privilege.run_as_user(...)` or by resolving the
-invoking user's home via `privilege.resolve()` ... your call, document
-which"): this module resolves the invoking user's home directly via
-`privilege.resolve()` and writes there with `os.chown()` back to that user,
-rather than shelling out through `run_as_user`. That keeps the write on the
-same atomic-write + explicit-chown code path already used for
-`secrets/ngc.env`, and is straightforward to unit test by monkeypatching
-`privilege.resolve()` -- no subprocess/sudo involved.
+Design note on `configure_ngc_cli`: doc 00 §9.2 is explicit that anything
+under the user's home "MUST be run via `privilege.run_as_user(...)` ...
+exactly as Phases 6/10 of `00_bootstrap.sh` do for `ngc`", and
+`privilege.py`'s own docstring repeats the same rule. `~/.ngc/config` is
+exactly that case, so this module writes it entirely inside a
+`privilege.run_as_user("bash", "-lc", ...)` call (equivalent to
+`sudo -u "$SUDO_USER" -H bash -lc '...'`), mirroring 00_bootstrap.sh Phase
+10's `NGCINI` heredoc, which itself runs inside a `sudo -u "$SUDO_USER" -H`
+block (lines ~972-987) rather than being written by the root installer
+process and chowned after the fact. The key is handed to that child process
+via `NGC_ENV_FILE`, an env var pointing at the *already-invoking-user-owned*
+`secrets/ngc.env` (written by `store_key`, §10.1) -- the child script
+sources it (`set -a; . "$NGC_ENV_FILE"; set +a`) exactly as bootstrap's
+Phase 10 sources `$BOOTSTRAP_ENV_FILE`. This means the raw key is never
+passed as a CLI argument (so it never shows up in `ps`/`/proc/*/cmdline`)
+and never appears as a literal in this module's Python source at all.
 """
 
 from __future__ import annotations
@@ -146,6 +153,10 @@ def capture_key(non_interactive: bool) -> KeyState:
 def _atomic_write_secret(
     directory: pathlib.Path, target: pathlib.Path, contents: str
 ) -> None:
+    """Write `contents` to `target` atomically. Caller must ensure
+    `directory` already exists with its final owner/mode set -- this
+    function only creates it as a fallback (`exist_ok=True`) and never
+    loosens permissions the caller already applied."""
     directory.mkdir(parents=True, exist_ok=True)
 
     fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(directory))
@@ -170,21 +181,25 @@ def _atomic_write_secret(
 def store_key(key: str, install_dir: StrPath) -> pathlib.Path:
     """Write `<install_dir>/secrets/ngc.env` (doc 00 §10.1/§10.2).
 
-    Single line `NGC_API_KEY=<key>`. The secrets directory is `chmod 700`,
-    the file `chmod 600`, both chowned to the invoking user
+    Single line `NGC_API_KEY=<key>`. The secrets directory is `chmod 700`
+    *before* anything is written into it (no window where a
+    default-mode directory momentarily lists the file to other local
+    users), the file itself `chmod 600`, both chowned to the invoking user
     (`privilege.resolve()`). Uses the atomic temp-file + `os.replace`
     pattern (see `_atomic_write_secret`) so a crash mid-write never leaves a
-    truncated or world-readable secret file behind.
+    truncated secret file behind.
     """
     secrets_dir = pathlib.Path(install_dir) / _SECRET_RELATIVE_PATH.parent
     target = secrets_dir / _SECRET_RELATIVE_PATH.name
 
     user = privilege.resolve()
 
-    _atomic_write_secret(secrets_dir, target, f"{_KEY_PREFIX}{key}\n")
-
+    secrets_dir.mkdir(parents=True, exist_ok=True)
     os.chown(secrets_dir, user.uid, user.gid)
     os.chmod(secrets_dir, 0o700)
+
+    _atomic_write_secret(secrets_dir, target, f"{_KEY_PREFIX}{key}\n")
+
     os.chown(target, user.uid, user.gid)
     os.chmod(target, 0o600)
 
@@ -218,10 +233,30 @@ def load_key(install_dir: StrPath = DEFAULT_INSTALL_DIR) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+# Runs entirely as the invoking user (doc 00 §9.2), mirroring
+# 00_bootstrap.sh Phase 10's NGCINI heredoc (lines ~972-987) verbatim,
+# including the unquoted `<<NGCINI` delimiter so `${NGC_API_KEY}` expands.
+# `$NGC_ENV_FILE` is supplied via the child process's environment (see
+# `configure_ngc_cli`) -- never interpolated into this script string -- so
+# the raw key is never a literal in Python source or a CLI argument.
+_CONFIGURE_NGC_CLI_SCRIPT = (
+    'set -e; '
+    'set -a; . "$NGC_ENV_FILE"; set +a; '
+    'mkdir -p "$HOME/.ngc"; '
+    'chmod 700 "$HOME/.ngc"; '
+    'cat > "$HOME/.ngc/config" <<NGCINI\n'
+    '[CURRENT]\n'
+    'apikey = ${NGC_API_KEY}\n'
+    'format_type = ascii\n'
+    'NGCINI\n'
+    'chmod 600 "$HOME/.ngc/config"'
+)
+
+
 def configure_ngc_cli(
     install_dir: StrPath = DEFAULT_INSTALL_DIR,
 ) -> Optional[pathlib.Path]:
-    """Write `~/.ngc/config` for the invoking user (doc 00 §10.2).
+    """Write `~/.ngc/config` for the invoking user (doc 00 §10.2/§9.2).
 
     Mirrors Phase 10 of laptop/scripts/00_bootstrap.sh's `NGCINI` heredoc
     exactly:
@@ -230,36 +265,47 @@ def configure_ngc_cli(
         apikey = <key>
         format_type = ascii
 
-    Resolves the invoking user's home via `privilege.resolve()` (never
-    `$HOME` -- see privilege.py's §9.2 docstring for why) and writes there
-    directly, chowning the result back to that user -- see the module
-    docstring's "Design note" for why this doesn't go through
-    `privilege.run_as_user` instead.
+    Per doc 00 §9.2 ("files under the user's home MUST be run via
+    `privilege.run_as_user(...)` ... exactly as Phases 6/10 of
+    `00_bootstrap.sh` do for `ngc`"), the whole write happens inside a
+    `privilege.run_as_user("bash", "-lc", ...)` call -- this process never
+    touches `~/.ngc/config` directly or `chown`s it after the fact. See the
+    module docstring's "Design note" for how the key reaches that child
+    process without ever becoming a CLI argument or a Python-source literal.
 
-    Reads the key via `load_key(install_dir)`. If no key was ever stored
-    (manual fallback, doc 00 §10.3), this is a no-op that returns `None` --
-    it is each step's job to detect that from `load_key()` directly and
-    surface a USER_ACTION_REQUIRED block, not this function's.
+    Reads the key via `load_key(install_dir)` only to decide whether there
+    is anything to configure. If no key was ever stored (manual fallback,
+    doc 00 §10.3), this is a no-op that returns `None` -- it is each step's
+    job to detect that from `load_key()` directly and surface a
+    USER_ACTION_REQUIRED block, not this function's.
     """
-    key = load_key(install_dir)
-    if key is None:
+    if load_key(install_dir) is None:
         log.warn(
             f"{_REDACTED_LOG_LINE} not configured (manual fallback); "
             "skipping ~/.ngc/config."
         )
         return None
 
+    secrets_path = pathlib.Path(install_dir) / _SECRET_RELATIVE_PATH
     user = privilege.resolve()
-    ngc_dir = user.home / ".ngc"
-    config_path = ngc_dir / "config"
+    config_path = user.home / ".ngc" / "config"
 
-    contents = f"[CURRENT]\napikey = {key}\nformat_type = ascii\n"
-    _atomic_write_secret(ngc_dir, config_path, contents)
+    result = privilege.run_as_user(
+        "env",
+        f"NGC_ENV_FILE={secrets_path}",
+        "bash",
+        "-lc",
+        _CONFIGURE_NGC_CLI_SCRIPT,
+        capture_output=True,
+        text=True,
+    )
 
-    os.chown(ngc_dir, user.uid, user.gid)
-    os.chmod(ngc_dir, 0o700)
-    os.chown(config_path, user.uid, user.gid)
-    os.chmod(config_path, 0o600)
+    if result.returncode != 0:
+        log.warn(
+            f"Failed to write ~/.ngc/config for {user.name} "
+            f"(exit {result.returncode})."
+        )
+        return None
 
     log.info(f"Wrote ~/.ngc/config for {user.name} ({_REDACTED_LOG_LINE}).")
     return config_path
