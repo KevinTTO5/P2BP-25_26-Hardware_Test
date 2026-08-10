@@ -1,0 +1,24 @@
+# Nested gitignore for the installer/ subtree.
+#
+# This file intentionally lives at installer/.gitignore (NOT at the repo
+# root) so the mv3dt-installer package stays isolated from the rest of the
+# repo and does not force a change to the root .gitignore — same pattern as
+# laptop/.gitignore (which isolates the laptop/ subtree for the same reason).
+
+# Operator secrets written under <install_dir>/secrets/ (ngc.env,
+# webapp.env — doc 00 §10.1, §14.1). NEVER committed, regardless of where
+# an operator points --install-dir inside this working tree.
+**/secrets/
+
+# Python build/test artifacts.
+__pycache__/
+*.pyc
+dist/
+build/
+.pytest_cache/
+*.egg-info/
+
+# NOTE: installer.spec is a tracked source file (the PyInstaller build
+# recipe), not a build artifact — do not ignore it.
+# NOTE: mv3dt_installer/assets/ is tracked scaffolding populated by later
+# work (Steps 2-7) — do not ignore it.
