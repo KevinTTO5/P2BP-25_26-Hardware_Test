@@ -307,10 +307,10 @@ method-aware.
      file) and normalize to `9.0.0`.
 3. **Binary + version report** — `deepstream-app --version-all` (falls back to
    `deepstream-app --version`) runs and reports DeepStream 9.0.
-4. **Post-install artifacts present** ([§9](#9-post-install-steps)):
+4. **Post-install artifacts present** ([§9](#9-post-install-steps-run-tail-host-installs)):
    `/etc/profile.d/deepstream.sh` exists and exports `DEEPSTREAM_DIR`;
    `update_rtpmanager.sh` was executed (record a marker/log line).
-5. **Smoke test passed** ([§7.3](#73-smoke-test)).
+5. **Smoke test passed** ([§7.3](#73-smoke-test-ds-90-quickstart)).
 
 ### 7.2 Docker checks (Method C)
 
@@ -319,7 +319,7 @@ method-aware.
 2. Version inside the container:
    `docker run --rm --gpus all <image> deepstream-app --version-all` reports
    DeepStream 9.0 → `verify_pinned("DeepStream", <actual>, "9.0.0")`.
-3. Smoke test runs inside the container ([§7.3](#73-smoke-test)).
+3. Smoke test runs inside the container ([§7.3](#73-smoke-test-ds-90-quickstart)).
 4. Host wiring for docker: `/etc/profile.d/deepstream.sh` is **not** required
    (SDK is in-container); instead verify Docker + NVIDIA runtime usable
    (`docker info` shows the `nvidia` runtime).
@@ -418,7 +418,7 @@ skips the host profile write; the equivalent lives in the image.
    export LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream-9.0/lib:$LD_LIBRARY_PATH
    ```
 
-Each dependency touch is reported per doc 00 §8.3 ([§10](#10-reporting-strings)).
+Each dependency touch is reported per doc 00 §8.3 ([§10](#10-reporting-strings-reportctx--inline)).
 
 ---
 

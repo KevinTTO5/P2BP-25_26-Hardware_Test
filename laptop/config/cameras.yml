@@ -9,6 +9,54 @@
 #   - laptop/scripts/50_start_pipeline.sh: ping-sweep before deepstream-app.
 #
 # Credentials: CAM_USER / CAM_PASSWORD in laptop/config/laptop.env (not here).
+#
+# ---------------------------------------------------------------------------
+# Fleet hardware facts (harvested from the P2BP camera-node tree before it was
+# removed from this fork — see installer/plan/DELETION-REVIEW.md). These are
+# the camera facts that existed nowhere else; preserved here because this file
+# is the retained camera inventory.
+# ---------------------------------------------------------------------------
+#
+# Vendor / firmware
+#   ANNKE cameras running Hikvision-OEM firmware: ISAPI endpoints, the
+#   /Streaming/Channels/101 main-stream path used below, and a
+#   /doc/page/login.asp web UI. MAC OUI prefix: d0:3b:f4
+#
+# Fleet MAC inventory (8 cameras). MACs are the STABLE identifier; the
+# link-local IPs below are not (see the caveat further down).
+#   d0:3b:f4:01:52:79    d0:3b:f4:02:44:84
+#   d0:3b:f4:01:52:91    d0:3b:f4:02:44:85
+#   d0:3b:f4:01:52:9a    d0:3b:f4:02:44:87
+#   d0:3b:f4:01:52:f1    d0:3b:f4:02:44:e2
+#   (No MAC-to-position mapping survived: the two source files shared no key.
+#    Re-derive with `arp-scan -l` on the camera LAN if the mapping is needed.)
+#
+# Native sensor resolution: 3072x1728 per camera.
+#   NOTE the deliberate mismatch: laptop/deepstream/deepstream_app_config.txt
+#   sets [streammux] width=1920 height=1080, so the pipeline downscales each
+#   3072x1728 source. That is a throughput choice, not an oversight — but it
+#   means detection runs at 1080p, not sensor resolution.
+#
+# CAVEAT — link-local IPs are volatile.
+#   These are 169.254.0.0/16 auto-configured addresses, NOT derived from the
+#   camera MAC and NOT DHCP-reserved. A previously captured snapshot of four
+#   of these cameras recorded a completely disjoint IP set from the one below,
+#   so a camera can change address across power cycles. If ping/ffprobe fails
+#   for an entry here, re-scan the LAN by MAC before assuming the camera is
+#   down. This is why the camera-node stack discovered by MAC rather than
+#   trusting a static list.
+#
+# MANUAL PRE-FLIGHT (required before a camera serves usable video).
+#   Per-camera setup is out of scope for the installer (framework doc 00 §13,
+#   STEP-5 §9) and must be done by hand in each camera's web UI:
+#     1. ACTIVATE the camera. They ship un-activated and refuse RTSP until an
+#        admin password is set. Check with:
+#          curl -s -o /dev/null -w '%{http_code}' http://<ip>/ISAPI/System/status
+#     2. DISABLE OSD TEXT: Configuration -> Image -> OSD Settings -> uncheck
+#        "Display Name" and "Display Date" -> Save.
+#        This one matters: the overlay is burned into the encoded stream, so
+#        leaving it on feeds timestamp/name pixels into PeopleNet detection and
+#        into AutoMagicCalib's feature matching.
 
 cameras:
   - id: c1

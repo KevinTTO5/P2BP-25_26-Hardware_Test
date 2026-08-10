@@ -27,9 +27,11 @@ Scope, from the product owner (LOCKED):
    `mv3dt/#`). The desktop makes an **outbound** connection to the broker,
    **subscribes** to command topics, and **publishes** status back. There is
    **no inbound-to-desktop API** (firewall-friendly for on-prem).
-4. Supervision = **systemd**, mirroring the existing Jetson
-   [`services/`](../../services/) pattern (`Restart=on-failure`,
-   `WantedBy=multi-user.target`, journald logging).
+4. Supervision = **systemd**, mirroring the P2BP camera-node `services/`
+   pattern (`Restart=on-failure`, `WantedBy=multi-user.target`, journald
+   logging). Those units are being removed from this fork
+   ([`DELETION-REVIEW` §3](DELETION-REVIEW.md#3-deletions-gated-on-the-harvest-the-jetson-tree)),
+   so every convention borrowed from them is written out in full below.
 5. Same framework contracts as Steps 1–5 (Step protocol, `Context`,
    `StepStatus`, the exact reporting strings, `install_dir` default
    `/opt/mv3dt`).
@@ -37,10 +39,23 @@ Scope, from the product owner (LOCKED):
    infrastructure, credential issuance — is flagged for the human, not built
    here ([§8](#8-out-of-scope--flag-for-human)).
 
+> **Control plane vs data plane.** Step 6 is the **control plane**: MQTT
+> commands that run, stop, and restart pipelines. The **data plane** — the
+> desktop's HTTP connection to the web app for registration/status, artifact
+> upload, and web-app-initiated one-shot operations — is
+> [`STEP-7`](STEP-7-WEBAPP-INTEGRATION.md), a separate opt-in step over a
+> separate transport. The two are independent: either may be enabled alone, and
+> neither reads the other's state. They overlap only in the per-unit
+> `{Active, Sub}` field names, which
+> [§C.5](#c5-status--heartbeat-json-schema-desktop--cloud) and
+> [`STEP-7` §D.1](STEP-7-WEBAPP-INTEGRATION.md#d1-the-status-payload) must keep
+> identical. See [`STEP-7` §H.3](STEP-7-WEBAPP-INTEGRATION.md#h3-relationship-to-step-6)
+> for the full comparison.
+
 > systemd unit fields, the enable/`daemon-reload` flow, `Restart=`,
 > `WantedBy=`, journald `StandardOutput/Error`, and `systemctl is-active`
 > status parsing are **OS-level conventions mirrored from the repo's existing
-> [`services/`](../../services/) tree and [`install.sh`](../../install.sh)** —
+> P2BP camera-node `services/` tree and its `install.sh`** —
 > **not** DeepStream facts. Only DeepStream-specific facts (the
 > `deepstream-app` entry point, MV3DT `mv3dt/<LOCATION_ID>/*` telemetry, and
 > the Gst-nvmsgbroker MQTT transport) are cited to the DS 9.0 docs. See
@@ -60,7 +75,7 @@ Scope, from the product owner (LOCKED):
 - Each project's `rendered_config` and `location_id` from the registry
   (Step 5 §4.2), used to build the per-instance `ExecStart`.
 - The Step 5 `pipeline` subcommand of the frozen `mv3dt-installer` binary
-  (Step 5 §3.3), refactored here into a systemctl controller ([§A.2](#a2-step-5-handoff-the-pipeline-slug-exe-becomes-a-systemctl-controller)).
+  (Step 5 §3.3), refactored here into a systemctl controller ([§A.2](#a2-step-5-handoff--the-pipeline-slug-exe-becomes-a-systemctl-controller)).
 - The existing Mosquitto broker installed by the laptop tree
   ([`laptop/mosquitto/mv3dt.conf`](../../laptop/mosquitto/mv3dt.conf)), TCP
   `1883` + WebSocket `9001`.
@@ -73,6 +88,9 @@ Scope, from the product owner (LOCKED):
   ([§B.1](#b1-the-agent-systemd-unit)).
 - The control agent program + its env/config under `<install_dir>/` and
   `<install_dir>/agent/` ([§B](#b-the-control-agent-remote)).
+- `/etc/polkit-1/rules.d/49-mv3dt-agent.rules` — the scoped authorization rule
+  letting the agent start/stop/restart pipeline instances without root
+  ([§B.1.1](#b11-the-polkit-rule-locked-form)).
 - The remote-mode broker config drop-in (`password_file` / `acl_file` /
   bound + TLS listeners) written into `/etc/mosquitto/conf.d/`
   ([§D](#d-security-remote-control-must-be-authenticated)).
@@ -93,15 +111,16 @@ One template supervises every project. The systemd instance specifier
 (`%i`) is the Step 5 `slug`, so `mv3dt-pipeline@north-lobby-2.service`
 supervises the `north-lobby-2` project. This mirrors the single-template,
 many-instances model and the field conventions of
-[`services/tracker.service`](../../services/tracker.service) — journald
-logging, `EnvironmentFile`, `WantedBy=multi-user.target` — adapted for a
-long-running, auto-restarting DeepStream pipeline.
+the camera-node `tracker.service` — journald logging, `EnvironmentFile`,
+`WantedBy=multi-user.target` — adapted for a long-running, auto-restarting
+DeepStream pipeline. The full unit is given below, so nothing depends on that
+file remaining in the tree.
 
 `ExecStart` / `ExecStop` are **rendered per instance** because
 `deepstream-app` needs the project's absolute config path. The installer
 writes the template with `%i`-parameterized paths; the per-instance config is
 resolved from the registry at install time (or by the pipeline subcommand at
-`ExecStart` time — see [§A.2](#a2-step-5-handoff-the-pipeline-slug-exe-becomes-a-systemctl-controller)).
+`ExecStart` time — see [§A.2](#a2-step-5-handoff--the-pipeline-slug-exe-becomes-a-systemctl-controller)).
 
 File `/etc/systemd/system/mv3dt-pipeline@.service` (installed as a bundled
 asset, root-owned, `0644`):
@@ -239,16 +258,22 @@ point at this step (it is no longer out of scope).
 
 ### A.4 Installer integration (mirror `install.sh`)
 
-`run()` mirrors the enable flow in
-[`install.sh`](../../install.sh) lines 147–207:
+`run()` mirrors the unit-install flow of the P2BP camera-node `install.sh`
+(copy units → `daemon-reload` → per-unit `enable`), reproduced here in full
+since that script is being removed
+([`DELETION-REVIEW` §3](DELETION-REVIEW.md#3-deletions-gated-on-the-harvest-the-jetson-tree)):
 
 1. Copy `mv3dt-pipeline@.service` and `mv3dt-agent.service` into
    `/etc/systemd/system/` (bundled assets via `ctx.asset_path`, framework
-   §4.2; `cp` as root, matching `install.sh` line 162).
-2. `systemctl daemon-reload` (matching `install.sh` line 165).
+   §4.2; `cp` as root).
+2. `systemctl daemon-reload` — **required** before any `enable`, or systemd
+   acts on a stale view of the unit files.
 3. For each project in `registry.json`:
-   `systemctl enable --now mv3dt-pipeline@<slug>` (the per-`.service` enable
-   loop, `install.sh` lines 184–195, keyed on registry slugs).
+   `systemctl enable --now mv3dt-pipeline@<slug>`, keyed on registry slugs.
+   Boot-enablement is the installer's job alone: the polkit rule in
+   [§B.1.1](#b11-the-polkit-rule-locked-form) deliberately withholds `enable`
+   from the agent, so a pipeline persists across reboots only because this
+   step enabled it.
 4. `systemctl enable --now mv3dt-agent.service` ([§B](#b-the-control-agent-remote)).
 5. Report each touched unit via the framework reporters ([§E](#e-framework-integration)).
 
@@ -269,9 +294,8 @@ loop; the cloud webapp is the other half (out of scope, [§8](#8-out-of-scope--f
 ### B.0 Language + delivery
 
 - **Python**, consistent with the installer (framework §2) and the existing
-  Jetson agents ([`scripts/heartbeat.py`](../../scripts/heartbeat.py)). MQTT
-  via `paho-mqtt` (add to `installer/pyproject.toml`; keep the dep list
-  minimal per framework §4.1).
+  P2BP camera-node agents. MQTT via `paho-mqtt` (add to
+  `installer/pyproject.toml`; keep the dep list minimal per framework §4.1).
 - Ships **as part of the installer binary / assets**: the agent is a
   subcommand of the frozen binary — `mv3dt-installer agent` — so it needs no
   separate packaging, exactly like the `pipeline` subcommand (Step 5 §3.2).
@@ -313,12 +337,163 @@ LogRateLimitBurst=200
 WantedBy=multi-user.target
 ```
 
-The agent must be allowed to call `systemctl start/stop/restart` on the
-`mv3dt-pipeline@*` instances. Running as the invoking user, that needs a
-polkit rule or a scoped sudoers entry restricted to
-`systemctl {start,stop,restart} mv3dt-pipeline@*`. The installer writes that
-polkit/sudoers drop-in (root-owned) as part of `run()`; the exact rule is a
-small, greppable file and is flagged in the report.
+#### Granting the agent authority over the units (LOCKED: scoped polkit rule)
+
+The agent runs as the invoking user but must cause `systemctl
+start/stop/restart` on the `mv3dt-pipeline@*` instances. Two approaches were
+weighed; **Option 1 is LOCKED, in its polkit form specifically**
+([§B.1.1](#b11-the-polkit-rule-locked-form)). Option 2 is retained below
+because its trade-offs are the reason for the choice, not because it remains
+open.
+
+**Option 1 — scoped authorization drop-in (CHOSEN).** The installer writes a
+root-owned rule restricted to the verbs `start`/`stop`/`restart` on
+`mv3dt-pipeline@*`, and the agent calls `systemctl` directly.
+
+- *Pros:* direct and obvious; one small greppable file; the call is
+  **synchronous**, so the exit status tells the agent whether the action
+  actually succeeded and `ok` in §C.4 can be reported truthfully with no extra
+  logic; no additional unit files.
+- *Cons:* grants a non-root, network-facing process real `systemctl`
+  authority — and this process consumes commands from a broker; the rule is
+  easy to widen by accident when someone adds a unit (`mv3dt-*` instead of
+  `mv3dt-pipeline@*` is one careless edit away); needs care to pin both the
+  verbs and the unit pattern.
+
+**Option 2 — flag file plus a `.path` unit (REJECTED, see the rationale after
+this block).** The agent writes
+`/run/mv3dt/pipeline-<slug>.enabled`; a `.path` unit watches that file and
+triggers a `oneshot` toggle service that does the privileged work. This is the
+pattern the P2BP camera-node tree already uses for exactly this problem, ported
+here (its unit files are inlined below because that tree is being removed —
+[`DELETION-REVIEW` §3](DELETION-REVIEW.md#3-deletions-gated-on-the-harvest-the-jetson-tree)):
+
+```ini
+# /etc/systemd/system/mv3dt-pipeline@.path
+[Unit]
+Description=Enable MV3DT pipeline (%i) when its flag exists
+
+[Path]
+PathExists=/run/mv3dt/pipeline-%i.enabled
+PathChanged=/run/mv3dt/pipeline-%i.enabled
+Unit=mv3dt-pipeline-toggle@%i.service
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```ini
+# /etc/systemd/system/mv3dt-pipeline-toggle@.service
+[Unit]
+Description=Start/stop the MV3DT pipeline (%i) based on its flag
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -ec 'if [ -e /run/mv3dt/pipeline-%i.enabled ]; then \
+  /usr/bin/systemctl start mv3dt-pipeline@%i.service; else \
+  /usr/bin/systemctl stop mv3dt-pipeline@%i.service; fi'
+```
+
+Under this option `mv3dt-pipeline@.service` also gains
+`ConditionPathExists=/run/mv3dt/pipeline-%i.enabled` as a second guard, so a
+manual `systemctl start` of a disabled project is a no-op rather than a
+surprise.
+
+- *Pros:* the agent needs **zero** privilege — only write access to its own
+  runtime directory, which is the strongest property on offer for a process
+  that takes instructions from a network; the pattern is already proven in this
+  repo; state is trivially inspectable (`ls /run/mv3dt/`); the extra
+  `ConditionPathExists` guard comes free.
+- *Cons:* the trigger is **asynchronous** — the agent cannot observe the
+  outcome directly and must settle-and-poll `is-active` before publishing
+  §C.4's `ok` and `state` (see [§C.6](#c6-action--systemctl-mapping-idempotency-unknown-projects));
+  it adds two unit templates; and `restart` has no natural flag-file
+  expression, needing either a toggle-off/toggle-on with a settle in between or
+  a separate `.restart` path unit.
+
+> **Carve-out required under Option 2.** Units driven by a `.path` must **not**
+> themselves be `systemctl enable`d — the `.path` unit owns their lifecycle,
+> and enabling both makes the boot-time state race the flag file. The
+> camera-node `install.sh` handles exactly this by skipping such units in its
+> enable loop.
+
+**Why Option 2 was rejected.** `/run` is a **tmpfs**: the flag files do not
+survive a reboot. Option 2's boot-enable story therefore requires a *fourth*
+unit — a boot-time reconciler that reads `registry.json` and re-creates one
+flag per enabled project — before
+[§A.3](#a3-boot-enable-per-project-lifecycle-and-reconciliation)'s "runs 24/7"
+guarantee holds at all. That is three unit templates plus a reconciler to avoid
+a single authorization rule, and it buys an *asynchronous* trigger that makes
+truthful acking harder ([§C.4](#c4-result--ack-json-schema-desktop--cloud)) and
+has no natural expression for `restart`. The zero-privilege property is real
+and attractive, but it is not worth four moving parts and a weaker status
+contract.
+
+### B.1.1 The polkit rule (LOCKED form)
+
+**REQUIRED — polkit, not sudoers.** A sudoers entry is the obvious way to write
+Option 1 and the wrong one: sudoers wildcards match **across argument
+boundaries**, so a rule ending in `mv3dt-pipeline@*` also authorizes
+`systemctl start mv3dt-pipeline@a.service unrelated.service` — extra arguments
+slip past the glob. Polkit receives the unit name and the verb as *structured*
+values, so both can be matched exactly.
+
+Because the agent runs as a non-root user, its plain `systemctl` call already
+goes through polkit over D-Bus — no `sudo`, no wrapper, and the call stays
+**synchronous**, which is what preserves the truthful `ok` in
+[§C.4](#c4-result--ack-json-schema-desktop--cloud).
+
+File `/etc/polkit-1/rules.d/49-mv3dt-agent.rules` (root-owned, `0644`; the
+`49-` prefix sorts it before the distribution defaults in `50-*.rules`):
+
+```javascript
+polkit.addRule(function (action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (subject.user !== "<INVOKING_USER>") {      // rendered, framework §9.2
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    // Anchored: no prefix or suffix may be appended to the instance name.
+    // The charset mirrors the Step 5 slug rules (§3.1 there): [a-z0-9-], <=64.
+    if (/^mv3dt-pipeline@[a-z0-9-]{1,64}\.service$/.test(unit) &&
+        (verb === "start" || verb === "stop" || verb === "restart")) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});
+```
+
+Four properties, each load-bearing:
+
+- **Anchored regex** (`^…$`) — the failure mode that sinks the sudoers form
+  cannot occur; no other unit name matches, however it is decorated.
+- **Explicit verb allowlist** — `enable`, `disable`, and `mask` are *not*
+  granted. Boot-enablement stays the installer's job
+  ([§A.3](#a3-boot-enable-per-project-lifecycle-and-reconciliation)), so a
+  compromised agent cannot make a pipeline persist across reboots.
+- **`Result.YES`, not `AUTH_ADMIN`** — the agent runs headless under systemd
+  with no polkit authentication agent available; anything requiring interaction
+  would simply fail.
+- **`NOT_HANDLED` on every other path** — the rule only ever *adds* a narrow
+  permission; normal administrative behavior for every other unit and user is
+  untouched.
+
+`verify()` ([§E.1](#e1-lifecycle)) must assert the rule file exists and that a
+negative case is actually denied — `systemctl start mosquitto` as the agent
+user must fail. A rule that grants too much still passes a positive-only test,
+which is precisely the bug this form exists to prevent.
+
+> **Portability note (flagged).** This is the polkit `.rules` JavaScript
+> format, which requires polkit ≥ 0.106; Ubuntu 24.04 ships polkit 124, so it
+> applies. On a host where the rule cannot be installed, the fallback is a
+> sudoers entry that enumerates the registry slugs **explicitly** — one full
+> command line per project per verb, with no wildcard — regenerated whenever
+> the registry changes. It is more churn, and it is the only safe way to write
+> the sudoers form.
 
 ### B.2 Broker location + connection topology
 
@@ -468,17 +643,28 @@ Published to `mv3dt/<HOST_ID>/cmd/result` once per handled command:
   `unknown project`, `systemctl start failed: <rc>`).
 - `ts` — result timestamp (UTC).
 
+> **Truthfulness of `ok`.** Under the LOCKED polkit design
+> ([§B.1.1](#b11-the-polkit-rule-locked-form)) the `systemctl` call is
+> **synchronous**, so a non-zero exit is an unambiguous failure and `ok` can
+> report it directly — one of the main reasons that design was chosen. A zero
+> exit is still not the whole story for `run`/`restart`, because systemd
+> returns as soon as the job is *queued*: `ok` additionally requires the
+> instance to have reached `active`, which is what the settle-and-poll in
+> [§C.6](#c6-action--systemctl-mapping-idempotency-unknown-projects)
+> establishes.
+
 ### C.5 Status / heartbeat JSON schema (desktop → cloud)
 
 Published periodically (default 15 s, configurable) and on state change to
-`mv3dt/<HOST_ID>/status`. Field naming mirrors
-[`heartbeat.py`](../../scripts/heartbeat.py) /
-[`heartbeat_payload.py`](../../scripts/json_models/heartbeat_payload.py) —
-`Timestamp`, a `Services`-style map of per-unit `{Active, Sub}` from
-`systemctl show ... ActiveState/SubState`, and an optional GPU/`System`
-block — so the cloud side can reuse the same model shape. It is **not** copied
-blindly; it is keyed by project slug and adds enable/uptime/exit fields
-relevant to supervision:
+`mv3dt/<HOST_ID>/status`.
+
+**REQUIRED — field names are shared with the HTTP plane.** The per-unit state
+map (`{Active, Sub}`) and the GPU/memory block use the same field names as
+[`STEP-7` §D.1](STEP-7-WEBAPP-INTEGRATION.md#d1-the-status-payload), so the web
+app can consume either plane with one model. Changing a name here without
+changing it there silently forks the contract. The payload is **not** a blind
+copy of the HTTP one: it is keyed by project slug and adds the
+enable/uptime/exit fields that only supervision needs.
 
 ```json
 {
@@ -511,18 +697,25 @@ relevant to supervision:
 }
 ```
 
-- `pipelines.<slug>.active` / `sub` — from
-  `systemctl show mv3dt-pipeline@<slug> -p ActiveState -p SubState` (the exact
-  pattern in [`systemd_services.py`](../../scripts/systemd_services.py)
-  `get_service_state`). `active` ∈
-  `active` | `activating` | `inactive` | `failed`.
+- `pipelines.<slug>.active` / `sub` — parsed line-wise from
+
+  ```bash
+  systemctl show mv3dt-pipeline@<slug> -p ActiveState -p SubState
+  ```
+
+  `active` ∈ `active` | `activating` | `inactive` | `failed`.
+  **REQUIRED:** any failure of that call — non-zero exit, a ~5 s timeout, or a
+  unit that does not exist — yields `{"Active": "unknown", "Sub": "unknown"}`
+  rather than raising. One unreadable unit must never prevent the status
+  payload from being published. Same rule as
+  [`STEP-7` §D.1](STEP-7-WEBAPP-INTEGRATION.md#d1-the-status-payload).
 - `enabled` — `systemctl is-enabled mv3dt-pipeline@<slug>`.
 - `uptime_s` / `last_exit_code` / `restarts` — from `systemctl show`
   properties (`ActiveEnterTimestamp`, `ExecMainStatus`, `NRestarts`).
 - `gpu` — optional, best-effort from
   `nvidia-smi --query-gpu=utilization.gpu,memory.used,temperature.gpu
-  --format=csv,noheader,nounits` (same query the Step 5 validation banner and
-  `heartbeat.py` GPU block use). Omitted/`null` if `nvidia-smi` fails.
+  --format=csv,noheader,nounits` (the same query the Step 5 validation banner
+  prints). Omitted/`null` if `nvidia-smi` fails.
 - `agent_version` — the installer/step version string.
 
 The set of projects is enumerated from `registry.json` at each publish, so
@@ -530,7 +723,7 @@ projects added/removed via Step 5 are reflected without restarting the agent.
 
 ### C.6 Action → systemctl mapping, idempotency, unknown projects
 
-| `action` | systemctl call (as root via scoped sudoers/polkit, §B.1) | Idempotent? |
+| `action` | effective systemctl call (invoked per the [§B.1](#b1-the-agent-systemd-unit) decision) | Idempotent? |
 | --- | --- | --- |
 | `run` | `systemctl start mv3dt-pipeline@<slug>` | yes — starting an already-`active` unit is a no-op |
 | `stop` | `systemctl stop mv3dt-pipeline@<slug>` | yes — stopping an `inactive` unit is a no-op |
@@ -552,6 +745,15 @@ projects added/removed via Step 5 are reflected without restarting the agent.
 - **Malformed command:** JSON that fails schema validation (missing
   `action`/`request_id`/`ts`, unknown `action`) yields a result with
   `ok: false`, `error: "invalid command: <reason>"`, and no systemctl call.
+- **Settle-and-poll (REQUIRED for `run` and `restart`).** `systemctl start`
+  returns once the job is queued, not once the unit is up, and a DeepStream
+  pipeline takes seconds to initialize CUDA and open eight RTSP streams. After
+  issuing the call, poll `systemctl is-active` until it leaves the transitional
+  `activating` / `deactivating` states or a timeout (~10 s, matching the unit's
+  `TimeoutStopSec`) elapses, and only then publish the §C.4 result. A unit
+  still `activating` at the deadline is reported as-is with `ok: false` and
+  `error: "timed out waiting for active"` — never optimistically as `active`.
+  `stop` needs the same treatment for the symmetric reason.
 
 ---
 
@@ -646,8 +848,9 @@ Implements the `Step` protocol (framework §12.1).
 
 - Install the two unit files, `daemon-reload`, enable + start per-project
   instances and the agent ([§A.4](#a4-installer-integration-mirror-installsh)).
-- Write the scoped sudoers/polkit rule for the agent
-  ([§B.1](#b1-the-agent-systemd-unit)).
+- Write the scoped polkit rule for the agent
+  ([§B.1.1](#b11-the-polkit-rule-locked-form)), root-owned `0644`, then confirm
+  a **negative** case is denied before reporting success.
 - In remote mode: write the broker remote-mode drop-in + agent creds, add the
   bridge drop-in, `systemctl restart mosquitto`
   ([§D](#d-security-remote-control-must-be-authenticated), [§B.2](#b2-broker-location--connection-topology)).
@@ -672,6 +875,13 @@ Idempotent post-checks (framework §8.4 `verify_pinned` / reporters);
   surfaces a `verify` failure with the `journalctl -u` hint).
 - The two unit files exist under `/etc/systemd/system/` and
   `daemon-reload` reports them loaded.
+- **Authorization scope — positive AND negative
+  ([§B.1.1](#b11-the-polkit-rule-locked-form)).** As the agent user, assert
+  that `systemctl start mv3dt-pipeline@<slug>` is permitted **and** that
+  `systemctl start mosquitto` and `systemctl enable mv3dt-pipeline@<slug>` are
+  **denied**. A positive-only check passes just as happily against a rule that
+  grants everything, which is the exact failure this design exists to prevent —
+  so the negative assertions are not optional.
 - **Round-trip `status` check:** publish a `{"action":"status"}` command to
   `mv3dt/<HOST_ID>/cmd` and assert a result returns on
   `mv3dt/<HOST_ID>/cmd/result` within a timeout (the end-to-end remote-control
@@ -719,6 +929,11 @@ can skip it. Gating:
   the MQTT publisher/subscriber, per-host dashboards, command authorization).
   Step 6 only defines the desktop agent, the topics, and the JSON contract it
   honors.
+- **The desktop's HTTP connection to the web app** — registration/status over
+  HTTPS, signed-URL artifact upload, and web-app-initiated one-shot
+  operations. This is **not** unspecified: it is
+  [`STEP-7`](STEP-7-WEBAPP-INTEGRATION.md), a separate opt-in step over a
+  separate transport. Out of scope *here*, owned *there*.
 - **Cloud auth infrastructure + credential issuance** — who provisions the
   cloud broker account, the agent's broker password rotation, and the TLS
   CA/certs ([§D](#d-security-remote-control-must-be-authenticated)). The
@@ -779,18 +994,27 @@ the logic Step 6 supervises/ports — **not** DeepStream docs):
 - [`laptop/docs/DEEPSTREAM-SETUP.md`](../../laptop/docs/DEEPSTREAM-SETUP.md)
   §6 — Mosquitto "Production hardening" (`password_file`, `acl_file`, bound
   listeners) required for remote mode ([§D](#d-security-remote-control-must-be-authenticated)).
-- [`services/tracker.service`](../../services/tracker.service),
-  [`services/heartbeat.service`](../../services/heartbeat.service),
-  [`services/tracker.path`](../../services/tracker.path) — the existing
-  systemd conventions mirrored (`Restart=`, `RestartSec`, journald
-  `StandardOutput/Error`, `EnvironmentFile`, `WantedBy=multi-user.target`).
-- [`scripts/heartbeat.py`](../../scripts/heartbeat.py) /
-  [`scripts/json_models/heartbeat_payload.py`](../../scripts/json_models/heartbeat_payload.py)
-  — the JSON-over-transport status pattern the §C.5 status payload mirrors
-  (`Timestamp`, `Services`/`{Active,Sub}` map, GPU/`System` block).
-- [`scripts/systemd_services.py`](../../scripts/systemd_services.py) — the
-  `systemctl show -p ActiveState -p SubState` pattern the agent reuses for
-  per-instance state.
-- [`install.sh`](../../install.sh) — the `cp` units → `daemon-reload` →
-  per-`.service` `enable` loop mirrored by
-  [§A.4](#a4-installer-integration-mirror-installsh).
+- [`STEP-7-WEBAPP-INTEGRATION.md`](STEP-7-WEBAPP-INTEGRATION.md) — the HTTP
+  data plane; §D.1 there and [§C.5](#c5-status--heartbeat-json-schema-desktop--cloud)
+  here share field names by contract.
+- [`DELETION-REVIEW.md`](DELETION-REVIEW.md) — records the camera-node files
+  the systemd conventions above were mirrored from, and why they are removed.
+
+> **Attribution — sources no longer in this fork.** The systemd conventions in
+> [§A.1](#a1-the-templated-per-project-instance-unit) and
+> [§B.1](#b1-the-agent-systemd-unit) (`Restart=`, `RestartSec`, journald
+> `StandardOutput/Error`, `EnvironmentFile`, `WantedBy=multi-user.target`), the
+> flag-file/`.path`-unit precedent documented (and rejected) as §B.1 Option 2,
+> the
+> `systemctl show -p ActiveState -p SubState` parsing in §C.5, the status
+> payload shape, and the unit-install flow in
+> [§A.4](#a4-installer-integration-mirror-installsh) were ported from the P2BP
+> camera-node tree (`services/tracker.service`, `services/tracker.path`,
+> `services/tracker-toggle.service`, `services/heartbeat.service`,
+> `scripts/heartbeat.py`, `scripts/json_models/heartbeat_payload.py`,
+> `scripts/systemd_services.py`, `scripts/signals.py`, and `install.sh`). Those
+> files are removed per
+> [`DELETION-REVIEW` §3](DELETION-REVIEW.md#3-deletions-gated-on-the-harvest-the-jetson-tree)
+> and remain in the parent repository. Every convention borrowed from them is
+> written out in full above; they are named here as provenance only —
+> deliberately not linked, so the links cannot rot.

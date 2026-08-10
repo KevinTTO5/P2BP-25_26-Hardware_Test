@@ -75,7 +75,7 @@ What next?
 
 - The prompt shells out to the freshly-generated
   `<install_dir>/bin/pipeline-<slug>` (equivalent to running the project exe
-  directly, [§3.3](#33-what-the-exe-does-at-runtime)). This `exec`s
+  directly, [§3.3](#33-what-the-exe-does-at-runtime-pipeline-subcommand)). This `exec`s
   `deepstream-app`, so the installer process is replaced by the running
   pipeline — matching `50_start_pipeline.sh`'s terminal `exec` behavior.
 - Because `run()` must return a `StepResult` to the framework, "start now"
@@ -168,6 +168,14 @@ resolving the config from the registry rather than the repo tree:
    `cameras.yml` (the successor to
    [`laptop/config/cameras.yml`](../../laptop/config/cameras.yml)) and ping
    each enabled entry; warn on misses, do not block (port lines 137–196).
+
+   > **Partial port (flagged).** Only the ping sweep is ported. The
+   > `ffprobe`-over-RTSP stream check and the pass/fail table in
+   > [`20_verify_cameras.sh`](../../laptop/scripts/20_verify_cameras.sh) have
+   > no equivalent in any step, so that script stays load-bearing for genuine
+   > pre-flight camera verification — a ping proves the host is up, not that it
+   > serves a decodable RTSP stream. Tracked in
+   > [`DELETION-REVIEW` §6](DELETION-REVIEW.md#6-coverage-gaps-this-triage-exposed).
 4. **Source the DeepStream env** — `. /etc/profile.d/deepstream.sh` (written
    by Step 2) so `deepstream-app` and `DEEPSTREAM_DIR` are in the environment
    (port lines 201–210).
@@ -219,8 +227,13 @@ stable place to resolve its config.
 
 - **`<install_dir>/projects/registry.json`** (the `projects/` dir is already
   reserved by framework §11.2). Root-owned, `chmod 0644`; the directory
-  `chmod 0755`. Written atomically (`tmp` + `os.replace`), same discipline as
-  `state.py` (framework §6.3). It is **separate** from `state.json`: the
+  `chmod 0755`. Written with the **shared atomic-write helper** specified in
+  [`00` §6.3](00-FRAMEWORK-AND-BOOTSTRAP.md#63-api-statepy) — `tmp` →
+  `json.dump` → `flush` → **`os.fsync`** → `os.replace`. The `fsync` is not
+  optional: a power loss between `write` and `replace` otherwise yields a
+  zero-length registry, which orphans every generated exe. Readers are
+  correspondingly forgiving — a missing or malformed file yields the empty
+  registry, never an exception. It is **separate** from `state.json`: the
   registry is per-project data owned by Step 5, not installer step-state.
 - Per-project scratch/entry dir: `<install_dir>/projects/<slug>/` (may hold a
   copy of that project's `cameras.yml` and a back-reference to its
@@ -519,3 +532,9 @@ Repo files referenced (ported/reused by this step):
   resulting `cameras.yml`; camera web-UI setup stays manual (framework §13).
 - **Alternate detectors** — PeopleNet-only, matching the DS 9.0 MV3DT
   reference; `yolo11n` remains future work (framework §13).
+- **Shipping per-project artifacts to the web app** — the tracking exports,
+  plots, and clips a running project produces are uploaded by
+  [Step 7](STEP-7-WEBAPP-INTEGRATION.md), which keys its upload prefixes and
+  its status payload off this step's `registry.json`
+  ([`STEP-7` §E.1](STEP-7-WEBAPP-INTEGRATION.md#e1-what-gets-uploaded)). Step 5
+  produces the artifacts; it does not transmit them.

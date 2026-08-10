@@ -3,8 +3,7 @@
 This subtree contains the **laptop-side** scripted workflow for the MV3DT
 pipeline. It is isolated from the Jetson tree at the repo root: every file
 under `laptop/` is self-contained and does not read from or write to
-`scripts/`, `services/`, `config/`, `models/`, `my-docs/`, `homographies/`,
-or `virtual-cameras/`.
+`scripts/`, `services/`, or `models/`.
 
 Full operator doc: [`laptop/docs/SCRIPTED-WORKFLOW.md`](docs/SCRIPTED-WORKFLOW.md)
 DS 9.0 setup reference: [`laptop/docs/DEEPSTREAM-SETUP.md`](docs/DEEPSTREAM-SETUP.md)

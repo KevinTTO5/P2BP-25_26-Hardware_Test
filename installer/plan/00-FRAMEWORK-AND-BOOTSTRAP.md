@@ -102,7 +102,8 @@ installer/
   4. Opens the transcript logger (`logs.open_transcript()`, §8).
   5. Loads the state file (`state.load()`, §6) and runs
      `reboot.reconcile()` to clear any satisfied reboot-pending marker (§7).
-  6. Enters the **dispatch loop** over `STEP_REGISTRY` (steps 1→5 in order).
+  6. Enters the **dispatch loop** over `STEP_REGISTRY` (steps 1→7 in order).
+     Steps 6 and 7 are opt-in and auto-skip when their gate is `off` (§3.4).
 
 - **Dispatch loop** (the core of the state machine, §6):
   For each step in order, if `state.status(step) == COMPLETE`, skip and emit
@@ -133,6 +134,24 @@ Steps may add their own, but the framework owns these:
 - `--no-pause` — skip "press Enter" confirmations.
 - `--log-dir PATH` — override the transcript directory (§8).
 - `-h/--help`, `--version`.
+
+### 3.4 Opt-in step gates
+
+Steps 1–5 always run. Steps 6 and 7 are **opt-in**: a workstation used only for
+local calibration and ad-hoc pipeline runs needs neither 24/7 supervision nor a
+web-app connection. Each is gated by an `installer.conf` key (§11.2) with a
+matching CLI flag:
+
+| Gate key | Values (default first) | Owning step |
+|---|---|---|
+| `MV3DT_REMOTE_SUPERVISION` | `off` \| `local` \| `remote` | [`STEP-6` §E.2](STEP-6-REMOTE-SUPERVISION.md#e2-gating-opt-in) |
+| `MV3DT_WEBAPP_INTEGRATION` | `off` \| `on` | [`STEP-7` §H.2](STEP-7-WEBAPP-INTEGRATION.md#h2-gating-opt-in) |
+
+When a gate is `off` the dispatch loop treats that step as auto-`COMPLETE`
+(skipped) with a one-line log, using the same skip discipline as a genuinely
+completed step (§3.2). Under `--non-interactive` an unset gate stays `off`, so
+an unattended run never enables long-running services or outbound network
+connections the operator did not ask for.
 
 ---
 
@@ -235,9 +254,15 @@ Delivered two ways with identical behavior:
    fallback" so Step 2 knows to use the guided manual placement path. The key
    is NEVER written to the transcript log, NEVER committed, NEVER passed on a
    command line that lands in shell history.
-5. **Build the single binary** with PyInstaller (§4.1), building as the
+5. **Capture the web-app credential (optional, bootstrap stage).** Only when
+   `MV3DT_WEBAPP_INTEGRATION` is on (§3.4). Prompt for `API_KEY` (secret input,
+   no echo) and `ENDPOINT` (plain), normalize the endpoint, and store both per
+   §14. Blank input leaves the gate effectively inert and Step 7 surfaces a
+   USER-ACTION block on its first run. Same secrecy rules as the NGC key: never
+   logged, never committed, never on a command line.
+6. **Build the single binary** with PyInstaller (§4.1), building as the
    invoking user where possible (only the final launch needs root).
-6. **Launch the installer**:
+7. **Launch the installer**:
 
    ```bash
    sudo -E installer/dist/mv3dt-installer
@@ -285,7 +310,9 @@ passed.
     "step2_deepstream_sdk":   { "status": "PENDING" },
     "step3_amc_launcher":     { "status": "PENDING" },
     "step4_calib_output_wiring": { "status": "PENDING" },
-    "step5_per_project_exes": { "status": "PENDING" }
+    "step5_per_project_exes": { "status": "PENDING" },
+    "step6_remote_supervision":  { "status": "PENDING" },
+    "step7_webapp_integration":  { "status": "PENDING" }
   },
   "reboot_pending": {
     "requested_by": "step1_prerequisites",
@@ -301,11 +328,34 @@ passed.
 
 ### 6.3 API (`state.py`)
 
-- `load() -> State` / `save(State)` — atomic write (`tmp` + `os.replace`).
+- `load() -> State` / `save(State)` — atomic write, per the shared helper
+  below.
 - `status(step_id) -> StepStatus` / `set_status(step_id, status)`.
 - `mark_complete(step_id)` — sets `COMPLETE` + `finished_utc`.
 - `set_reboot_pending(step_id, boot_id)` / `clear_reboot_pending()`.
 - `all_complete() -> bool` — used to print the final success banner.
+
+**REQUIRED — the shared atomic-write helper.** `state.json`, the Step 5
+registry ([`STEP-5` §4.1](STEP-5-PER-PROJECT-EXES.md#41-path)), and every
+run-state file written by [`STEP-7` §F.2](STEP-7-WEBAPP-INTEGRATION.md#f2-state-file-fan-in)
+use one implementation. The `flush` + `fsync` pair before `os.replace` is the
+part that matters: without it a power loss mid-install can leave a
+zero-length `state.json` and lose every completed step.
+
+```python
+def write_json_atomic(path: pathlib.Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)          # atomic within a filesystem
+```
+
+Readers are correspondingly forgiving: a missing file yields the empty default
+and a `json.JSONDecodeError` is treated as "absent", never as a fatal error —
+so a partially-written file can never wedge the installer.
 
 Re-running the binary after a reboot resumes at the first non-`COMPLETE`
 step; completed steps log the standard "already complete" line and are
@@ -573,10 +623,15 @@ placement paths.
   ```
   <install_dir>/
   ├── installer.conf        # chosen path + shared vars
-  ├── secrets/ngc.env       # NGC key, chmod 600 (§10)
+  ├── secrets/
+  │   ├── ngc.env           # NGC key, chmod 600 (§10)
+  │   └── webapp.env        # API_KEY + ENDPOINT, chmod 600 (§14)
   ├── bin/                  # per-project exes dropped here (Steps 3 & 5)
   ├── deepstream/           # rendered DS configs + calibration (Step 4)
-  └── projects/             # per-project registry entries (Step 5)
+  ├── projects/             # per-project registry entries (Step 5)
+  ├── agent/                # MQTT control agent env/config (Step 6)
+  ├── webapp/               # upload queue + run-state files (Step 7)
+  └── run/                  # worker state files, fan-in source (Step 7 §F.2)
   ```
 
 - **Steps 3 and 5** drop per-project executables into `<install_dir>/bin/`;
@@ -654,6 +709,8 @@ class StepResult:
 - `log` (§8.1), `report_installed`, `report_already_installed`,
   `verify_pinned` (§8.3–8.4).
 - `ngc` handle (`load_key`, `configure_ngc_cli`, `manual_fallback`, §10).
+- `webapp` handle (`load_credentials`, `enabled`, §14) — the web-app API key
+  and normalized endpoint, for steps that talk to the backend.
 - `asset_path(...)` (§4.2) to locate bundled bash/config.
 - `reboot.request()` helper (which just returns `REBOOT_REQUIRED`; the
   framework does the boot-id bookkeeping, §7).
@@ -680,6 +737,14 @@ Each step doc defines its own internals but consumes only the contracts above:
 - **Step 5 — Per-project exes (DevD):** start-or-close, project-named
   DeepStream exe + reusable AMC exe, project registry / re-run; writes to
   `<install_dir>/bin/` and `<install_dir>/projects/`.
+- **Step 6 — Remote supervision (DevD, opt-in §3.4):** per-project pipelines
+  become boot-enabled `mv3dt-pipeline@<slug>.service` instances plus an MQTT
+  control agent — the **control plane** (run / stop / restart). See
+  [`STEP-6`](STEP-6-REMOTE-SUPERVISION.md).
+- **Step 7 — Web-app integration (DevD, opt-in §3.4):** the HTTP **data
+  plane** — registration/status, signed-URL artifact upload, and
+  web-app-initiated one-shot operations, against the credential contract in
+  §14. See [`STEP-7`](STEP-7-WEBAPP-INTEGRATION.md).
 
 ---
 
@@ -694,15 +759,137 @@ Each step doc defines its own internals but consumes only the contracts above:
   (Notion §7.1–7.4). The pipeline only consumes the resulting RTSP URLs.
 - Secure Boot MOK enrollment and any BIOS interaction — surfaced as
   `USER_ACTION_REQUIRED` by Step 1, performed by the operator.
-- Production hardening (Mosquitto ACL/passwords, `ufw`, Tailscale/NoMachine),
-  systemd supervision, and dashboards — see the "Out of scope" / "Future
-  work" sections of
+- `ufw`, Tailscale/NoMachine, and dashboards — see the "Out of scope" /
+  "Future work" sections of
   [`SCRIPTED-WORKFLOW.md`](../../laptop/docs/SCRIPTED-WORKFLOW.md).
+  (systemd supervision and Mosquitto ACL/password hardening are **no longer**
+  out of scope — [`STEP-6`](STEP-6-REMOTE-SUPERVISION.md) owns both.)
+- **The web app itself** — its UI, its API implementation, cloud auth
+  infrastructure, and API-key issuance/rotation. The framework captures and
+  stores the credential (§14) but never provisions it; the desktop-side half
+  of the integration is [`STEP-7`](STEP-7-WEBAPP-INTEGRATION.md), and its own
+  exclusions are listed in
+  [`STEP-7` §I](STEP-7-WEBAPP-INTEGRATION.md#i-out-of-scope--flag-for-human).
 - Alternate detectors (`yolo11n`): explicitly deferred; PeopleNet is the only
   detector installed, matching NVIDIA's DS 9.0 MV3DT reference.
 - The NGC account itself and any credential the operator must obtain from
   NVIDIA — the installer captures and stores the key locally (§10) but never
   provisions it.
+
+---
+
+## 14. Web-app connection contract
+
+The desktop talks to a cloud web app over **HTTP with a bearer API key**. This
+section owns the credential and endpoint contract — the *transport* and the
+*routes* belong to [`STEP-7`](STEP-7-WEBAPP-INTEGRATION.md), and
+[`STEP-6`](STEP-6-REMOTE-SUPERVISION.md) owns the separate MQTT control plane.
+It is deliberately a sibling of §10 (NGC key): same storage discipline, same
+secrecy rules, different consumer.
+
+> **Provenance:** this contract is ported from the P2BP Jetson camera-node
+> agent, which has been running against the same backend. The capture flow
+> mirrors that tree's `install.sh` (credential prompt → normalize → atomic
+> write → `chmod 600`) and the endpoint rule mirrors its `_normalize_endpoint`.
+> Those source files are being removed from this fork — see
+> [`DELETION-REVIEW` §3](DELETION-REVIEW.md#3-deletions-gated-on-the-harvest-the-jetson-tree)
+> — so the behavior is specified here in full rather than by reference.
+
+### 14.1 Storage contract
+
+- Canonical secret file: **`<install_dir>/secrets/webapp.env`**, owned by the
+  invoking user (§9.2), permissions **`chmod 600`**, directory `chmod 700` —
+  identical to §10.1. Exactly two lines:
+
+  ```
+  API_KEY=<key>
+  ENDPOINT=<normalized-base-url>
+  ```
+
+- The file is `KEY=VALUE` with no quoting or expansion, so it is directly
+  consumable both by `EnvironmentFile=` in a systemd unit and by
+  `set -a; . webapp.env` in a bundled bash fragment (§11.2).
+- If `<install_dir>` is inside a git working tree, the secrets directory MUST
+  be gitignored, exactly as §10.1 requires for `ngc.env`. The key is **NEVER**
+  committed.
+- Only the API key is secret. `ENDPOINT` is not, but it lives in the same file
+  so there is one place to look and one file to `chmod`.
+
+### 14.2 Endpoint normalization (REQUIRED)
+
+Operators paste base URLs inconsistently — with a trailing slash, or with the
+`/api` suffix already attached, because that is what the browser address bar
+shows. Every consumer joins routes as `<endpoint> + /api/...`, so a
+non-normalized value silently produces `https://host/api/api/...`.
+
+Normalization is applied **once at capture** and **again on every load** (cheap,
+and it protects against a hand-edited file):
+
+1. Strip surrounding whitespace.
+2. Strip **all** trailing `/` characters.
+3. If the result ends in `/api` (case-insensitive), remove that suffix, then
+   strip trailing `/` again.
+4. An empty result is an error, not an empty endpoint.
+
+| Operator input | Normalized `ENDPOINT` |
+|---|---|
+| `https://host` | `https://host` |
+| `https://host/` | `https://host` |
+| `https://host/api` | `https://host` |
+| `https://host/api/` | `https://host` |
+| `https://host/API//` | `https://host` |
+
+Route joining is correspondingly strict: `join(endpoint, path)` right-strips
+`/` from the base, left-pads a single `/` onto the path, and concatenates —
+never `urljoin`, whose relative-reference semantics would discard a base path
+component.
+
+### 14.3 Capture + handoff API (`webapp.py`)
+
+Mirrors the §10.2 shape so the two credential handles behave identically:
+
+- `capture_credentials(non_interactive: bool) -> Credentials` — the prompt
+  flow. **When a value already exists, ask before replacing it** rather than
+  forcing re-entry: print that a credential was found and offer to keep it,
+  defaulting to keep. The key prompt suppresses echo; the endpoint prompt does
+  not. Under `--non-interactive`, existing values are kept silently and missing
+  ones are left unset.
+- `store_credentials(creds, install_dir) -> Path` — writes `secrets/webapp.env`
+  via the §6.3 atomic-write discipline, then `chmod 600` and `chown` to the
+  invoking user. Write-then-permission ordering matters: create the file with a
+  restrictive mode from the start (`os.open` with `0o600`) so the key is never
+  briefly world-readable.
+- `load_credentials() -> Credentials | None` — reads back, re-normalizes the
+  endpoint (§14.2), and returns `None` when either value is missing. Steps
+  treat `None` as "not configured" and surface a USER-ACTION block (§9.3), not
+  a crash.
+- `enabled() -> bool` — the §3.4 gate combined with a successful
+  `load_credentials()`. This is what a step's `preflight` checks.
+
+### 14.4 Redaction (REQUIRED)
+
+The transcript log (§8.2) captures every prompt and every shelled-out command's
+output, so redaction is a contract, not a nicety. Two distinct rules:
+
+- **The API key** — any log line that would contain it prints
+  `API_KEY=<redacted>`. The capture prompt echoes nothing.
+- **Signed URLs** — the upload flow
+  ([`STEP-7` §B](STEP-7-WEBAPP-INTEGRATION.md#b-signed-url-upload)) receives
+  pre-signed URLs whose **query string is itself the credential**. Before any
+  such URL reaches a log, transcript, or error message, everything from the
+  first `?` onward is replaced:
+
+  ```python
+  def redact_url(url: str) -> str:
+      if not url:
+          return ""
+      q = url.find("?")
+      return url if q < 0 else url[:q] + "?<redacted>"
+  ```
+
+  This applies to failure paths too — an exception message containing a raw
+  signed URL is the most likely way one leaks, so the redaction happens in the
+  logging helper, not at each call site.
 
 ---
 
@@ -747,3 +934,18 @@ Repo files referenced:
   — source workflow the installer unifies.
 - [`laptop/.gitignore`](../../laptop/.gitignore) — precedent for gitignoring
   local secrets/env (`config/laptop.env`).
+- [`STEP-6-REMOTE-SUPERVISION.md`](STEP-6-REMOTE-SUPERVISION.md) — the opt-in
+  control plane (§3.4 gate, §12.4 map).
+- [`STEP-7-WEBAPP-INTEGRATION.md`](STEP-7-WEBAPP-INTEGRATION.md) — the opt-in
+  data plane; sole consumer of the §14 credential contract.
+- [`DELETION-REVIEW.md`](DELETION-REVIEW.md) — records which Jetson-tree files
+  the §14 contract was harvested from, and why they are being removed.
+
+> **Attribution — sources no longer in this fork.** The §14 credential flow,
+> the §6.3 atomic-write helper, and the §14.4 redaction rule were ported from
+> the P2BP Jetson camera-node agent (`scripts/cloud_storage_media.py`,
+> `scripts/heartbeat.py`, `scripts/config_io.py`, and `install.sh` at the repo
+> root). Those files are removed from this fork per
+> [`DELETION-REVIEW` §3](DELETION-REVIEW.md#3-deletions-gated-on-the-harvest-the-jetson-tree)
+> and remain available in the parent repository. They are named here as
+> provenance only — deliberately not linked, so the links cannot rot.

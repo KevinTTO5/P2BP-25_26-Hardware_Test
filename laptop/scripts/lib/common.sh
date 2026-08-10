@@ -11,8 +11,7 @@
 #   - require_root / require_tool preflight helpers.
 #
 # Isolation: this file only reads from and writes to paths under laptop/. It
-# never reaches into the repo-root scripts/, services/, config/, models/,
-# my-docs/, homographies/, or virtual-cameras/ trees.
+# never reaches into the repo-root scripts/, services/, or models/ trees.
 
 # Guard: cowardly refuse if the caller ran `bash common.sh` directly.
 if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then

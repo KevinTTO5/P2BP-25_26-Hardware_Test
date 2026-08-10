@@ -49,8 +49,20 @@ Out of scope (deferred / other steps):
   (§7 handoff).
 - Running AMC or defining the AMC project — that is the human (Step 3 brings up
   the UI; the operator drives the 6-step workflow).
-- Mosquitto install/config — owned by Step 1/2 bootstrap (`mv3dt.conf`); Step 4
-  only references `127.0.0.1:1883` to match the local broker.
+- Mosquitto install/config — Step 4 only references `127.0.0.1:1883` to match
+  the local broker.
+
+  > **Open gap (flagged, not resolved).** No step currently owns Mosquitto
+  > installation. This bullet previously deferred it to "Step 1/2 bootstrap",
+  > but neither [`STEP-1`](STEP-1-PREREQUISITES.md) nor
+  > [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) installs it, while
+  > [`STEP-6` §E.1](STEP-6-REMOTE-SUPERVISION.md#e1-lifecycle) `preflight`
+  > **requires** a reachable broker and
+  > [`STEP-6` §D](STEP-6-REMOTE-SUPERVISION.md#d-security-remote-control-must-be-authenticated)
+  > **rewrites** its configuration. Until a step adopts it,
+  > [`10_setup_mosquitto.sh`](../../laptop/scripts/10_setup_mosquitto.sh) is
+  > load-bearing and must be run by hand. Tracked in
+  > [`DELETION-REVIEW` §6](DELETION-REVIEW.md#6-coverage-gaps-this-triage-exposed).
 
 The tracker YAML schema is **settled** (see §6.1): Step 4 uses the repo's
 `SV3DT.calibrationDirectory` field and does not re-schematize to NVIDIA's
@@ -212,6 +224,15 @@ is `COMPLETE` (framework §6). Matches the "idempotent" contract in the
   `40_export_watcher.sh` for operators who want to iterate on AMC exports after
   install. Step 4 may print a hint pointing at it. It is not invoked by the
   installer flow.
+
+> **[`40_export_watcher.sh`](../../laptop/scripts/40_export_watcher.sh) is NOT
+> superseded — do not delete it when the installer ships.** Step 4 ports only
+> the *one-shot* ingest+render path; the watch mode above has no equivalent
+> anywhere in the installer, by design (the dispatch loop must not block on an
+> `inotifywait`, §4.4 above). Unlike the other numbered scripts, which the
+> installer replaces outright, this one survives the port. Recorded in
+> [`DELETION-REVIEW` §5](DELETION-REVIEW.md#5-retained-files-and-why) so it is
+> not removed on the assumption that Step 4 replaced it.
 
 ---
 
