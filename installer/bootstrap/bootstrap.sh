@@ -119,6 +119,7 @@ REBUILD=0
 INSTALL_DIR="${INSTALL_DIR:-/opt/mv3dt}"
 CLONE_DIR="${CLONE_DIR:-}"
 SUDO_USER_HOME=""
+SUDO_USER_GROUP=""
 REPO_ROOT=""
 
 # -----------------------------------------------------------------------
@@ -245,11 +246,24 @@ resolve_sudo_user_home() {
   if [[ -z "$SUDO_USER_HOME" || ! -d "$SUDO_USER_HOME" ]]; then
     die "Could not resolve a home directory for SUDO_USER='${SUDO_USER}' via getent passwd."
   fi
-  log_info "Resolved SUDO_USER home: ${SUDO_USER_HOME}"
+  SUDO_USER_GROUP="$(id -gn "$SUDO_USER" 2>/dev/null || echo "$SUDO_USER")"
+  log_info "Resolved SUDO_USER home: ${SUDO_USER_HOME} (primary group: ${SUDO_USER_GROUP})"
 
   if [[ -z "$CLONE_DIR" ]]; then
     CLONE_DIR="${SUDO_USER_HOME}/${DEFAULT_CLONE_DIRNAME}"
   fi
+}
+
+# -----------------------------------------------------------------------
+# Shared secrets-dir setup (§10.1 / §14.1: chmod 700 dir, invoking-user
+# owned) — used by both the NGC and web-app credential capture steps.
+# -----------------------------------------------------------------------
+
+ensure_secrets_dir() {
+  local secrets_dir="${INSTALL_DIR}/secrets"
+  mkdir -p "$secrets_dir"
+  chmod 700 "$secrets_dir"
+  printf '%s' "$secrets_dir"
 }
 
 # -----------------------------------------------------------------------
@@ -321,10 +335,8 @@ capture_and_store_ngc_key() {
   local key
   key="$(prompt_secret 'NGC API key (blank to skip, see docs for manual download): ')"
 
-  local secrets_dir="${INSTALL_DIR}/secrets"
-  mkdir -p "$secrets_dir"
-  chmod 700 "$secrets_dir"
-
+  local secrets_dir
+  secrets_dir="$(ensure_secrets_dir)"
   local ngc_env="${secrets_dir}/ngc.env"
   if [[ -n "$key" ]]; then
     (
@@ -340,14 +352,52 @@ capture_and_store_ngc_key() {
     log_warn "No NGC API key entered; recorded manual download fallback at ${ngc_env}."
   fi
   chmod 600 "$ngc_env"
-  chown "$SUDO_USER" "$secrets_dir" "$ngc_env" 2>/dev/null || true
+  chown "${SUDO_USER}:${SUDO_USER_GROUP}" "$secrets_dir" "$ngc_env" 2>/dev/null || true
   key=""
 }
 
 # -----------------------------------------------------------------------
+# §14.2 endpoint normalization (REQUIRED). §5.1 step 5's literal text is
+# "Prompt for API_KEY ... and ENDPOINT ..., normalize the endpoint, and
+# store both per §14" — capture-time normalization is bootstrap.sh's own
+# responsibility, not deferred to the not-yet-built webapp.py (which only
+# re-normalizes on every *load*, per §14.2). Implemented as a standalone,
+# testable helper; mirrors the exact 4-step algorithm and worked examples:
+#   https://host       -> https://host
+#   https://host/       -> https://host
+#   https://host/api    -> https://host
+#   https://host/api/   -> https://host
+#   https://host/API//  -> https://host
+# -----------------------------------------------------------------------
+
+normalize_endpoint() {
+  local v="$1"
+  # 1. Strip surrounding whitespace.
+  v="${v#"${v%%[![:space:]]*}"}"
+  v="${v%"${v##*[![:space:]]}"}"
+  # 2. Strip all trailing '/' characters.
+  while [[ "$v" == */ ]]; do
+    v="${v%/}"
+  done
+  # 3. If the result ends in /api (case-insensitive), remove that suffix,
+  #    then strip trailing '/' again.
+  local lower="${v,,}"
+  if [[ "$lower" == */api ]]; then
+    v="${v:0:${#v}-4}"
+    while [[ "$v" == */ ]]; do
+      v="${v%/}"
+    done
+  fi
+  printf '%s' "$v"
+}
+
+# -----------------------------------------------------------------------
 # Step 5 (doc 00 §5.1.5) — web-app credential, only when
-# MV3DT_WEBAPP_INTEGRATION=on. Raw values only: endpoint normalization
-# (§14.2) belongs to webapp.py, not this script.
+# MV3DT_WEBAPP_INTEGRATION=on. ENDPOINT is normalized at capture time
+# (§14.2, via normalize_endpoint above) before it is ever written to
+# webapp.env, since webapp.env is meant to be directly consumable by
+# systemd's EnvironmentFile= — a path that never goes through a future
+# Python-side re-normalization.
 # -----------------------------------------------------------------------
 
 capture_and_store_webapp_credentials() {
@@ -357,14 +407,24 @@ capture_and_store_webapp_credentials() {
   fi
 
   log_info "MV3DT_WEBAPP_INTEGRATION=on; capturing web-app credential."
-  local api_key endpoint
+  local api_key raw_endpoint endpoint=""
   api_key="$(prompt_secret 'Web-app API key (input hidden): ')"
-  endpoint="$(prompt_plain 'Web-app endpoint URL: ')"
+  raw_endpoint="$(prompt_plain 'Web-app endpoint URL (blank to leave unset): ')"
 
-  local secrets_dir="${INSTALL_DIR}/secrets"
-  mkdir -p "$secrets_dir"
-  chmod 700 "$secrets_dir"
+  if [[ -n "$raw_endpoint" ]]; then
+    endpoint="$(normalize_endpoint "$raw_endpoint")"
+    if [[ -z "$endpoint" ]]; then
+      die "Web-app endpoint normalized to an empty value (entered: '${raw_endpoint}')." \
+          " Doc 00 §14.2 treats this as an error, not a blank endpoint — re-run and" \
+          " enter a valid base URL, or leave the prompt fully blank to skip."
+    fi
+    log_info "Normalized web-app endpoint: ${endpoint}"
+  else
+    log_warn "No web-app endpoint entered; leaving the gate effectively inert (Step 7 will surface a USER-ACTION block)."
+  fi
 
+  local secrets_dir
+  secrets_dir="$(ensure_secrets_dir)"
   local webapp_env="${secrets_dir}/webapp.env"
   (
     umask 0177
@@ -374,10 +434,10 @@ capture_and_store_webapp_credentials() {
     } > "$webapp_env"
   )
   chmod 600 "$webapp_env"
-  chown "$SUDO_USER" "$secrets_dir" "$webapp_env" 2>/dev/null || true
+  chown "${SUDO_USER}:${SUDO_USER_GROUP}" "$secrets_dir" "$webapp_env" 2>/dev/null || true
 
   log_info "Web-app credential stored at ${webapp_env} (API_KEY redacted in all logs;" \
-           " ENDPOINT stored as entered, not normalized here — see doc 00 §14.2, owned by webapp.py)."
+           " ENDPOINT normalized per doc 00 §14.2 before storage)."
   api_key=""
 }
 
