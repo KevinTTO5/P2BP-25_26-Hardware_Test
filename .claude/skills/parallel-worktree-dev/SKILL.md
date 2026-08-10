@@ -72,19 +72,31 @@ summarize → stop. Merging is a separate, explicit step owned by
    already knows why the code looks the way it does will rubber-stamp it.
    The reviewer checks: exact adherence to any required signatures/strings
    the spec states, scope (flag anything the spec didn't ask for — that's
-   a real finding, not nitpicking), and test coverage. It posts a real
-   `gh pr review <n>` — `--approve`, or `--request-changes` with specific,
-   file-and-line inline comments.
+   a real finding, not nitpicking), and test coverage.
+   - **Verdict format — read this before posting anything.** Every agent in
+     this workflow authenticates as the *same* `gh` identity as the PR
+     author, so GitHub's own self-approval guard rejects
+     `gh pr review <n> --approve` / `--request-changes` outright (HTTP 422,
+     "Can not approve your own pull request"). Do not attempt formal
+     `gh pr review` at all, and do not try to work around the guard (e.g.
+     retrying `--comment` as a disguised approval) — that defeats a real
+     security control and will get flagged. Instead, post a **plain
+     comment** whose first line is exactly one of:
+     `REVIEW VERDICT: APPROVE` or `REVIEW VERDICT: REQUEST_CHANGES`,
+     followed by the findings — via `gh pr comment <n> --body "..."`. This
+     marker line is what `/merge-prs` greps for later, so get it verbatim.
 
-6. **Iterate by continuing agents, not respawning them** — on
-   `--request-changes`, `SendMessage` the reviewer's feedback to the
+6. **Iterate by continuing agents, not respawning them** — on a
+   `REQUEST_CHANGES` verdict, `SendMessage` the reviewer's feedback to the
    *same* implementer agent (it already has the worktree open and the
    context of what it built and why — a fresh agent would have to
    re-derive both). It fixes and pushes a follow-up commit. Then
-   `SendMessage` the *same* reviewer agent to re-check (it already knows
-   what it flagged). Repeat. Cap at 3 rounds per PR — if still unresolved
-   after that, stop looping and surface the specific disagreement to the
-   user instead of continuing indefinitely.
+   `SendMessage` the *same* reviewer agent to re-check and post a fresh
+   `REVIEW VERDICT: ...` comment (it already knows what it flagged; the
+   newest verdict comment on a PR is the one that counts — don't delete or
+   edit the old one, just post a new one). Repeat. Cap at 3 rounds per PR —
+   if still unresolved after that, stop looping and surface the specific
+   disagreement to the user instead of continuing indefinitely.
 
 7. **Summarize before merge, and stop there** — once every PR in the batch
    is approved, produce one consolidated summary: PR number, branch, files
@@ -121,11 +133,18 @@ summarize → stop. Merging is a separate, explicit step owned by
 - If the target is a spec doc, skim it fully yourself first so the
   decomposition in step 3 is grounded in the actual document, not an
   assumption about what it probably says.
+- Know going in that review verdicts are `REVIEW VERDICT: APPROVE` /
+  `REQUEST_CHANGES` **comments**, not formal GitHub reviews — see step 5.
+  If a stray comment ever gets posted while working out a posting problem
+  (e.g. a blocked attempt that partially succeeds), it can't be deleted
+  once submitted; post a follow-up comment saying to disregard it and move
+  on, don't burn time trying to remove it via the API.
 
 ## Self-check before handing back the summary
 
 - Every unit that was built has an open PR, and every open PR has either an
-  `--approve` or an explicit user-facing escalation (step 6's 3-round cap).
+  `REVIEW VERDICT: APPROVE` comment or an explicit user-facing escalation
+  (step 6's 3-round cap).
 - No PR's diff contains anything outside its assigned spec section(s).
 - The recommended merge order in the summary is a valid topological order
   of the dependency DAG — not just "PR-1, PR-2, PR-3..." by number.
