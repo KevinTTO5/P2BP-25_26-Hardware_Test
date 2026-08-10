@@ -26,26 +26,29 @@ steps in order.
    workflow shares one `gh` identity with the PR author, so GitHub blocks
    formal self-approval and `reviewDecision` is never populated here.
    Instead, scan `.comments[].body` in chronological order and take the
-   **last** one whose first line is exactly `REVIEW VERDICT: APPROVE` or
-   `REVIEW VERDICT: REQUEST_CHANGES` (a later verdict comment supersedes an
-   earlier one on the same PR — that's how the re-review loop in
-   `parallel-worktree-dev` records an iteration). The entry must resolve to
-   `APPROVE`. If any entry fails on state, mergeable, or verdict — including
-   "no verdict comment found at all" — stop immediately, report exactly
-   which PR and which condition failed, and do not merge anything from the
-   list, including entries earlier in the order that did pass. A partial
-   merge of a dependency chain is worse than no merge.
+   **last** one that is exactly `LGTM` or that starts with
+   `REQUEST_CHANGES` (a later verdict comment supersedes an earlier one on
+   the same PR — that's how the re-review loop in `parallel-worktree-dev`
+   records an iteration). The entry must resolve to `LGTM`. If any entry
+   fails on state, mergeable, or verdict — including "no verdict comment
+   found at all" — stop immediately, report exactly which PR and which
+   condition failed, and do not merge anything from the list, including
+   entries earlier in the order that did pass. A partial merge of a
+   dependency chain is worse than no merge.
 
 3. **Print the resolved plan** before touching anything: a table of
-   PR # → title → base branch → merge position in this run. Ask the user
-   once, up front, whether to merge via `--merge` or `--squash` for the
-   whole batch (not per PR — a mixed batch is confusing to reconstruct
-   later). Get an explicit go-ahead before merging — this command performs
-   real, hard-to-reverse merges against the shared remote.
+   PR # → title → base branch → merge position in this run. Get an
+   explicit go-ahead from the user before merging — this command performs
+   real, hard-to-reverse merges against the shared remote. There is no
+   merge-strategy choice to make: this command always squash-merges with
+   the branch deleted (see step 4) — never a plain merge commit.
 
-4. **Merge in order**, one at a time:
-   `gh pr merge <id> --merge --delete-branch` (or `--squash --delete-branch`
-   per the user's choice in step 3).
+4. **Merge in order**, one at a time, always:
+   `gh pr merge <id> --squash --delete-branch`.
+   Never use `--merge`; a squash merge is the only mode this command uses,
+   so every PR's entire diff lands on `main` as one commit named from the
+   PR title/body — which is why PR content style matters (see the skill's
+   step 6a).
    - Before merging any entry after the first: if that PR's base branch was
      the *previous* entry's branch (a stacked PR), confirm GitHub already
      retargeted it to `main` following the previous merge —

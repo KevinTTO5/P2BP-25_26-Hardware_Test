@@ -81,10 +81,18 @@ summarize → stop. Merging is a separate, explicit step owned by
      `gh pr review` at all, and do not try to work around the guard (e.g.
      retrying `--comment` as a disguised approval) — that defeats a real
      security control and will get flagged. Instead, post a **plain
-     comment** whose first line is exactly one of:
-     `REVIEW VERDICT: APPROVE` or `REVIEW VERDICT: REQUEST_CHANGES`,
-     followed by the findings — via `gh pr comment <n> --body "..."`. This
-     marker line is what `/merge-prs` greps for later, so get it verbatim.
+     comment** via `gh pr comment <n> --body "..."`:
+     - If changes are needed, the comment's first line is exactly
+       `REQUEST_CHANGES`, followed by the specific, concrete findings (this
+       is the one case where real explanatory content belongs in the
+       comment — the implementer needs to know what to fix).
+     - If it's clean, the comment is exactly `LGTM` and nothing else. Do
+       the full verification (read the spec, run the tests, check scope)
+       before posting it, but do not narrate that work in the comment —
+       the review happened, it just isn't written up when there's nothing
+       to flag.
+     `/merge-prs` scans for the newest comment matching one of these two
+     markers, so get them verbatim.
 
 6. **Iterate by continuing agents, not respawning them** — on a
    `REQUEST_CHANGES` verdict, `SendMessage` the reviewer's feedback to the
@@ -92,11 +100,28 @@ summarize → stop. Merging is a separate, explicit step owned by
    context of what it built and why — a fresh agent would have to
    re-derive both). It fixes and pushes a follow-up commit. Then
    `SendMessage` the *same* reviewer agent to re-check and post a fresh
-   `REVIEW VERDICT: ...` comment (it already knows what it flagged; the
-   newest verdict comment on a PR is the one that counts — don't delete or
-   edit the old one, just post a new one). Repeat. Cap at 3 rounds per PR —
-   if still unresolved after that, stop looping and surface the specific
-   disagreement to the user instead of continuing indefinitely.
+   `LGTM` or `REQUEST_CHANGES` comment (it already knows what it flagged;
+   the newest verdict comment on a PR is the one that counts — don't delete
+   or edit the old one, just post a new one). Repeat. Cap at 3 rounds per
+   PR — if still unresolved after that, stop looping and surface the
+   specific disagreement to the user instead of continuing indefinitely.
+
+6a. **PR and commit content style — applies to every title, body, commit
+    message, and review comment written by any agent in this workflow:**
+    - No mention of AI/agent/Claude authorship or generation (no
+      "Generated with Claude Code," no `Co-Authored-By: Claude...`
+      trailers, nothing that discloses how the change was produced) — the
+      PR content should read like it was written by the repo owner.
+    - No emoji.
+    - No section-symbol character — write "section 8.1," not "8.1."
+    - No double-hyphen ("--") as punctuation — use a single dash, a colon,
+      or restructure the sentence.
+    - Keep descriptions concise. A PR body should state what changed and
+      which spec section it covers, not walk through the implementation
+      narrative.
+    This matters beyond style: a squash merge uses the PR title/body as
+    the permanent commit message on `main`, so these rules are really
+    about what the repo's real history looks like, not cosmetic.
 
 7. **Summarize before merge, and stop there** — once every PR in the batch
    is approved, produce one consolidated summary: PR number, branch, files
@@ -133,18 +158,18 @@ summarize → stop. Merging is a separate, explicit step owned by
 - If the target is a spec doc, skim it fully yourself first so the
   decomposition in step 3 is grounded in the actual document, not an
   assumption about what it probably says.
-- Know going in that review verdicts are `REVIEW VERDICT: APPROVE` /
-  `REQUEST_CHANGES` **comments**, not formal GitHub reviews — see step 5.
-  If a stray comment ever gets posted while working out a posting problem
-  (e.g. a blocked attempt that partially succeeds), it can't be deleted
-  once submitted; post a follow-up comment saying to disregard it and move
-  on, don't burn time trying to remove it via the API.
+- Know going in that review verdicts are `LGTM` / `REQUEST_CHANGES`
+  **comments**, not formal GitHub reviews — see step 5. If a stray comment
+  ever gets posted while working out a posting problem (e.g. a blocked
+  attempt that partially succeeds), it can't be deleted once submitted;
+  post a follow-up comment saying to disregard it and move on, don't burn
+  time trying to remove it via the API.
 
 ## Self-check before handing back the summary
 
 - Every unit that was built has an open PR, and every open PR has either an
-  `REVIEW VERDICT: APPROVE` comment or an explicit user-facing escalation
-  (step 6's 3-round cap).
+  `LGTM` comment or an explicit user-facing escalation (step 6's 3-round
+  cap).
 - No PR's diff contains anything outside its assigned spec section(s).
 - The recommended merge order in the summary is a valid topological order
   of the dependency DAG — not just "PR-1, PR-2, PR-3..." by number.
