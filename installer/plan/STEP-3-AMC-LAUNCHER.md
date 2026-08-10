@@ -16,10 +16,10 @@ same thing any time later (and which Step 5 reuses).
 
 This step ports the runtime logic already proven in
 [`laptop/scripts/30_start_amc.sh`](../../laptop/scripts/30_start_amc.sh) into
-the installer's Python step module. AMC is **not** vendored: it is cloned from
-`https://github.com/NVIDIA-AI-IOT/auto-magic-calib.git` into
+the installer's Python step module. AMC is **not** vendored: it lives inside
+the `NVIDIA/DeepStream` monorepo at `tools/auto-magic-calib`, cloned into
 `$HOME/auto-magic-calib/` (never under this repo tree) and run via
-`docker compose`, per the DS 9.0 AutoMagicCalib page (see [References](#references)).
+`docker compose`, per the DS 9.1 AutoMagicCalib page (see [References](#references)).
 
 ---
 
@@ -166,9 +166,25 @@ Steps, in order:
 2. **Repo-isolation guard.** Refuse to place the clone under this repo's working
    tree — port the `REPO_ROOT` guard (`30_start_amc.sh` lines 116–121):
    if `AMC_ROOT == REPO_ROOT` or is a child of it, `die`/`FAILED`.
-3. **Clone if missing** into `AMC_ROOT` (default `$HOME/auto-magic-calib`):
-   `git clone https://github.com/NVIDIA-AI-IOT/auto-magic-calib.git "$AMC_ROOT"`
-   (lines 123–128). If present, log "AMC repo already present".
+3. **Clone if missing** into `AMC_ROOT` (default `$HOME/auto-magic-calib`),
+   porting the guard shape of `30_start_amc.sh` lines 123–128. AMC now ships
+   inside the `NVIDIA/DeepStream` monorepo rather than as its own repo, so a
+   full clone would pull down the entire SDK tree just to reach
+   `tools/auto-magic-calib`. Use a **sparse checkout**:
+
+   ```bash
+   git clone --filter=blob:none --no-checkout \
+     https://github.com/NVIDIA/DeepStream.git "$AMC_ROOT"
+   git -C "$AMC_ROOT" sparse-checkout set tools/auto-magic-calib
+   git -C "$AMC_ROOT" checkout
+   ```
+
+   If present, log "AMC repo already present". **Open decision for DevC:**
+   confirm the standalone `NVIDIA-AI-IOT/auto-magic-calib` repo's current
+   state before implementation — if it is archived or redirects to the
+   monorepo, the sparse checkout above is the only path; if it is still
+   independently maintained, a plain single-purpose clone of it remains a
+   lighter-weight fallback worth keeping as an option.
 4. **Create `projects/` + `models/`** and `chown 1000:1000` them so the
    in-container UID 1000 can write (Notion §8.3; lines 130–142). As root this is
    a direct `chown`; as the user it is `sudo chown` with a warning fallback.
@@ -178,9 +194,12 @@ Steps, in order:
    on failure, warn and continue. If `ctx.ngc.load_key()` is `None`
    (manual-fallback), skip and log "assuming AMC images are public or
    `docker login` already done".
-6. **Locate the compose dir** — `AMC_ROOT/compose` if present, else fall back to
-   `AMC_ROOT` if `compose.yaml`/`docker-compose.yml` sit at the root; else
-   `FAILED` "upstream AMC layout changed" (lines 152–160).
+6. **Locate the compose dir** — `AMC_ROOT/tools/auto-magic-calib/compose`
+   (the monorepo layout) if present, else fall back to `AMC_ROOT/compose` or
+   `AMC_ROOT` itself if `compose.yaml`/`docker-compose.yml` sit there (in case
+   a standalone-repo checkout was used instead, per the §4 open decision);
+   else `FAILED` "upstream AMC layout changed" (porting the search-order
+   guard from `30_start_amc.sh` lines 152–160).
 7. **Write `compose/.env`** (§4.2), atomically (`tmp` + `mv`), after diffing
    against upstream `.env.example` (§4.3).
 8. **Pull + up:** `docker compose pull` (skippable via `--skip-pull`) then
@@ -237,7 +256,8 @@ the invoking user.
 Before writing, diff our key set against `compose/.env.example` (lines 165–173):
 for each of `HOST_IP`, `AUTO_MAGIC_CALIB_MS_PORT`, `AUTO_MAGIC_CALIB_UI_PORT`,
 `PROJECT_DIR`, `MODEL_DIR`, `NVIDIA_VISIBLE_DEVICES`, warn if the key is no
-longer present upstream ("re-check the NVIDIA-AI-IOT/auto-magic-calib README").
+longer present upstream ("re-check the `tools/auto-magic-calib` README in
+NVIDIA/DeepStream").
 This surfaces upstream renames without hard-failing.
 
 ---
@@ -306,7 +326,7 @@ blocks on that process, and tears AMC down only when it exits.
 
 3. **Teardown (once, fail-safe)**: on the wait returning — or on `SIGINT` /
    `SIGTERM`, or via `atexit` — run `docker compose down` in the compose dir
-   (the DS 9.0 documented stop command). Guard with a run-once flag so signal +
+   (the DS 9.1 documented stop command). Guard with a run-once flag so signal +
    normal-exit paths don't double-invoke. Skip teardown when `--keep-up` is set.
 
 Install `SIGINT`/`SIGTERM` handlers and an `atexit` hook **before** `up -d` so
@@ -438,9 +458,9 @@ applies):
   user; `<install_dir>/bin/mv3dt-installer` exists.
 - `docker compose version` resolves and the `nvidia` runtime is registered.
 - The Step-3 keys are present in `installer.conf`.
-- (No pinned upstream AMC version — AMC tracks `NVIDIA-AI-IOT/auto-magic-calib`
-  `main`; `verify()` records the resolved commit for the transcript rather than
-  equality-pinning it.)
+- (No pinned upstream AMC version — AMC tracks the `tools/auto-magic-calib`
+  path in `NVIDIA/DeepStream` `main`; `verify()` records the resolved commit
+  for the transcript rather than equality-pinning it.)
 
 Returns `COMPLETE` only when the exe deliverable is in place and Docker is
 usable.
@@ -459,7 +479,7 @@ AutoMagicCalib launcher installed.
   Stop AMC:          <install_dir>/bin/amc --down   (or close the AMC window)
 
 The AMC service stays up until you close the AMC browser window (or run --down).
-Next: complete the 6-step calibration in the browser (see the DS 9.0
+Next: complete the 6-step calibration in the browser (see the DS 9.1
 AutoMagicCalib guide), then Step 4 ingests the export.
 ```
 
@@ -478,7 +498,7 @@ AutoMagicCalib guide), then Step 4 ingests the export.
 Step 3 gets the operator to the AMC landing page and holds it open; the
 calibration itself is **human-driven in the browser** and stays out of scope
 (same boundary as `30_start_amc.sh`). For reference, the workflow is (Notion
-§8.6, cross-referenced with the DS 9.0 AutoMagicCalib page):
+§8.6, cross-referenced with the DS 9.1 AutoMagicCalib page):
 
 1. **Project Setup** — name + camera count.
 2. **Video Upload** — one clip per camera.
@@ -521,25 +541,36 @@ scope):
 4. **Pre-pull AMC images at install time vs. lazy at first launch (§2, §4).**
    Default is lazy (avoid a ~4 GB pull during install); a `--amc-prepull`
    opt-in could warm the cache. Confirm expected install-time bandwidth.
+5. **`AMC_ROOT` as both source clone and data root (§4).** `AMC_ROOT`
+   currently doubles as the sparse-checkout target *and* the parent of
+   `projects/`/`models/` user data. Now that the source is a monorepo sparse
+   checkout rather than a small standalone repo, confirm whether that pairing
+   should stay as-is or split into a separate `AMC_SOURCE_DIR` (clone) and
+   `AMC_DATA_DIR` (`projects/`/`models/`) — flagged for DevC, not resolved
+   here.
 
 ---
 
 ## References
 
-DeepStream 9.0 official documentation — DS 9.0 only (NVIDIA's current release).
-AMC facts cross-checked via Context7 library
-`/websites/nvidia_metropolis_deepstream_dev-guide` (confirmed: `docker compose
-up -d` from `compose/`, `docker compose down` to stop, `docker login nvcr.io`
-with `$oauthtoken` + NGC API key, `HOST_IP` in `compose/.env`, UI on
+DeepStream 9.1 official documentation — DS 9.1 only (NVIDIA's current
+release). AMC facts confirmed directly against the pages below: `docker
+compose up -d` from `compose/`, `docker compose down` to stop, `docker login
+nvcr.io` with `$oauthtoken` + NGC API key, `HOST_IP` in `compose/.env`, UI on
 `AUTO_MAGIC_CALIB_UI_PORT` default 5000 and microservice on
-`AUTO_MAGIC_CALIB_MS_PORT` default 8000).
+`AUTO_MAGIC_CALIB_MS_PORT` default 8000, and AMC's location inside the
+`NVIDIA/DeepStream` monorepo at `tools/auto-magic-calib`.
 
-- DS 9.0 AutoMagicCalib (NGC setup, clone, `compose/.env` `HOST_IP`,
-  `docker compose up -d`, UI 5000 / microservice 8000, `docker compose down`):
+- DS 9.1 AutoMagicCalib (monorepo clone + `tools/auto-magic-calib`,
+  `compose/.env` `HOST_IP`, `docker compose up -d`, UI 5000 / microservice
+  8000, `docker compose down`):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_AutoMagicCalib.html>
-- DS 9.0 Docker Containers (NVIDIA Container Toolkit / `--gpus`, `nvcr.io`
+- DS 9.1 Docker Containers (NVIDIA Container Toolkit / `--gpus`, `nvcr.io`
   registry, running DeepStream containers):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_docker_containers.html>
+- NVIDIA/DeepStream GitHub repo (monorepo root; `tools/auto-magic-calib` is
+  the AMC subdirectory):
+  <https://github.com/NVIDIA/DeepStream>
 
 Repo files referenced:
 

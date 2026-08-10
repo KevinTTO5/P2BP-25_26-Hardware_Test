@@ -1,4 +1,4 @@
-# laptop/ — DeepStream 9.0 scripted testing harness
+# laptop/ — DeepStream 9.1 scripted testing harness
 
 This subtree contains the **laptop-side** scripted workflow for the MV3DT
 pipeline. It is isolated from the Jetson tree at the repo root: every file
@@ -6,7 +6,12 @@ under `laptop/` is self-contained and does not read from or write to
 `scripts/`, `services/`, or `models/`.
 
 Full operator doc: [`laptop/docs/SCRIPTED-WORKFLOW.md`](docs/SCRIPTED-WORKFLOW.md)
-DS 9.0 setup reference: [`laptop/docs/DEEPSTREAM-SETUP.md`](docs/DEEPSTREAM-SETUP.md)
+DS 9.1 setup reference: [`laptop/docs/DEEPSTREAM-SETUP.md`](docs/DEEPSTREAM-SETUP.md)
+
+> **Known drift:** targets below are DS 9.1; `scripts/00_bootstrap.sh` and
+> `scripts/30_start_amc.sh` have not yet been updated to match (still
+> DS 9.0 / the standalone AMC repo) — see
+> [`docs/DEEPSTREAM-SETUP.md`](docs/DEEPSTREAM-SETUP.md) §5.2.
 
 ## Prerequisites (manual, outside this repo)
 
@@ -18,7 +23,7 @@ the §1–4 pins manually and use bootstrap for the rest. Summary:
 
 - §1–2: Hardware (Ampere-or-newer NVIDIA GPU) and BIOS.
 - §3: Dual-boot Ubuntu 24.04.
-- §4: Driver `590.48.01`, CUDA `13.1`, cuDNN `9.18.0`, TRT `10.14.1.48-1+cuda13.0` (exact pins in that doc).
+- §4: Driver `595.58.03`, CUDA `13.2`, cuDNN `9.20.0.48`, TRT `10.16.0.72-1+cuda13.2` (exact pins in that doc).
 
 ## Minimal post-clone sequence
 
@@ -58,7 +63,7 @@ laptop/
 ├── mosquitto/mv3dt.conf       # broker drop-in installed by 10_setup_mosquitto.sh
 ├── deepstream/
 │   ├── deepstream_app_config.txt    # 8 RTSP sources + MV3DT + MQTT sink (template)
-│   ├── config_infer_primary.txt     # PeopleNet only (NVIDIA DS 9.0 MV3DT reference)
+│   ├── config_infer_primary.txt     # PeopleNet only (NVIDIA DS 9.1 MV3DT reference)
 │   ├── config_tracker_NvMOT.yml     # NvDCF + ReID + SV3DT + MV3DT
 │   ├── msgconv_config.txt
 │   ├── calibration/<LOCATION_ID>/   # written by 40_export_watcher.sh (gitignored)
@@ -80,7 +85,7 @@ watch -n 1 'nvidia-smi --query-gpu=utilization.gpu,memory.used,temperature.gpu -
 ## Detector policy
 
 PeopleNet is the **only** detector installed and wired into the pipeline,
-matching NVIDIA's DS 9.0 MV3DT reference documentation. `yolo11n`
+matching NVIDIA's DS 9.1 MV3DT reference documentation. `yolo11n`
 (ultralytics `yolo11n.pt`) is named as the _only_ approved alternative
 detector for future work, but no script here installs, exports, or
 configures it. See [`deepstream/config_infer_primary.txt`](deepstream/config_infer_primary.txt)
@@ -89,9 +94,8 @@ entry for `marcoslucianops/DeepStream-Yolo` when wiring it later.
 
 ## Documentation source of truth
 
-All DS 9.0 facts in this subtree (plugin fields, MV3DT semantics, AMC
-workflow, NGC tags, 9.0 breaking changes) are resolved via
+All DS 9.1 facts in this subtree (plugin fields, MV3DT semantics, AMC
+workflow, distribution tags, breaking changes) are resolved via
 [`.cursor/skills/deepstream-9-docs/SKILL.md`](../.cursor/skills/deepstream-9-docs/SKILL.md)
-(Context7 `/websites/nvidia_metropolis_deepstream_dev-guide` → WebFetch →
-GitHub, in that order). See [`docs/SCRIPTED-WORKFLOW.md`](docs/SCRIPTED-WORKFLOW.md)
+(WebFetch → GitHub, in that order). See [`docs/SCRIPTED-WORKFLOW.md`](docs/SCRIPTED-WORKFLOW.md)
 for the end-to-end flow diagram and future-work items.

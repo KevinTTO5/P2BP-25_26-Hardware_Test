@@ -1,13 +1,21 @@
-# Laptop Scripts & Config Reference (DS 9.0 + AMC + MV3DT)
+# Laptop Scripts & Config Reference (DS 9.1 + AMC + MV3DT)
 
 Concise map of what every script under [`laptop/scripts/`](../scripts/) does,
-which DS 9.0 doc section it implements, and exactly which config files you
+which DS 9.1 doc section it implements, and exactly which config files you
 must customize for your own cameras / site / MV3DT output. Read this before
 running anything.
 
 Companion docs:
 [`SCRIPTED-WORKFLOW.md`](SCRIPTED-WORKFLOW.md) (operator run order) and
 [`DEEPSTREAM-SETUP.md`](DEEPSTREAM-SETUP.md) (manual §1–4 prereqs).
+
+> **Known drift:** this reference targets DS 9.1. The scripts referenced below
+> (`00_bootstrap.sh`, `30_start_amc.sh`) have not yet been updated to match —
+> where a row below quotes an exact filename, package name, or clone URL, that
+> reflects what the script **currently** does (still DS 9.0 / the standalone
+> AMC repo), not the DS 9.1 target. See
+> [`DEEPSTREAM-SETUP.md` §5.2](DEEPSTREAM-SETUP.md) "Known drift" for the
+> full picture before running anything end-to-end.
 
 ---
 
@@ -27,11 +35,11 @@ the UI.
 
 ---
 
-## 2. Script-by-script table (cross-referenced to DS 9.0 docs)
+## 2. Script-by-script table (cross-referenced to DS 9.1 docs)
 
-| # | Script | DS 9.0 doc section | What it installs / does | sudo? | Idempotent |
+| # | Script | DS 9.1 doc section | What it installs / does | sudo? | Idempotent |
 |---|--------|--------------------|-------------------------|-------|-----------|
-| — | **Manual prereq** | [DS_Installation → dGPU Setup for Ubuntu → Prerequisites](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html) | Ubuntu 24.04, NVIDIA driver **590.48.01**, CUDA **13.1**, TensorRT **10.14.1.48-1+cuda13.0**, cuDNN **9.18.0**, GStreamer **1.24.2**. | yes | n/a |
+| — | **Manual prereq** | [DS_Installation → dGPU Setup for Ubuntu → Prerequisites](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html) | Ubuntu 24.04, NVIDIA driver **595.58.03**, CUDA **13.2**, TensorRT **10.16.0.72-1+cuda13.2**, cuDNN **9.20.0.48**, GStreamer **1.24.2**. | yes | n/a |
 | 00 | [`00_bootstrap.sh`](../scripts/00_bootstrap.sh) | [DS_Installation](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html); [DS_docker_containers](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_docker_containers.html) | **Phased install**: pre-downloaded NVIDIA local-repo + cuda-keyring debs; driver `590.48.01` + CUDA 13.1 + cuDNN 9.18 + TRT 10.14.1.48-1; `/etc/profile.d/cuda.sh`; GStreamer 1.24 + DS apt prerequisites; Mosquitto; Docker + `nvidia-container-toolkit`; NGC `ngc registry resource download-version` of `deepstream-9.0_9.0.0-1_amd64.deb` + `apt install`; `update_rtpmanager.sh` + `/etc/profile.d/deepstream.sh`; version audit; `laptop/config/laptop.env`; PeopleNet ONNX → `laptop/deepstream/models/peoplenet/`. | yes | yes |
 | 10 | [`10_setup_mosquitto.sh`](../scripts/10_setup_mosquitto.sh) | [DS_IoT](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_IoT.html); [Gst-nvmsgbroker](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvmsgbroker.html) | Installs [`laptop/mosquitto/mv3dt.conf`](../mosquitto/mv3dt.conf) → `/etc/mosquitto/conf.d/mv3dt.conf`; `systemctl enable --now mosquitto`. `--with-firewall` opens `ufw` 1883/9001. | yes | yes |
 | 20 | [`20_verify_cameras.sh`](../scripts/20_verify_cameras.sh) | [DS_Quickstart](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Quickstart.html) (RTSP input sanity) | For each enabled row in [`cameras.yml`](../config/cameras.yml): `ping` then `ffprobe -rtsp_transport tcp` against `rtsp://$CAM_USER:$CAM_PASSWORD@$ip:554$rtsp_path`. Emits a PASS/FAIL/SKIP table. | no | yes |
@@ -63,7 +71,7 @@ These are the most common failure modes and what to do:
 | `30_start_amc` fails: "Cannot locate compose dir" | Upstream AMC repo layout changed | Check the [AMC README](https://github.com/NVIDIA-AI-IOT/auto-magic-calib); compose dir may have moved to repo root. |
 | AMC "Execute" step times out | GPU VRAM pressure from the VGGT stage | See the workaround in [DS_AutoMagicCalib](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_AutoMagicCalib.html); reduce resolution or shorten clips. |
 | `50_start_pipeline` errors "no rendered pipeline config found" | `40_export_watcher` has not rendered `deepstream_app_config.rendered.txt` yet | Run `laptop/scripts/40_export_watcher.sh --oneshot` first. For a structural smoke test only, use `50_start_pipeline.sh --force-template`. |
-| INT8 calibration cache missing | DS 9.0 **removed INT8 calibration for TAO models** | Use FP16 (default in `config_infer_primary.txt`). This is a DS 9.0 breaking change. |
+| INT8 calibration cache missing | DS 9.1 **has no INT8 calibration for TAO models** (removed in an earlier DS release, still absent) | Use FP16 (default in `config_infer_primary.txt`). |
 
 ---
 
@@ -109,7 +117,7 @@ cameras:
 **What to change for your dataset:**
 
 1. **Number of entries** — add or remove rows to match your camera count.
-   NVIDIA's DS 9.0 MV3DT reference uses up to 8 cameras, matching the
+   NVIDIA's DS 9.1 MV3DT reference uses up to 8 cameras, matching the
    seeded C1..C8.
 2. **IPs** — match whatever your DHCP / static plan assigns on the
    camera LAN. The reference uses `192.168.10.101..108` with laptop on
@@ -128,7 +136,7 @@ must match that assumption; otherwise fused tracks will drop.
 Installed to `/etc/mosquitto/conf.d/mv3dt.conf` by `10_setup_mosquitto.sh`.
 "Simple testing" posture by default:
 
-- `listener 1883 0.0.0.0` — MQTT over TCP (where the DS 9.0
+- `listener 1883 0.0.0.0` — MQTT over TCP (where the DS 9.1
   `nvmsgbroker` sink publishes via `libnvds_mqtt_proto.so`).
 - `listener 9001` + `protocol websockets` — for browser-based inspectors.
 - `allow_anonymous true` — **no auth**.
@@ -144,7 +152,7 @@ Installed to `/etc/mosquitto/conf.d/mv3dt.conf` by `10_setup_mosquitto.sh`.
 | `persistence true` + `persistence_location /var/lib/mosquitto/` | Queue messages while consumer is offline. |
 | Comment out `listener 9001` | Drop websockets if you don't need browser clients. |
 
-After any edit: `sudo systemctl restart mosquitto`. The DS 9.0 side must
+After any edit: `sudo systemctl restart mosquitto`. The DS 9.1 side must
 also receive matching creds via `gst-nvmsgbroker` config (see
 [DS_plugin_gst-nvmsgbroker](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvmsgbroker.html)).
 
@@ -155,7 +163,7 @@ also receive matching creds via `gst-nvmsgbroker` config (see
 > and **is never run directly** — `40_export_watcher.sh` renders it into
 > `deepstream_app_config.rendered.txt` every time new AMC artifacts land.
 
-Structure matches the NVIDIA DS 9.0 MV3DT reference
+Structure matches the NVIDIA DS 9.1 MV3DT reference
 ([`DS_MV3DT.html`](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html)):
 one `[sourceN]` per camera, a `[primary-gie]` pointing at
 `config_infer_primary.txt` (PeopleNet), a `[tracker]` block, a `[sink0]`
@@ -169,7 +177,7 @@ one `[sourceN]` per camera, a `[primary-gie]` pointing at
 | Number of `[sourceN]` blocks | top of file, one per camera | Must equal the number of **enabled** entries in `cameras.yml`. URLs are overwritten by `40_export_watcher.sh`. |
 | Calibration paths | any `[mv3dt]` / tracker config block referencing `calibration/` | Re-point to `laptop/deepstream/calibration/<LOCATION_ID>/` — already automatic if you leave `${LOCATION_ID}` in. |
 | `[sink0] topic=` | MQTT publish sink | Must match `MQTT_TOPIC_BASE` in `laptop.env` (default `mv3dt`). |
-| `[primary-gie] model-engine-file` | if you pin a pre-built TRT engine | Default is PeopleNet FP16 rebuilt on first run (DS 9.0 removed TAO INT8 calibration). |
+| `[primary-gie] model-engine-file` | if you pin a pre-built TRT engine | Default is PeopleNet FP16 rebuilt on first run (DS 9.1 has no TAO INT8 calibration). |
 
 Do **not** edit the rendered file — it's regenerated.
 
@@ -177,7 +185,7 @@ Do **not** edit the rendered file — it's regenerated.
 
 ## 5. Matching NVIDIA's MV3DT testing format
 
-NVIDIA's DS 9.0 MV3DT reference test expects:
+NVIDIA's DS 9.1 MV3DT reference test expects:
 
 1. **PeopleNet detector** (Phase 10 of `00_bootstrap.sh`; see
    [DS_MV3DT §Models](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html)).

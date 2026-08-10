@@ -6,9 +6,9 @@ Guidance for Claude Code when working in this repository.
 
 P2BP Senior Design (Fall '25 – Spring '26) hardware stack for a multi-camera
 3D tracking system (MV3DT). It is now a **single subsystem**: the DeepStream
-9.0 workstation.
+9.1 workstation.
 
-1. **DeepStream 9.0 harness** (`laptop/`) — the working scripted workflow for
+1. **DeepStream 9.1 harness** (`laptop/`) — the working scripted workflow for
    multi-view calibration (AutoMagicCalib) and MV3DT inference. Start at
    [`laptop/README.md`](laptop/README.md) and
    [`laptop/docs/SCRIPTED-WORKFLOW.md`](laptop/docs/SCRIPTED-WORKFLOW.md).
@@ -73,7 +73,7 @@ and [`laptop/docs/SCRIPTED-WORKFLOW.md`](laptop/docs/SCRIPTED-WORKFLOW.md).
   what was removed from this fork and why.
 - [`laptop/docs/SCRIPTED-WORKFLOW.md`](laptop/docs/SCRIPTED-WORKFLOW.md) —
   operator guide + script run order + flow diagram.
-- [`laptop/docs/DEEPSTREAM-SETUP.md`](laptop/docs/DEEPSTREAM-SETUP.md) — DS 9.0
+- [`laptop/docs/DEEPSTREAM-SETUP.md`](laptop/docs/DEEPSTREAM-SETUP.md) — DS 9.1
   package/OS setup and AMC workflow; source of truth for version pins.
 - [`laptop/docs/SCRIPTS-AND-CONFIG-REFERENCE.md`](laptop/docs/SCRIPTS-AND-CONFIG-REFERENCE.md)
   — per-script/config field reference.

@@ -1,4 +1,4 @@
-# STEP 2 — DeepStream 9.0 SDK (owner: DevB)
+# STEP 2 — DeepStream 9.1 SDK (owner: DevB)
 
 Status: step spec. This document builds on the shared framework contract in
 [`00-FRAMEWORK-AND-BOOTSTRAP.md`](00-FRAMEWORK-AND-BOOTSTRAP.md) — the
@@ -7,37 +7,39 @@ reboot gate, logging/reporting strings, NGC key handoff, and install-location
 config are all defined there and are **not** restated here. Read doc 00 first.
 
 Step 2 module: `installer/mv3dt_installer/steps/step2_deepstream_sdk.py`
-(`id = "step2_deepstream_sdk"`, `title = "DeepStream 9.0 SDK"`, `order = 2`).
+(`id = "step2_deepstream_sdk"`, `title = "DeepStream 9.1 SDK"`, `order = 2`).
 
-Scope: install the **DeepStream 9.0 SDK** on Ubuntu 24.04 / x86_64 (RTX PRO
-4500 Blackwell), by one of the three official methods (deb / tar / docker),
-using the operator's NGC key captured at bootstrap (with a guided manual
-fallback), then run post-install wiring and a smoke test. This step assumes
-Step 1 already installed and verified the driver / CUDA / cuDNN / TensorRT /
-GStreamer stack and that its reboot is confirmed.
+Scope: install the **DeepStream 9.1 SDK** on Ubuntu 24.04 / x86_64 (RTX PRO
+4500 Blackwell), by one of the three official methods (deb / tar / docker) —
+deb/tar are public GitHub Release downloads, docker is NGC-gated using the
+operator's key captured at bootstrap (with a guided manual fallback) — then
+run post-install wiring and a smoke test. This step assumes Step 1 already
+installed and verified the driver / CUDA / cuDNN / TensorRT / GStreamer stack
+and that its reboot is confirmed.
 
 ---
 
-## 1. Locked facts and pins (from DS 9.0 docs)
+## 1. Locked facts and pins (from DS 9.1 docs)
 
 - Target: **Ubuntu 24.04**, **x86_64 (dGPU)**, GPU **RTX PRO 4500 Blackwell**.
-  **DeepStream 9.0 only.**
-- DS SDK version string: **`9.0.0-1`** (deb/dpkg), SDK dir
-  **`/opt/nvidia/deepstream/deepstream-9.0`** with the stable symlink
+  **DeepStream 9.1 only.**
+- DS SDK version string: **`9.1.0-1`** (deb/dpkg), SDK dir
+  **`/opt/nvidia/deepstream/deepstream-9.1`** with the stable symlink
   **`/opt/nvidia/deepstream/deepstream`** pointing at it.
-- DS 9.0 is **NGC-only**. There is **no** `apt install deepstream-9.0` from
-  `developer.download.nvidia.com`. See the DOCUMENTED DRIFT reconciliation in
+- DS 9.1 deb/tar artifacts are **public GitHub Release assets** — no NGC
+  account or key required to download them. Only the **Docker image** remains
+  NGC-gated (`nvcr.io`, needs `docker login`). See the acquisition split in
   [§8](#8-reconciling-the-documented-drift-vs-00_bootstrapsh).
-- Artifacts (exact filenames, from the DS 9.0 Installation page):
-  - Debian package: **`deepstream-9.0_9.0.0-1_amd64.deb`**
-  - Tar archive: **`deepstream_sdk_v9.0.0_x86_64.tbz2`**
-  - Docker image: **`nvcr.io/nvidia/deepstream:9.0-triton-multiarch`**
+- Artifacts (exact filenames, from the DS 9.1 Installation page):
+  - Debian package: **`deepstream-9.1_9.1.0-1_amd64.deb`**
+  - Tar archive: **`deepstream_sdk_v9.1.0_x86_64.tbz2`**
+  - Docker images: **`nvcr.io/nvidia/deepstream:9.1-triton-multiarch`** and
+    **`nvcr.io/nvidia/deepstream:9.1-samples-multiarch`**
 - GStreamer prerequisite pin (owned/verified by Step 1): **1.24.2**. Step 2
   does not re-install the driver/CUDA/TRT/GStreamer stack.
 
-Version pins and artifact names cross-checked against Context7 library
-`/websites/nvidia_metropolis_deepstream_dev-guide` (see
-[References](#references)).
+Version pins and artifact names cross-checked directly against the DS 9.1
+Installation and Docker Containers pages (see [References](#references)).
 
 ---
 
@@ -55,11 +57,11 @@ runtime facts because a step must not trust prior state blindly.
    the environment drifted.
 2. **Prereq pins present** (equality, via `ctx.verify_pinned`, doc 00 §8.4) —
    these are Step 1's deliverables, re-checked as *inputs* here:
-   - NVIDIA driver `590.48.01`
+   - NVIDIA driver `595.58.03`
      (`nvidia-smi --query-gpu=driver_version --format=csv,noheader`)
-   - CUDA `13.1` (`nvcc --version` release)
-   - cuDNN `9.18.0` (`dpkg -l | grep libcudnn9`)
-   - TensorRT `10.14.1.48-1+cuda13.0` (`dpkg -s libnvinfer10`)
+   - CUDA `13.2` (`nvcc --version` release)
+   - cuDNN `9.20.0.48` (`dpkg -l | grep libcudnn9`)
+   - TensorRT `10.16.0.72-1+cuda13.2` (`dpkg -s libnvinfer10`)
    - GStreamer `1.24.2` (`gst-inspect-1.0 --version`)
    Any mismatch → `FAILED` with remediation "re-run Step 1"
    (`--reset-step 1`).
@@ -75,8 +77,8 @@ runtime facts because a step must not trust prior state blindly.
 6. **Method decidability inputs** — probe the auto-detect inputs
    ([§4](#4-auto-detection-vs-prompt)) so a choice can be made without extra
    privilege escalation later. This is read-only; it never installs anything.
-7. **Already installed?** — if `dpkg -s deepstream-9.0` reports `9.0.0-1` (deb)
-   **or** `/opt/nvidia/deepstream/deepstream-9.0/version` matches (tar/docker
+7. **Already installed?** — if `dpkg -s deepstream-9.1` reports `9.1.0-1` (deb)
+   **or** `/opt/nvidia/deepstream/deepstream-9.1/version` matches (tar/docker
    host marker), preflight may short-circuit to let `verify()` confirm and the
    framework mark `COMPLETE` (idempotent re-run).
 
@@ -84,48 +86,50 @@ runtime facts because a step must not trust prior state blindly.
 
 ## 3. The three official install methods
 
-DS 9.0 x86_64 has exactly three official install paths (DS 9.0 Installation
+DS 9.1 x86_64 has exactly three official install paths (DS 9.1 Installation
 page). The installer prompts with the operator-facing description of each; the
 descriptions below are the prompt copy.
 
-### 3.1 Method A — NGC Debian package (bare-metal host install)
+### 3.1 Method A — GitHub Release Debian package (bare-metal host install)
 
 **What it is (operator copy):** "Install DeepStream directly onto this
 machine as a system package. Best for running the DeepStream pipeline on the
 host (no container). Pulls in its apt prerequisites automatically."
 
-- Artifact: `deepstream-9.0_9.0.0-1_amd64.deb`.
+- Artifact: `deepstream-9.1_9.1.0-1_amd64.deb`, downloaded from the
+  `NVIDIA/DeepStream` GitHub Release (no NGC account needed).
 - Install command (from the Installation page — the leading `./` is required
   so apt treats it as a local file and resolves dependencies):
 
   ```bash
-  sudo apt-get install ./deepstream-9.0_9.0.0-1_amd64.deb
+  sudo apt-get install ./deepstream-9.1_9.1.0-1_amd64.deb
   ```
 
-- Registers as dpkg package `deepstream-9.0` (`9.0.0-1`) → cleanly
+- Registers as dpkg package `deepstream-9.1` (`9.1.0-1`) → cleanly
   verifiable/removable via apt. This is the default for the MV3DT host
   pipeline this installer targets.
 
-### 3.2 Method B — NGC tar archive (relocatable / non-apt install)
+### 3.2 Method B — GitHub Release tar archive (relocatable / non-apt install)
 
 **What it is (operator copy):** "Extract the DeepStream SDK from a tarball and
 run its installer script. Use when you want a self-contained SDK tree not
 managed by apt, or need to sit alongside another install. Does not register
 with dpkg."
 
-- Artifact: `deepstream_sdk_v9.0.0_x86_64.tbz2`.
+- Artifact: `deepstream_sdk_v9.1.0_x86_64.tbz2`, downloaded from the
+  `NVIDIA/DeepStream` GitHub Release (no NGC account needed).
 - Install commands (from the Installation page):
 
   ```bash
-  sudo tar -xvf deepstream_sdk_v9.0.0_x86_64.tbz2 -C /
-  cd /opt/nvidia/deepstream/deepstream-9.0/
+  sudo tar -xvf deepstream_sdk_v9.1.0_x86_64.tbz2 -C /
+  cd /opt/nvidia/deepstream/deepstream-9.1/
   sudo ./install.sh
   sudo ldconfig
   ```
 
 - The archive extracts into the same fixed SDK path
-  `/opt/nvidia/deepstream/deepstream-9.0`. `install.sh` + `ldconfig` finalize
-  the linker cache. Not visible to `dpkg -s deepstream-9.0`, so `verify()`
+  `/opt/nvidia/deepstream/deepstream-9.1`. `install.sh` + `ldconfig` finalize
+  the linker cache. Not visible to `dpkg -s deepstream-9.1`, so `verify()`
   uses the on-disk `version` file + binary checks
   ([§7](#7-verification-verifyctx)).
 
@@ -136,16 +140,18 @@ container. The host only needs the driver + Docker + NVIDIA Container Toolkit;
 DeepStream and its dependencies live in the image. Best when you prefer
 containerized/reproducible runtime or already run Docker."
 
-- Image: `nvcr.io/nvidia/deepstream:9.0-triton-multiarch` (the Triton variant;
+- Image: `nvcr.io/nvidia/deepstream:9.1-triton-multiarch` (the Triton variant;
   it is the Quickstart-referenced image and carries the sample configs used by
-  the smoke test).
+  the smoke test). A `9.1-samples-multiarch` variant also exists. Docker
+  images remain NGC-hosted — this is the one method that still needs the
+  operator's NGC key.
 - Acquire + run (from the Quickstart / Docker Containers page):
 
   ```bash
-  docker pull nvcr.io/nvidia/deepstream:9.0-triton-multiarch
+  docker pull nvcr.io/nvidia/deepstream:9.1-triton-multiarch
   docker run --gpus all -it --rm --net=host \
     -e CUDA_CACHE_DISABLE=0 \
-    nvcr.io/nvidia/deepstream:9.0-triton-multiarch
+    nvcr.io/nvidia/deepstream:9.1-triton-multiarch
   ```
 
 - Requires Docker Engine + NVIDIA Container Toolkit on the host (installed by
@@ -173,7 +179,7 @@ method (see decision table) rather than prompting.
 | Docker present + usable | `docker` on PATH **and** `docker info` succeeds (as invoking user via `ctx.run_as_user`) | Container runtime available |
 | NVIDIA runtime present | `nvidia-container-toolkit` installed (`dpkg -s`) **and** `nvidia-ctk` on PATH **and** Docker `nvidia` runtime configured (`docker info` runtimes) | Container GPU access available |
 | Host pipeline intent | default `True` for this installer (MV3DT host pipeline is the product) unless overridden | Bare-metal DS wanted |
-| Existing DS install | `dpkg -s deepstream-9.0` == `9.0.0-1` (deb) or `/opt/nvidia/deepstream/deepstream-9.0/version` present (tar) or local image tag present (`docker image inspect`) | Already installed via a specific method |
+| Existing DS install | `dpkg -s deepstream-9.1` == `9.1.0-1` (deb) or `/opt/nvidia/deepstream/deepstream-9.1/version` present (tar) or local image tag present (`docker image inspect`) | Already installed via a specific method |
 | Relocatable / non-root / multi-version need | `--ds-method tar` or `installer.conf` `ds_relocatable=true` | Force the tarball path |
 | NGC key state | `ctx.ngc.load_key()` (present vs `None`) | Automatic acquisition vs manual fallback (does not change *method*, only *acquisition*) |
 
@@ -202,67 +208,64 @@ the method is mirrored into `installer.conf` via the framework helper, doc 00
 
 ---
 
-## 5. NGC acquisition (and manual fallback)
+## 5. Acquisition (GitHub Release for deb/tar, NGC for Docker)
 
-DS 9.0 artifacts are gated on NGC. Acquisition is orthogonal to method: each
-method needs its artifact fetched (or the operator pointed at where to get it).
+Acquisition is method-dependent: deb/tar are anonymous GitHub Release
+downloads with no gating at all; Docker remains NGC-gated. Acquisition is
+otherwise orthogonal to method — each method needs its own artifact fetched
+(or the operator pointed at where to get it).
 
-### 5.1 Automatic (NGC key present)
+### 5.1 deb / tar — public GitHub Release download (no key, no login)
 
-- `ctx.ngc.configure_ngc_cli()` writes the invoking user's `~/.ngc/config`
-  (`chmod 600`) from the bootstrap-stored key (doc 00 §10), then all NGC calls
-  run **as the invoking user** via `ctx.run_as_user` (mirrors
-  `00_bootstrap.sh` Phases 6/10).
-- **deb / tar** — fetch the resource from the DeepStream NGC catalog into the
-  known artifact dir:
+- Fetch the release asset directly, run as the invoking user
+  (`ctx.run_as_user`):
 
   ```bash
   # run as the invoking user
   cd <artifact_dir>
-  ngc registry resource download-version "nvidia/deepstream/deepstream:9.0"
+  curl -fsSL -o <artifact> \
+    "https://github.com/NVIDIA/DeepStream/releases/download/v9.1.0/<artifact>"
   ```
 
-  Then locate `deepstream-9.0_9.0.0-1_amd64.deb` (Method A) or
-  `deepstream_sdk_v9.0.0_x86_64.tbz2` (Method B) within the downloaded
-  version dir.
-- **docker** — authenticate then pull:
+  where `<artifact>` is `deepstream-9.1_9.1.0-1_amd64.deb` (Method A) or
+  `deepstream_sdk_v9.1.0_x86_64.tbz2` (Method B). No NGC key, no `docker
+  login`, no browser sign-in — this is a plain anonymous HTTPS download.
+- **Failure fallback (not NGC-gated — just "no internet" or GitHub
+  unreachable):** if the download fails, `run()` returns
+  `USER_ACTION_REQUIRED` (doc 00 §9.3) telling the operator to download the
+  asset from
+  `https://github.com/NVIDIA/DeepStream/releases/tag/v9.1.0` on any machine
+  with internet access and place it in `<install_dir>/downloads/deepstream/`,
+  then re-run. This replaces the old NGC-sign-in fallback entirely for these
+  two methods.
+
+### 5.2 docker — NGC-gated (unchanged acquisition model)
+
+- `ctx.ngc.configure_ngc_cli()` writes the invoking user's `~/.ngc/config`
+  (`chmod 600`) from the bootstrap-stored key (doc 00 §10) only when the
+  Docker method is chosen; deb/tar never touch the NGC CLI.
+- Authenticate then pull, run as the invoking user:
 
   ```bash
   echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
-  docker pull nvcr.io/nvidia/deepstream:9.0-triton-multiarch
+  docker pull nvcr.io/nvidia/deepstream:9.1-triton-multiarch
   ```
 
   The key is never echoed to the transcript (doc 00 §8.2/§10 redaction).
-
-### 5.2 Known artifact directory
-
-- `artifact_dir` = `<install_dir>/downloads/deepstream/` (created by Step 2,
-  chowned to the invoking user). Deb/tar land here; this is also the directory
-  the manual-fallback instructions tell the operator to populate, so automatic
-  and manual paths converge on one location.
-
-### 5.3 Guided manual fallback (`ctx.ngc.load_key() is None`)
-
-When there is no key, `run()` returns `USER_ACTION_REQUIRED` (doc 00 §9.3
-block) with method-specific steps. Per DEEPSTREAM-SETUP.md, the DS `.deb`/tar
-are **not anonymously `curl`-able** — the operator must sign in and download
-in a browser.
-
-- **deb/tar action list:**
-  1. Sign in at
-     `https://catalog.ngc.nvidia.com/orgs/nvidia/resources/deepstream`.
-  2. Download `deepstream-9.0_9.0.0-1_amd64.deb` (Method A) **or**
-     `deepstream_sdk_v9.0.0_x86_64.tbz2` (Method B).
-  3. Place it in `<install_dir>/downloads/deepstream/` (path shown verbatim
-     via the `UserAction.path` field).
-  4. "Then run the installer again to continue." (framework contract phrase.)
-- **docker action list:** sign in / accept the DeepStream container EULA on
-  NGC, run `docker login nvcr.io` manually (username `$oauthtoken`), then
-  re-run. On the next launch Step 2 re-checks for the artifact/image and
+- **Guided manual fallback (`ctx.ngc.load_key() is None`):** `run()` returns
+  `USER_ACTION_REQUIRED` with: sign in / accept the DeepStream container EULA
+  on NGC, run `docker login nvcr.io` manually (username `$oauthtoken`), then
+  re-run. On the next launch Step 2 re-checks for a successful login and
   proceeds automatically.
 
-On re-run, preflight/`run()` detect the placed artifact (or successful login)
-and continue without re-prompting.
+### 5.3 Known artifact directory
+
+- `artifact_dir` = `<install_dir>/downloads/deepstream/` (created by Step 2,
+  chowned to the invoking user). Deb/tar land here whether fetched
+  automatically or placed manually, so both paths converge on one location.
+
+On re-run, preflight/`run()` detect the placed artifact (or successful docker
+login) and continue without re-prompting.
 
 ---
 
@@ -271,7 +274,7 @@ and continue without re-prompting.
 There are **two** distinct locations; do not conflate them.
 
 - **Fixed DS SDK path (NVIDIA-owned):**
-  `/opt/nvidia/deepstream/deepstream-9.0` (symlink
+  `/opt/nvidia/deepstream/deepstream-9.1` (symlink
   `/opt/nvidia/deepstream/deepstream`). This is **not** configurable — the
   deb/tar both install there, and the docker image uses the same path
   internally. The framework install-path prompt does **not** move it.
@@ -282,7 +285,7 @@ There are **two** distinct locations; do not conflate them.
   Step 2 reads it via `config.load()` and never hardcodes it.
 
 Operator-facing clarification the prompt must show: "DeepStream itself always
-installs to `/opt/nvidia/deepstream/deepstream-9.0` (fixed by NVIDIA). The
+installs to `/opt/nvidia/deepstream/deepstream-9.1` (fixed by NVIDIA). The
 install directory you choose is where this installer keeps its own files,
 downloads, and the per-project executables." A path prompt is only presented
 where the choice is meaningful (the framework `install_dir`); the DS SDK path
@@ -298,15 +301,15 @@ method-aware.
 
 ### 7.1 Common checks (deb / tar host installs)
 
-1. **SDK present** — `/opt/nvidia/deepstream/deepstream-9.0` exists and the
+1. **SDK present** — `/opt/nvidia/deepstream/deepstream-9.1` exists and the
    `deepstream` symlink resolves to it.
 2. **Version pin** —
-   `verify_pinned("DeepStream", <actual>, "9.0.0-1")`:
-   - deb: `dpkg -s deepstream-9.0 | Version`.
-   - tar: read `/opt/nvidia/deepstream/deepstream-9.0/version` (SDK version
-     file) and normalize to `9.0.0`.
+   `verify_pinned("DeepStream", <actual>, "9.1.0-1")`:
+   - deb: `dpkg -s deepstream-9.1 | Version`.
+   - tar: read `/opt/nvidia/deepstream/deepstream-9.1/version` (SDK version
+     file) and normalize to `9.1.0`.
 3. **Binary + version report** — `deepstream-app --version-all` (falls back to
-   `deepstream-app --version`) runs and reports DeepStream 9.0.
+   `deepstream-app --version`) runs and reports DeepStream 9.1.
 4. **Post-install artifacts present** ([§9](#9-post-install-steps-run-tail-host-installs)):
    `/etc/profile.d/deepstream.sh` exists and exports `DEEPSTREAM_DIR`;
    `update_rtpmanager.sh` was executed (record a marker/log line).
@@ -315,25 +318,25 @@ method-aware.
 ### 7.2 Docker checks (Method C)
 
 1. Image present locally: `docker image inspect
-   nvcr.io/nvidia/deepstream:9.0-triton-multiarch` succeeds.
+   nvcr.io/nvidia/deepstream:9.1-triton-multiarch` succeeds.
 2. Version inside the container:
    `docker run --rm --gpus all <image> deepstream-app --version-all` reports
-   DeepStream 9.0 → `verify_pinned("DeepStream", <actual>, "9.0.0")`.
+   DeepStream 9.1 → `verify_pinned("DeepStream", <actual>, "9.1.0")`.
 3. Smoke test runs inside the container ([§7.3](#73-smoke-test-ds-90-quickstart)).
 4. Host wiring for docker: `/etc/profile.d/deepstream.sh` is **not** required
    (SDK is in-container); instead verify Docker + NVIDIA runtime usable
    (`docker info` shows the `nvidia` runtime).
 
-### 7.3 Smoke test (DS 9.0 Quickstart)
+### 7.3 Smoke test (DS 9.1 Quickstart)
 
 Prove the SDK actually runs a pipeline using a stock sample config, per the
 Quickstart. Sample configs live under
-`/opt/nvidia/deepstream/deepstream-9.0/samples/configs/deepstream-app/`.
+`/opt/nvidia/deepstream/deepstream-9.1/samples/configs/deepstream-app/`.
 
 - Reference command (Quickstart):
 
   ```bash
-  cd /opt/nvidia/deepstream/deepstream-9.0/samples/configs/deepstream-app
+  cd /opt/nvidia/deepstream/deepstream-9.1/samples/configs/deepstream-app
   deepstream-app -c source30_1080p_dec_infer-resnet_tiled_display.txt
   ```
 
@@ -358,8 +361,8 @@ Step 1).
 - [ ] Prereq pins still match (driver/CUDA/cuDNN/TRT/GStreamer) — else the
       DS runtime loader would refuse to start.
 - [ ] DS SDK present at the fixed path (deb/tar) **or** image present (docker).
-- [ ] `verify_pinned("DeepStream", actual, "9.0.0-1"/"9.0.0")` passes.
-- [ ] `deepstream-app --version-all` reports 9.0.
+- [ ] `verify_pinned("DeepStream", actual, "9.1.0-1"/"9.1.0")` passes.
+- [ ] `deepstream-app --version-all` reports 9.1.
 - [ ] `update_rtpmanager.sh` executed; `ldconfig` run.
 - [ ] `/etc/profile.d/deepstream.sh` present (host installs) exporting
       `DEEPSTREAM_DIR` + DS `bin`/`lib` on `PATH`/`LD_LIBRARY_PATH`.
@@ -370,22 +373,22 @@ Step 1).
 ## 8. Reconciling the DOCUMENTED DRIFT vs `00_bootstrap.sh`
 
 [`laptop/scripts/00_bootstrap.sh`](../../laptop/scripts/00_bootstrap.sh)
-predates DS 9.0 GA in two ways that Step 2 must **not** inherit
-(cross-referenced in
+still targets DS 9.0 in ways Step 2 must **not** inherit (cross-referenced in
 [`laptop/docs/DEEPSTREAM-SETUP.md`](../../laptop/docs/DEEPSTREAM-SETUP.md)
 §5.2 "Known drift"):
 
-1. **No apt-repo DS install.** DS 9.0 is NGC-only; there is no
-   `apt install deepstream-9.0` on `developer.download.nvidia.com`, so Step 2
-   never attempts a keyring-repo DS install. It always acquires the deb/tar or
-   image from **NGC** (§5). (`00_bootstrap.sh` Phase 6 already downloads the
-   `.deb` via `ngc registry resource download-version` and installs it with
-   `apt-get install ./...deb` — that NGC path is the correct behavior Step 2
-   ports; any lingering keyring-repo attempt is dropped.)
-2. **Prereq pins are Step 1's job.** The bootstrap script's older
-   "driver ≥ 550 / CUDA ≥ 12.4" preflight is superseded by Step 1's equality
-   pins (driver `590.48.01` / CUDA `13.1`). Step 2 only *consumes* those pins
-   (§2), it does not install or loosen them.
+1. **Acquisition model has changed.** The script downloads the DS 9.0 `.deb`
+   via `ngc registry resource download-version` and installs it with
+   `apt-get install ./...deb`. Step 2 targets DS 9.1, whose deb/tar are public
+   **GitHub Release** assets (§5.1) — no NGC key needed for those two methods;
+   only the Docker image stays NGC-gated (§5.2). Bringing the script in line
+   with this spec is a follow-up implementation task, not performed by this
+   document change.
+2. **Prereq pins are Step 1's job.** Step 1's DS 9.1 equality pins (driver
+   `595.58.03` / CUDA `13.2` / cuDNN `9.20.0.48` / TensorRT
+   `10.16.0.72-1+cuda13.2`) supersede whatever the bootstrap script currently
+   checks. Step 2 only *consumes* those pins (§2), it does not install or
+   loosen them.
 
 Extra scope beyond installing the DS SDK (e.g. re-syncing the legacy bash) is
 **flagged for the human**, not built here (doc 00 §13).
@@ -397,7 +400,7 @@ Extra scope beyond installing the DS SDK (e.g. re-syncing the legacy bash) is
 Applied after a successful deb/tar install (Method A/B). Docker (Method C)
 skips the host profile write; the equivalent lives in the image.
 
-1. **RTSP jitter-buffer workaround** (DS 9.0 Installation page note):
+1. **RTSP jitter-buffer workaround** (DS 9.1 Installation page note):
 
    ```bash
    sudo /opt/nvidia/deepstream/deepstream/update_rtpmanager.sh
@@ -412,10 +415,10 @@ skips the host profile write; the equivalent lives in the image.
    `chmod 0644`), porting `00_bootstrap.sh` Phase 7 `write_deepstream_profile`:
 
    ```sh
-   export DEEPSTREAM_DIR=/opt/nvidia/deepstream/deepstream-9.0
+   export DEEPSTREAM_DIR=/opt/nvidia/deepstream/deepstream-9.1
    # prepend DS bin/lib to PATH / LD_LIBRARY_PATH (idempotent guards)
-   export PATH=/opt/nvidia/deepstream/deepstream-9.0/bin:$PATH
-   export LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream-9.0/lib:$LD_LIBRARY_PATH
+   export PATH=/opt/nvidia/deepstream/deepstream-9.1/bin:$PATH
+   export LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream-9.1/lib:$LD_LIBRARY_PATH
    ```
 
 Each dependency touch is reported per doc 00 §8.3 ([§10](#10-reporting-strings-reportctx--inline)).
@@ -427,13 +430,13 @@ Each dependency touch is reported per doc 00 §8.3 ([§10](#10-reporting-strings
 Use the framework reporters verbatim (doc 00 §8.3) for every dependency
 touched, so the transcript is uniform/greppable:
 
-- `report_installed("deepstream-9.0", "9.0.0-1")` after a fresh deb install →
-  logs `installed deepstream-9.0 version 9.0.0-1`.
-- `report_already_installed("deepstream-9.0", "9.0.0-1")` when re-run finds it
-  present → logs `already installed deepstream-9.0 version 9.0.0-1`.
-- tar install: `report_installed("deepstream-sdk", "9.0.0")` (no dpkg record;
+- `report_installed("deepstream-9.1", "9.1.0-1")` after a fresh deb install →
+  logs `installed deepstream-9.1 version 9.1.0-1`.
+- `report_already_installed("deepstream-9.1", "9.1.0-1")` when re-run finds it
+  present → logs `already installed deepstream-9.1 version 9.1.0-1`.
+- tar install: `report_installed("deepstream-sdk", "9.1.0")` (no dpkg record;
   version from the SDK `version` file).
-- docker: `report_installed("deepstream-image", "9.0-triton-multiarch")` after
+- docker: `report_installed("deepstream-image", "9.1-triton-multiarch")` after
   pull; `report_already_installed(...)` if the image tag is already local.
 
 `report()` prints a human summary block: chosen method + reason, artifact
@@ -442,19 +445,20 @@ smoke-test result. No side effects.
 
 ---
 
-## 11. DS 9.0 breaking changes relevant to install/verify
+## 11. DS 9.1 breaking changes relevant to install/verify
 
 From [`laptop/docs/DEEPSTREAM-SETUP.md`](../../laptop/docs/DEEPSTREAM-SETUP.md)
-"DS 9.0 breaking changes" — only the parts that affect *this step's*
+"DS 9.1 breaking changes" — only the parts that affect *this step's*
 install/verify:
 
-- **PyDS deprecated** — Step 2 installs the SDK only; it does **not** rely on
-  the Python bindings for verification. The smoke test uses `deepstream-app`
-  (C reference app), not a PyDS script.
+- **`pyds` (Python bindings) deprecated in favor of `pyservicemaker`** — Step
+  2 installs the SDK only; it does **not** rely on the Python bindings for
+  verification. The smoke test uses `deepstream-app` (C reference app), not a
+  Python script.
 - **Graph Composer removed** — no Graph Composer install/verify step exists;
   do not check for it.
 - **TF/UFF/Caffe removed** — the smoke test uses a stock ResNet/ETLT sample
-  config that DS 9.0 still ships; do not select a sample that depends on a
+  config that DS 9.1 still ships; do not select a sample that depends on a
   removed model format.
 
 These are awareness constraints on *which* verification path Step 2 takes;
@@ -468,7 +472,7 @@ later steps, not Step 2.
 | Situation | Status |
 |-----------|--------|
 | Step 1 pins missing/mismatched | `FAILED` (re-run Step 1) |
-| No NGC key and artifact/image not yet placed | `USER_ACTION_REQUIRED` (guided manual download/login, §5.3) |
+| Artifact/image not yet placed (download failure or no NGC key) | `USER_ACTION_REQUIRED` (guided manual download/login, §5.1/§5.2) |
 | Ambiguous method, interactive | prompt inline; proceeds — no special status |
 | Ambiguous method, `--non-interactive` | proceed with **deb** default |
 | deb/tar/docker install + post-install + smoke all pass | `COMPLETE` |
@@ -481,11 +485,12 @@ SDK install needs no reboot on top of Step 1's driver reboot.
 
 ## 13. User actions Step 2 may surface
 
-- **Manual DS artifact download** (no NGC key) — sign in at the NGC DeepStream
-  catalog, download the `.deb`/tar, place it in
-  `<install_dir>/downloads/deepstream/`, re-run (§5.3).
+- **Manual DS artifact download** (GitHub Release unreachable from this
+  machine) — download the `.deb`/tar from the `NVIDIA/DeepStream` GitHub
+  Release on any machine with internet access, place it in
+  `<install_dir>/downloads/deepstream/`, re-run (§5.1).
 - **Manual `docker login nvcr.io`** (no NGC key, docker method) — authenticate
-  to `nvcr.io` by hand, re-run (§5.3).
+  to `nvcr.io` by hand, re-run (§5.2).
 - **Method choice** (ambiguous auto-detect, interactive) — pick deb/tar/docker
   from the three descriptions (§4).
 
@@ -496,24 +501,26 @@ All rendered through the framework `USER_ACTION_REQUIRED` block ending with
 
 ## References
 
-DeepStream **9.0** official documentation (facts cross-checked via Context7
-library `/websites/nvidia_metropolis_deepstream_dev-guide`). DS 9.0 only.
+DeepStream **9.1** official documentation. DS 9.1 only.
 
-- DS 9.0 Installation — three x86_64 methods (Debian package, tar package,
-  Docker), `sudo apt-get install ./deepstream-9.0_9.0.0-1_amd64.deb`, tar
-  `install.sh` + `ldconfig`, `update_rtpmanager.sh`, fixed SDK path:
+- DS 9.1 Installation — three x86_64 methods (Debian package, tar package,
+  Docker), `sudo apt-get install ./deepstream-9.1_9.1.0-1_amd64.deb`, tar
+  `install.sh` + `ldconfig`, `update_rtpmanager.sh`, fixed SDK path, deb/tar
+  published as GitHub Release assets:
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html>
-- DS 9.0 Quickstart — sample-app smoke test
+- DS 9.1 Quickstart — sample-app smoke test
   (`deepstream-app -c source30_1080p_dec_infer-resnet_tiled_display.txt`),
-  Triton Docker image `nvcr.io/nvidia/deepstream:9.0-triton-multiarch`:
+  Triton Docker image `nvcr.io/nvidia/deepstream:9.1-triton-multiarch`:
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Quickstart.html>
-- DS 9.0 Docker Containers — image tags, `docker login nvcr.io`, `--gpus all`,
+- DS 9.1 Docker Containers — image tags, `docker login nvcr.io`, `--gpus all`,
   NVIDIA Container Toolkit:
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_docker_containers.html>
-- DS 9.0 `deepstream-app` reference (`--version` / `--version-all`):
+- DS 9.1 `deepstream-app` reference (`--version` / `--version-all`):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_ref_app_deepstream.html>
-- DS 9.0 Release Notes (pins / breaking changes):
+- DS 9.1 Release Notes (pins / breaking changes):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Release_notes.html>
+- NVIDIA/DeepStream GitHub Releases (deb/tar distribution, v9.1.0):
+  <https://github.com/NVIDIA/DeepStream/releases/tag/v9.1.0>
 
 Repo files referenced:
 
@@ -521,8 +528,8 @@ Repo files referenced:
   — framework contract (module interface, state machine, NGC handoff,
   config, reporting).
 - [`laptop/docs/DEEPSTREAM-SETUP.md`](../../laptop/docs/DEEPSTREAM-SETUP.md)
-  — §5 DS 9.0 install (deb/tar/docker), NGC-only caveat, anonymous-download
-  caveat, breaking changes, documented drift.
+  — §5 DS 9.1 install (deb/tar/docker), GitHub Release vs. NGC acquisition
+  split, breaking changes, documented drift.
 - [`laptop/scripts/00_bootstrap.sh`](../../laptop/scripts/00_bootstrap.sh)
   — Phases 5–7 (NGC gate, DS `.deb` NGC download + install, post-install
   `update_rtpmanager.sh` + `/etc/profile.d/deepstream.sh`) that Step 2 ports.

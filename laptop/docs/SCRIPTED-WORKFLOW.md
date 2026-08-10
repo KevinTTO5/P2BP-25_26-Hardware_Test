@@ -1,6 +1,6 @@
-# Laptop DS 9.0 Scripted Testing — Operator Guide
+# Laptop DS 9.1 Scripted Testing — Operator Guide
 
-This document is the **operator-facing** guide for the DS 9.0 laptop
+This document is the **operator-facing** guide for the DS 9.1 laptop
 scripted testing harness. It covers:
 
 - the prerequisites that must already be done **outside this repo**,
@@ -10,22 +10,30 @@ scripted testing harness. It covers:
 - where files land on disk, and
 - how to validate a running pipeline.
 
-For the DS 9.0 package / OS setup and the 6-step AMC workflow, see the
+For the DS 9.1 package / OS setup and the 6-step AMC workflow, see the
 companion doc [`DEEPSTREAM-SETUP.md`](DEEPSTREAM-SETUP.md).
+
+> **Known drift:** the pins and paths below describe the DS 9.1 target.
+> [`laptop/scripts/00_bootstrap.sh`](../scripts/00_bootstrap.sh) has not yet
+> been updated to install/verify DS 9.1 or acquire it from GitHub Releases —
+> running it today still installs and gates on the older DS 9.0 stack. Do not
+> manually install the DS 9.1 driver/CUDA pins below against the current
+> script; see [`DEEPSTREAM-SETUP.md` §5.2](DEEPSTREAM-SETUP.md) "Known drift"
+> before running anything end-to-end.
 
 ## Prerequisites (manual, outside this repo)
 
 Complete Notion page `337b5d58-7212-81e1-b07a-d510d9605bbb` **Sections 1–4**
 on the laptop before cloning this repo (or use `00_bootstrap.sh` with the
 pre-downloaded `.deb` files listed in [`DEEPSTREAM-SETUP.md`](DEEPSTREAM-SETUP.md) §4
-to install the NVIDIA stack and DS 9.0 in phases). Scripts preflight and
+to install the NVIDIA stack and DS 9.1 in phases). Scripts preflight and
 fail fast with a pointer back to this doc if anything is missing.
 
 | § | Manual step |
 |---|-------------|
 | 1–2 | Hardware (Ampere-or-newer NVIDIA GPU) and BIOS: Secure Boot / virt extensions as per motherboard vendor. |
 | 3 | Dual-boot Ubuntu 24.04 (Rufus / balenaEtcher USB, Windows partition shrink, Ubuntu installer). |
-| 4 | NVIDIA driver `590.48.01`, CUDA Toolkit `13.1`, cuDNN `9.18.0`, TensorRT `10.14.1.48-1+cuda13.0` (exact pins per the [DS 9.0 Installation page](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html) → dGPU Setup for Ubuntu). |
+| 4 | NVIDIA driver `595.58.03`, CUDA Toolkit `13.2`, cuDNN `9.20.0.48`, TensorRT `10.16.0.72-1+cuda13.2` (exact pins per the [DS 9.1 Installation page](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html) → dGPU Setup for Ubuntu). |
 
 See [`DEEPSTREAM-SETUP.md`](DEEPSTREAM-SETUP.md) §1–4 for the step-by-step
 procedure.
@@ -69,7 +77,7 @@ below is idempotent — re-runs are safe.
 
 ```mermaid
 flowchart TD
-  N1["Manual (Notion §1-4, OUTSIDE repo)<br/>Ubuntu 24.04 + driver 590.48.01<br/>CUDA 13.1 / cuDNN 9.18.0 / TRT 10.14.1.48<br/>+ DS 9.0 .deb from NGC"] --> C["git clone repo onto laptop"]
+  N1["Manual (Notion §1-4, OUTSIDE repo)<br/>Ubuntu 24.04 + driver 595.58.03<br/>CUDA 13.2 / cuDNN 9.20.0.48 / TRT 10.16.0.72<br/>+ DS 9.1 .deb from GitHub Releases"] --> C["git clone repo onto laptop"]
   C --> B["00_bootstrap.sh<br/>phased install + laptop.env<br/>PeopleNet → models/peoplenet/ (§9.3)"]
   B --> M["10_setup_mosquitto.sh<br/>drop-in mv3dt.conf (§6.2)<br/>systemctl enable/restart"]
   M --> V["20_verify_cameras.sh<br/>ping + ffprobe C1..C8 (§7.5)"]
@@ -178,7 +186,7 @@ Expected local outputs:
 ## Detector policy
 
 PeopleNet is the **only** detector this harness installs and wires into the
-pipeline, matching NVIDIA's DS 9.0 MV3DT reference documentation
+pipeline, matching NVIDIA's DS 9.1 MV3DT reference documentation
 ([`DS_MV3DT.html`](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html)).
 `yolo11n` (ultralytics `yolo11n.pt`) is the **single approved alternative**
 detector reserved for future work — no script here installs it, exports it,
@@ -216,7 +224,7 @@ extend the harness is obvious:
   `DETECTOR=yolo11n` flag in `laptop.env`, wiring it up per the
   `DeepStream-Yolo` integration catalogued in the skill. PeopleNet remains
   the default.
-- **Inference Builder MCP** — if DS 9.0 template churn becomes painful,
+- **Inference Builder MCP** — if DS 9.1 template churn becomes painful,
   auto-generating
   [`laptop/deepstream/`](../deepstream/) via the MCP documented at
   [`DS_AI_Agent_MCP.html`](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_AI_Agent_MCP.html)
@@ -224,17 +232,16 @@ extend the harness is obvious:
 
 ## Further reading
 
-- [`laptop/docs/DEEPSTREAM-SETUP.md`](DEEPSTREAM-SETUP.md) — DS 9.0 laptop
-  setup (Notion §1–10 mirrored with DS 9.0 doc links).
+- [`laptop/docs/DEEPSTREAM-SETUP.md`](DEEPSTREAM-SETUP.md) — DS 9.1 laptop
+  setup (Notion §1–10 mirrored with DS 9.1 doc links).
 - [`.cursor/skills/deepstream-9-docs/SKILL.md`](../../.cursor/skills/deepstream-9-docs/SKILL.md)
-  — canonical DS 9.0 lookup path (Context7 `/websites/nvidia_metropolis_deepstream_dev-guide`
-  → WebFetch → GitHub, in that order). Every external DS 9.0 URL in this
-  subtree comes out of this skill's catalog.
+  — canonical DS 9.1 lookup path (WebFetch → GitHub, in that order). Every
+  external DS 9.1 URL in this subtree comes out of this skill's catalog.
 - [`.cursor/skills/deepstream-9-docs/reference.md`](../../.cursor/skills/deepstream-9-docs/reference.md)
   — full URL + repo catalog used to verify plugin field names and workflow
   docs.
-- DS 9.0 deepstream-app CLI:
+- DS 9.1 deepstream-app CLI:
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_ref_app_deepstream.html>
-- DS 9.0 MV3DT: <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html>
-- DS 9.0 AutoMagicCalib:
+- DS 9.1 MV3DT: <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html>
+- DS 9.1 AutoMagicCalib:
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_AutoMagicCalib.html>

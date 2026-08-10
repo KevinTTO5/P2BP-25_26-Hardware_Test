@@ -182,7 +182,7 @@ resolving the config from the registry rather than the repo tree:
 5. **Print the §10.2 validation helpers** ([§6](#6-validation--monitoring)),
    then `cd <install_dir>/deepstream` and
    `exec deepstream-app -c <rendered_config>` (port lines 374–401). This is
-   the DS 9.0 `deepstream-app` entry point:
+   the DS 9.1 `deepstream-app` entry point:
    `deepstream-app -c <path_to_config_file>`.
 - **Flags** the subcommand honors, mirroring `50_start_pipeline.sh`:
   `--preview` (display-enabled config while keeping MQTT publish),
@@ -285,7 +285,7 @@ The `amc` exe from Step 3 (`<install_dir>/bin/amc`) is the single entry point
 for calibration. Step 5 defines how it feeds new and existing projects back
 through Step 4's ingest/wiring and this step's exe generation. AutoMagicCalib
 is a web-based, human-driven workflow (see
-[`30_start_amc.sh`](../../laptop/scripts/30_start_amc.sh) and the DS 9.0
+[`30_start_amc.sh`](../../laptop/scripts/30_start_amc.sh) and the DS 9.1
 AutoMagicCalib doc); the exe only brings the operator to the UI and then
 ingests the result.
 
@@ -325,7 +325,7 @@ already deleted in the AMC GUI is cleaned up and never shown as runnable.
 1. `[R]` lists projects from `registry.json` and lets the operator pick one.
    The AMC UI comes up pre-seeded with that project's existing
    `PROJECT_NAME` / `LOCATION_ID` (AMC keys calibration by project; AMC can
-   re-calibrate from archived videos per the DS 9.0 AutoMagicCalib doc, so a
+   re-calibrate from archived videos per the DS 9.1 AutoMagicCalib doc, so a
    re-run does not require a fresh capture).
 2. On completion, the **new** calibration is re-ingested and re-wired through
    Step 4 for the *same* project (overwrites/updates that project's
@@ -488,18 +488,17 @@ later / stop" commands from §2/§3.4.
 
 ## 8. References
 
-DeepStream 9.0 official documentation only (facts cross-checked via Context7
-library `/websites/nvidia_metropolis_deepstream_dev-guide`).
+DeepStream 9.1 official documentation only.
 
-- DS 9.0 `deepstream-app` reference (the `deepstream-app -c <config>` entry
+- DS 9.1 `deepstream-app` reference (the `deepstream-app -c <config>` entry
   point the project exe drives):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_ref_app_deepstream.html>
-- DS 9.0 Quickstart (`deepstream-app -c <path_to_config_file>` invocation):
+- DS 9.1 Quickstart (`deepstream-app -c <path_to_config_file>` invocation):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Quickstart.html>
-- DS 9.0 MV3DT (multi-view 3D tracking pipeline + `mv3dt/<LOCATION_ID>/*`
+- DS 9.1 MV3DT (multi-view 3D tracking pipeline + `mv3dt/<LOCATION_ID>/*`
   topics the pipeline publishes):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html>
-- DS 9.0 AutoMagicCalib (project-based web workflow; MV3DT-compatible export;
+- DS 9.1 AutoMagicCalib (project-based web workflow; MV3DT-compatible export;
   re-calibration from archived videos — basis for the re-run flow §5):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_AutoMagicCalib.html>
 
@@ -530,7 +529,7 @@ Repo files referenced (ported/reused by this step):
   [§5.4](#54-project-removal-amc-gui-driven--reconciliation-check).
 - **Per-camera network/RTSP configuration** — the pipeline only consumes the
   resulting `cameras.yml`; camera web-UI setup stays manual (framework §13).
-- **Alternate detectors** — PeopleNet-only, matching the DS 9.0 MV3DT
+- **Alternate detectors** — PeopleNet-only, matching the DS 9.1 MV3DT
   reference; `yolo11n` remains future work (framework §13).
 - **Shipping per-project artifacts to the web app** — the tracking exports,
   plots, and clips a running project produces are uploaded by

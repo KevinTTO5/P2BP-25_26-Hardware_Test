@@ -769,7 +769,7 @@ app can consume either without a second model.
 
 ## References
 
-No DeepStream 9.0 documentation is cited: nothing in this step is a DeepStream
+No DeepStream 9.1 documentation is cited: nothing in this step is a DeepStream
 fact. The authority for the transport, the DTO field names, and the failure
 handling is the deployed P2BP backend and the camera-node agent that has been
 speaking to it — captured here in full because those sources are leaving this

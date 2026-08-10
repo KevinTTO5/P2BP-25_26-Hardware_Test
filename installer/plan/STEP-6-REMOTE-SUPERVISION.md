@@ -58,7 +58,7 @@ Scope, from the product owner (LOCKED):
 > P2BP camera-node `services/` tree and its `install.sh`** —
 > **not** DeepStream facts. Only DeepStream-specific facts (the
 > `deepstream-app` entry point, MV3DT `mv3dt/<LOCATION_ID>/*` telemetry, and
-> the Gst-nvmsgbroker MQTT transport) are cited to the DS 9.0 docs. See
+> the Gst-nvmsgbroker MQTT transport) are cited to the DS 9.1 docs. See
 > [References](#9-references).
 
 ---
@@ -176,7 +176,7 @@ Notes:
   (lines 201–210), then `exec deepstream-app -c <rendered_config>` (lines
   374–401) — but **non-interactively**: no ping-sweep gating, no
   validation-helper banner (those are for the operator's foreground TTY), and
-  logging to journald instead. `deepstream-app -c <config>` is the DS 9.0
+  logging to journald instead. `deepstream-app -c <config>` is the DS 9.1
   entry point (see [References](#9-references)).
 - **`ExecStop` = ported `99_stop_all.sh`.** SIGTERM → wait → SIGKILL
   ([`99_stop_all.sh`](../../laptop/scripts/99_stop_all.sh) lines 62–78);
@@ -583,7 +583,7 @@ serve a fleet, and the ACL (§D) can pin the agent to its own subtree:
 | `mv3dt/<HOST_ID>/cmd/result` | desktop → cloud (agent **publishes**) | Result/ack JSON (§C.4) |
 | `mv3dt/<HOST_ID>/status` | desktop → cloud (agent **publishes**, periodic + on-change) | Status JSON (§C.5) |
 
-This is deliberately parallel to the DS 9.0 MV3DT telemetry topics
+This is deliberately parallel to the DS 9.1 MV3DT telemetry topics
 (`mv3dt/<LOCATION_ID>/sv3d`, `mv3dt/<LOCATION_ID>/fused`; see
 [References](#9-references)) — same `mv3dt/<id>/<channel>` shape — but keyed on
 `<HOST_ID>` (control plane) rather than `<LOCATION_ID>` (telemetry plane), so
@@ -954,24 +954,23 @@ can skip it. Gating:
 
 ## 9. References
 
-DeepStream 9.0 official documentation only — cited **only** for
+DeepStream 9.1 official documentation only — cited **only** for
 DeepStream-specific facts (the supervised entry point, MV3DT telemetry
-topics, and the MQTT transport the pipeline uses). Cross-checked via Context7
-library `/websites/nvidia_metropolis_deepstream_dev-guide`.
+topics, and the MQTT transport the pipeline uses).
 
-- DS 9.0 `deepstream-app` reference (the `deepstream-app -c <config>` entry
+- DS 9.1 `deepstream-app` reference (the `deepstream-app -c <config>` entry
   point the `mv3dt-pipeline@.service` `ExecStart` supervises):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_ref_app_deepstream.html>
-- DS 9.0 MV3DT (multi-view 3D tracking; MQTT-based communication via
+- DS 9.1 MV3DT (multi-view 3D tracking; MQTT-based communication via
   `communicatorType`; the `mv3dt/<LOCATION_ID>/*` telemetry topics whose
   `mv3dt/<id>/<channel>` shape the control topics parallel):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html>
-- DS 9.0 Gst-nvmsgbroker (the MQTT protocol adapter
+- DS 9.1 Gst-nvmsgbroker (the MQTT protocol adapter
   `libnvds_mqtt_proto.so`, `conn-str = <host>;<port>`, `config` file for
   auth, `nvds_msgapi_subscribe()` for consuming — the transport the pipeline
   already uses and the agent shares):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvmsgbroker.html>
-- DS 9.0 IoT / Edge-to-Cloud Messaging (bidirectional device↔cloud messaging
+- DS 9.1 IoT / Edge-to-Cloud Messaging (bidirectional device↔cloud messaging
   via Gst-nvmsgbroker — context for the remote command/status loop):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_IoT.html>
 

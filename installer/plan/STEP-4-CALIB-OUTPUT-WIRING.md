@@ -77,7 +77,7 @@ authoritative one for our local deployment.
 
 AMC's **Results / Export** step (workflow step 6, [`DEEPSTREAM-SETUP.md`
 §8.6](../../laptop/docs/DEEPSTREAM-SETUP.md)) produces the calibration artefacts
-that SV3DT/MV3DT consume. Per the DS 9.0 AutoMagicCalib docs (see
+that SV3DT/MV3DT consume. Per the DS 9.1 AutoMagicCalib docs (see
 [References](#references)):
 
 - The Results screen exposes overlay images, evaluation metrics (e.g. L2
@@ -112,7 +112,7 @@ config at that directory. It does not parse or validate individual matrices
 > Schema note (RESOLVED — use the repo config schema): the committed
 > [`config_tracker_NvMOT.yml`](../../laptop/deepstream/config_tracker_NvMOT.yml)
 > uses `SV3DT.calibrationDirectory` + `projectionType: homography`, whereas the
-> DS 9.0 Gst-nvtracker reference documents SV3DT via an
+> DS 9.1 Gst-nvtracker reference documents SV3DT via an
 > `ObjectModelProjection.cameraModelFilepath` list of `camInfo` files. Per the
 > product owner, the NVIDIA `cameraModelFilepath` form targets NVIDIA's **sample
 > projects**, while the repo's `calibrationDirectory` schema is authoritative for
@@ -190,7 +190,7 @@ Mirror `ingest_exports()` precisely:
        --output  "<chosen-calibration-dir>" )
    ```
 
-   The upstream AMC repo is the run-time ground truth (DS 9.0 AutoMagicCalib
+   The upstream AMC repo is the run-time ground truth (DS 9.1 AutoMagicCalib
    doc). On success, mark exporter used.
 2. **Raw-copy fallback.** If the exporter is missing (renamed in a newer AMC
    release) or exits non-zero, fall back to `cp -a "$EXPORT_DIR"/. <dest>/`
@@ -284,7 +284,7 @@ Templated fields:
 | `SV3DT.calibrationDirectory` | the chosen calibration dir | Repo template default is `calibration/${LOCATION_ID}` (relative to the `deepstream/` working dir). If the operator kept the default location, keep it **relative** (`calibration/<LOCATION_ID>`) so `ll-config-file` resolution stays working-dir-relative; if an alternate absolute path was chosen, write the absolute path. |
 | `MV3DT.nodeID` | `<LOCATION_ID>` | Template has `nodeID: ${LOCATION_ID}`. This is the MV3DT node identity on the broker. |
 
-Left **as-is** (verified against DS 9.0 MV3DT / Gst-nvtracker, do not touch):
+Left **as-is** (verified against DS 9.1 MV3DT / Gst-nvtracker, do not touch):
 
 - `SV3DT.projectionType: homography` — locked; the 8-camera ceiling-mount rig
   is a homography (ground-plane) projection.
@@ -442,16 +442,15 @@ files ingested, exporter-vs-copy path used, and the rendered/patched file paths
 
 ## References
 
-DeepStream 9.0 official documentation (facts cross-checked via Context7 library
-`/websites/nvidia_metropolis_deepstream_dev-guide`). DS 9.0 only.
+DeepStream 9.1 official documentation. DS 9.1 only.
 
-- DS 9.0 AutoMagicCalib (Results/Export → JSON + **MV3DT ZIP AMC / MV3DT ZIP
+- DS 9.1 AutoMagicCalib (Results/Export → JSON + **MV3DT ZIP AMC / MV3DT ZIP
   VGGT**; ROI/tripwire world coords + camera params):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_AutoMagicCalib.html>
-- DS 9.0 Multi-View 3D Tracking (MV3DT) (custom-dataset `videos`/`camInfo`
+- DS 9.1 Multi-View 3D Tracking (MV3DT) (custom-dataset `videos`/`camInfo`
   layout, `deepstream_auto_configurator.py`, MV3DT integration):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html>
-- DS 9.0 Gst-nvtracker (SV3DT `ObjectModelProjection.cameraModelFilepath`,
+- DS 9.1 Gst-nvtracker (SV3DT `ObjectModelProjection.cameraModelFilepath`,
   `projectionMatrix_3x4_w2p`, `modelInfo` — the §2/§6.1 schema note):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvtracker.html>
 

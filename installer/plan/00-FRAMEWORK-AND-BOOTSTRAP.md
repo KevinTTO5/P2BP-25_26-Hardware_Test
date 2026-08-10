@@ -3,21 +3,22 @@
 Status: shared foundation. The five step docs
 (`STEP-1-PREREQUISITES.md` … `STEP-5-PER-PROJECT-EXES.md`) depend on the
 contracts defined here. Do not restate these contracts in step docs — link
-back to this document.
+back to this document. See
+[`AI-AGENT-SKILLS-ASSESSMENT.md`](AI-AGENT-SKILLS-ASSESSMENT.md) for a
+sibling, non-step tooling reference on DS 9.1's Agentic Skills.
 
 This document specifies the **single self-contained installer binary** that
 unifies the loose numbered scripts under
 [`laptop/scripts/`](../../laptop/scripts/) into one resumable, CD-style
 installer for a brand-new Ubuntu 24.04 workstation
-(target GPU: NVIDIA RTX PRO 4500 Blackwell) targeting DeepStream 9.0 +
+(target GPU: NVIDIA RTX PRO 4500 Blackwell) targeting DeepStream 9.1 +
 AutoMagicCalib.
 
 It supersedes and wraps-and-ports the phase logic in
 [`laptop/scripts/00_bootstrap.sh`](../../laptop/scripts/00_bootstrap.sh) and
 the numbered runtime scripts. The DeepStream/OS reference facts come from the
-DS 9.0 docs (see [References](#references)); all version pins were
-cross-checked against Context7 library
-`/websites/nvidia_metropolis_deepstream_dev-guide`.
+DS 9.1 docs (see [References](#references)); all version pins were
+cross-checked directly against NVIDIA's published DS 9.1 Installation page.
 
 ---
 
@@ -36,7 +37,7 @@ Goals:
 
 Non-goals (see [§13](#13-out-of-scope--defer-to-human)): hardware/BIOS setup,
 per-camera network configuration, production hardening, systemd
-supervision, and anything the DS 9.0 docs mark as manual.
+supervision, and anything the DS 9.1 docs mark as manual.
 
 ---
 
@@ -451,9 +452,9 @@ is identical everywhere. These are the required human-facing strings:
 Concrete examples:
 
 ```
-installed cuda-toolkit-13-1 version 13.1
+installed cuda-toolkit-13-2 version 13.2
 already installed gstreamer1.0-tools version 1.24.2
-already installed deepstream-9.0 version 9.0.0-1
+already installed deepstream-9.1 version 9.1.0-1
 ```
 
 Helper signatures (`report.py`):
@@ -478,7 +479,7 @@ A single reusable helper does equality-pinned verification, porting
 
 Every step MUST use `verify_pinned` in its `verify()` and one of the two §8.3
 reporters after every dependency it touches, so the transcript is uniform and
-greppable. Steps use **equality pins** (DS 9.0 refuses older/newer minors of
+greppable. Steps use **equality pins** (DS 9.1 refuses older/newer minors of
 the driver and `libnvinfer*`; see [References](#references)).
 
 ---
@@ -561,8 +562,11 @@ already in [`00_bootstrap.sh`](../../laptop/scripts/00_bootstrap.sh)
 ## 10. NGC API key capture + local secure storage
 
 The key is captured in the **bootstrap stage** (§5.1 step 4) and consumed by
-**Step 2** (DS SDK + PeopleNet fetch via the `ngc` CLI) and later steps that
-pull gated NGC content.
+**Step 2** for the PeopleNet model fetch and for the Docker install method
+(both are NGC-gated), and by later steps that pull gated NGC content. The DS
+SDK deb/tar artifacts themselves are **public GitHub Release assets** and do
+not need this key — see [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md#1-locked-facts-and-pins-from-ds-91-docs)
+for the acquisition split.
 
 ### 10.1 Storage contract
 
@@ -592,11 +596,14 @@ pull gated NGC content.
 
 ### 10.3 Manual fallback
 
-If `load_key()` is `None`, gated steps MUST surface a `USER_ACTION_REQUIRED`
+If `load_key()` is `None`, steps that need NGC-gated content (the Docker
+install method, the PeopleNet model) MUST surface a `USER_ACTION_REQUIRED`
 block (§9.3) with the guided manual download-and-placement instructions
-(sign in at NGC, download the `.deb` / model, drop it in the expected dir),
-then re-verify on next launch. Step 2 owns the exact DS 9.0 download URLs and
-placement paths.
+(sign in at NGC, download the model / accept the container EULA, drop it in
+the expected dir), then re-verify on next launch. The DS SDK deb/tar
+artifacts need no such fallback — they are anonymously downloadable GitHub
+Release assets regardless of NGC key state. Step 2 owns the exact download
+URLs and placement paths.
 
 ---
 
@@ -671,7 +678,7 @@ class Step(Protocol):
   `report_already_installed` (§8.3) for every dependency touched. May return
   `REBOOT_REQUIRED` / `USER_ACTION_REQUIRED` / `FAILED` / `COMPLETE`.
 - **`verify(ctx)`** — idempotent post-checks using `verify_pinned` (§8.4)
-  against the DS 9.0 pins. Returns `COMPLETE` only when every pin matches.
+  against the DS 9.1 pins. Returns `COMPLETE` only when every pin matches.
 - **`report(ctx)`** — prints the step's human-facing summary block (what was
   installed/skipped, versions, where files landed). No side effects.
 
@@ -719,14 +726,15 @@ class StepResult:
 
 Each step doc defines its own internals but consumes only the contracts above:
 
-- **Step 1 — Prerequisites (DevA):** driver `590.48.01` / CUDA `13.1` /
-  cuDNN `9.18.0` / TensorRT `10.14.1.48-1+cuda13.0` / GStreamer `1.24.2` +
+- **Step 1 — Prerequisites (DevA):** driver `595.58.03` / CUDA `13.2` /
+  cuDNN `9.20.0.48` / TensorRT `10.16.0.72-1+cuda13.2` / GStreamer `1.24.2` +
   apt prereqs; Blackwell driver-support check for the RTX PRO 4500;
   verification via `verify_pinned`; uses the **reboot gate** (§7).
-- **Step 2 — DeepStream SDK (DevB):** DS 9.0 install via deb / tar / docker
-  (auto-detect or prompt), NGC download using the key from §10 (manual
-  fallback if none), install-path, post-install (`update_rtpmanager.sh`,
-  `ldconfig`, `/etc/profile.d/deepstream.sh`), smoke test.
+- **Step 2 — DeepStream SDK (DevB):** DS 9.1 install via deb / tar / docker
+  (auto-detect or prompt) — deb/tar are public GitHub Release downloads, the
+  docker image is NGC-gated using the key from §10 (manual fallback if
+  none) — install-path, post-install (`update_rtpmanager.sh`, `ldconfig`,
+  `/etc/profile.d/deepstream.sh`), smoke test.
 - **Step 3 — AMC launcher (DevC):** docker compose AMC bring-up, open the
   localhost UI, keep the service up until the browser closes; standalone AMC
   exe dropped in `<install_dir>/bin/` (§11).
@@ -750,7 +758,7 @@ Each step doc defines its own internals but consumes only the contracts above:
 
 ## 13. Out of scope / defer to human
 
-- Everything the DS 9.0 Installation page treats as manual and everything in
+- Everything the DS 9.1 Installation page treats as manual and everything in
   Notion §1–3 / [`DEEPSTREAM-SETUP.md`](../../laptop/docs/DEEPSTREAM-SETUP.md)
   §1–3: hardware selection, BIOS (Secure Boot, virtualization, discrete-GPU
   primary), and the Ubuntu 24.04 dual-boot install itself. The installer
@@ -771,7 +779,7 @@ Each step doc defines its own internals but consumes only the contracts above:
   exclusions are listed in
   [`STEP-7` §I](STEP-7-WEBAPP-INTEGRATION.md#i-out-of-scope--flag-for-human).
 - Alternate detectors (`yolo11n`): explicitly deferred; PeopleNet is the only
-  detector installed, matching NVIDIA's DS 9.0 MV3DT reference.
+  detector installed, matching NVIDIA's DS 9.1 MV3DT reference.
 - The NGC account itself and any credential the operator must obtain from
   NVIDIA — the installer captures and stores the key locally (§10) but never
   provisions it.
@@ -895,32 +903,33 @@ output, so redaction is a contract, not a nicety. Two distinct rules:
 
 ## References
 
-DeepStream 9.0 official documentation (facts cross-checked via Context7
-library `/websites/nvidia_metropolis_deepstream_dev-guide`). Reference DS 9.0
-only — NVIDIA's current release.
+DeepStream 9.1 official documentation. Reference DS 9.1 only — NVIDIA's
+current release.
 
-- DS 9.0 Installation (dGPU Ubuntu prerequisites + three install methods:
+- DS 9.1 Installation (dGPU Ubuntu prerequisites + three install methods:
   Debian package, tar package, Docker; `update_rtpmanager.sh`;
-  `sudo apt-get install ./deepstream-9.0_9.0.0-1_amd64.deb`):
+  `sudo apt-get install ./deepstream-9.1_9.1.0-1_amd64.deb`; deb/tar
+  published as GitHub Release assets):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html>
-- DS 9.0 Quickstart (sample-app smoke test; Triton Docker image
-  `nvcr.io/nvidia/deepstream:9.0-triton-multiarch`):
+- DS 9.1 Quickstart (sample-app smoke test; Triton Docker image
+  `nvcr.io/nvidia/deepstream:9.1-triton-multiarch`):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Quickstart.html>
-- DS 9.0 `deepstream-app` reference:
+- DS 9.1 `deepstream-app` reference:
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_ref_app_deepstream.html>
-- DS 9.0 Release Notes:
+- DS 9.1 Release Notes:
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Release_notes.html>
-- DS 9.0 MV3DT:
+- DS 9.1 MV3DT:
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html>
-- DS 9.0 AutoMagicCalib:
+- DS 9.1 AutoMagicCalib:
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_AutoMagicCalib.html>
-- DS 9.0 Docker containers:
+- DS 9.1 Docker containers:
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_docker_containers.html>
+- NVIDIA/DeepStream GitHub Releases (deb/tar distribution, v9.1.0):
+  <https://github.com/NVIDIA/DeepStream/releases/tag/v9.1.0>
 
-Verified DS 9.0 prerequisite pins (DS 9.0 Installation page, dGPU Ubuntu →
-Prerequisites; confirmed via Context7): Ubuntu 24.04, GStreamer 1.24.2, NVIDIA
-driver 590.48.01, CUDA 13.1, TensorRT 10.14.1.48 (cuDNN 9.18.0 per the DS 9.0
-dGPU compatibility table).
+Verified DS 9.1 prerequisite pins (DS 9.1 Installation page, dGPU Ubuntu →
+Prerequisites): Ubuntu 24.04, GStreamer 1.24.2, NVIDIA driver 595.58.03, CUDA
+13.2, TensorRT 10.16.0.72-1+cuda13.2, cuDNN 9.20.0.48.
 
 Repo files referenced:
 
