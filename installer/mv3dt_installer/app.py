@@ -309,6 +309,22 @@ def _gate_value_for_step(step: Step, cfg: config_mod.Config) -> Optional[str]:
     return getattr(cfg, attr) if attr is not None else None
 
 
+def _gate_is_off(gate_value: Optional[str]) -> bool:
+    """Whether a *gated* step (order 6 or 7) should be auto-skipped.
+
+    "off" is the uniform skip-indicator across both gates (doc 00 §3.4's
+    table), regardless of how many non-off states a given gate has: Step
+    7's `MV3DT_WEBAPP_INTEGRATION` is binary (`off`/`on`), but Step 6's
+    `MV3DT_REMOTE_SUPERVISION` is three-valued (`off`/`local`/`remote`).
+    Checking `gate_value != "on"` (an earlier, incorrect version of this
+    function) would wrongly auto-skip Step 6 whenever it was set to
+    `local` or `remote`, since neither equals the string `"on"`. The
+    correct rule is symmetric: skip only when the value actually *is*
+    `"off"` (or falsy/unset, treated the same way defensively) --
+    `"on"`, `"local"`, and `"remote"` all mean "run"."""
+    return not gate_value or gate_value == "off"
+
+
 # ---------------------------------------------------------------------------
 # doc 00 §12.2 -- step lifecycle
 # ---------------------------------------------------------------------------
@@ -369,7 +385,7 @@ def _dispatch(sm: StateMachine, ctx: Context, cfg: config_mod.Config) -> int:
     """
     for step in STEP_REGISTRY:
         gate_value = _gate_value_for_step(step, cfg)
-        if gate_value is not None and gate_value != "on":
+        if gate_value is not None and _gate_is_off(gate_value):
             if sm.status(step.id) is not StepStatus.COMPLETE:
                 sm.mark_complete(step.id)
             log.info(f"{step.id}: skipped (gate off)")

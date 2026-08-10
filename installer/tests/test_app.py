@@ -72,14 +72,19 @@ class _DummyStep:
         self.report_calls += 1
 
 
-def _minimal_ctx(tmp_path: Path, *, webapp_integration: str = "off"):
+def _minimal_ctx(
+    tmp_path: Path,
+    *,
+    webapp_integration: str = "off",
+    remote_supervision: str = "off",
+):
     """A `Context` + `Config` pair for direct `_dispatch()` unit tests,
     never touching a real install dir or a real invoking user."""
     install_dir = tmp_path / "install"
     install_dir.mkdir(exist_ok=True)
     cfg = config_mod.Config(
         install_dir=install_dir,
-        remote_supervision="off",
+        remote_supervision=remote_supervision,
         webapp_integration=webapp_integration,
         values={},
     )
@@ -513,6 +518,44 @@ def test_dispatch_gate_on_runs_step7_normally(tmp_path, monkeypatch):
     assert rc == 0
     assert step.report_calls == 1
     assert sm.status("step7_webapp_integration") is StepStatus.COMPLETE
+
+
+@pytest.mark.parametrize("gate_value", ["local", "remote"])
+def test_dispatch_gate_three_valued_non_off_runs_step6_normally(
+    tmp_path, monkeypatch, gate_value
+):
+    """Regression test: doc 00 §3.4's table gives Step 6's
+    `MV3DT_REMOTE_SUPERVISION` gate three values (`off`/`local`/`remote`),
+    unlike Step 7's binary `off`/`on`. An earlier version of `_dispatch`'s
+    gate check tested `gate_value != "on"`, which incorrectly auto-skipped
+    Step 6 for *both* `local` and `remote` (neither equals the literal
+    string "on"). Only `"off"` may skip a gated step; every other value
+    (however many a given gate defines) must run it normally."""
+    sm = StateMachine(path=tmp_path / "state.json")
+    ctx, cfg = _minimal_ctx(tmp_path, remote_supervision=gate_value)
+    step = _DummyStep("step6_remote_supervision", "Remote Supervision", 6)
+    monkeypatch.setattr(app, "STEP_REGISTRY", [step])
+
+    rc = app._dispatch(sm, ctx, cfg)
+
+    assert rc == 0
+    assert step.report_calls == 1
+    assert sm.status("step6_remote_supervision") is StepStatus.COMPLETE
+
+
+def test_dispatch_gate_off_skips_step6_explicitly(tmp_path, monkeypatch):
+    """Companion to the three-valued regression test above: "off" must
+    still skip Step 6, exactly as it does for Step 7's binary gate."""
+    sm = StateMachine(path=tmp_path / "state.json")
+    ctx, cfg = _minimal_ctx(tmp_path, remote_supervision="off")
+    step = _DummyStep("step6_remote_supervision", "Remote Supervision", 6)
+    monkeypatch.setattr(app, "STEP_REGISTRY", [step])
+
+    rc = app._dispatch(sm, ctx, cfg)
+
+    assert rc == 0
+    assert step.report_calls == 0
+    assert sm.status("step6_remote_supervision") is StepStatus.COMPLETE
 
 
 # ---------------------------------------------------------------------------
