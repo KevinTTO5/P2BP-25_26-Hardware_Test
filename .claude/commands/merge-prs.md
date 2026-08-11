@@ -43,8 +43,57 @@ steps in order.
    merge-strategy choice to make: this command always squash-merges with
    the branch deleted (see step 4) — never a plain merge commit.
 
-4. **Merge in order**, one at a time, always with an explicit commit
-   message:
+4. **Retarget to `main` before every single merge, unconditionally —
+   this is not optional and not conditional on anything.** For each
+   entry, immediately before merging it: check `baseRefName`
+   (`gh pr view <id> --json baseRefName`). If it is not already `main`,
+   retarget it:
+   `gh api repos/<owner>/<repo>/pulls/<id> -X PATCH -f base=main`
+   (do **not** use `gh pr edit <id> --base main` — it fails outright on
+   this repo with a GraphQL error about deprecated Projects Classic
+   fields; the REST endpoint above works). Then re-check `mergeable`.
+
+   Do this for *every* stacked-base entry, every time, even if you expect
+   GitHub to have already auto-retargeted it. Reasoning: GitHub only
+   auto-retargets a PR when the literal branch it's pointed at is deleted
+   as part of merging *that exact branch's own* PR. Two things break this
+   silently: (a) a merge whose `--delete-branch` step fails for any reason
+   (e.g. the branch is checked out in another local worktree — this
+   happens routinely in this workflow) leaves the branch alive and
+   auto-retargeting never fires; (b) if a dependency's code ever reaches
+   `main` through a *different* PR/branch than the one this entry is
+   literally based on (for example, after a recreated PR — see below),
+   GitHub has no way to know they're "the same" and will never retarget.
+   In both cases the PR silently stays pointed at its stale base, and
+   `gh pr merge --squash` will merge onto *that base*, not `main` — with
+   no error, and `gh pr view` will still happily report the PR as
+   `MERGED`. This is exactly how four modules ended up correct in the
+   final tree but invisible as separate commits in `main`'s history the
+   first time this command ran for real: their PRs were still based on
+   stacked branches nobody had explicitly retargeted, so their
+   squash-merges landed on those standalone branches instead of `main`,
+   and only became part of `main` because a later, larger PR happened to
+   already contain the same content. Retargeting explicitly, every time,
+   before every merge, is what makes each entry's contribution actually
+   show up as its own commit on `main` — the property this whole workflow
+   exists to guarantee.
+
+   **Never manually force-delete a branch that any other entry in this
+   run still uses as its base.** Doing so does not trigger GitHub's
+   retarget behavior — it auto-*closes* the dependent PR instead, and a
+   PR whose base branch is gone cannot be reopened or retargeted through
+   the API at all (a hard GitHub limitation, not a bug to route around).
+   If this has already happened before you notice: don't try to reopen
+   it. Open a fresh PR from the same, still-existing head branch, targeted
+   at `main`; verify its `headRefOid` matches the closed PR's, so you know
+   no code or review work was lost, and merge that instead. Because step
+   4 now always retargets each entry to `main` immediately before its own
+   merge, branches are safe to delete right after each merge completes —
+   no later entry is ever left depending on an earlier entry's branch,
+   since every entry gets pointed at `main` on its own turn regardless of
+   what happened to any branch before it.
+
+   With the merge itself, always pass an explicit commit message:
    `gh pr merge <id> --squash --delete-branch --subject "<pr title>" --body "<pr body>"`.
    Never omit `--subject`/`--body` and never use `--merge`. Individual
    commits on a feature branch may carry trailers or wording that violate
@@ -53,16 +102,14 @@ steps in order.
    messages) is not safe to use as-is. Always pass the PR's own
    already-cleaned title and body explicitly, so the commit that lands on
    `main` is exactly that text, never a concatenation of the branch's
-   individual commits.
-   - Before merging any entry after the first: if that PR's base branch was
-     the *previous* entry's branch (a stacked PR), confirm GitHub already
-     retargeted it to `main` following the previous merge —
-     `gh pr view <id> --json baseRefName`. If it's still pointed at the
-     now-deleted branch, run `gh pr edit <id> --base main` first, then
-     re-check `mergeable` before merging.
-   - After each successful merge, move to the next entry. Do not batch all
-     the `gh pr merge` calls up front — each one can change the
-     mergeability of the next.
+   individual commits. If `--delete-branch` reports a local deletion
+   failure (again, typically a worktree conflict) but `gh pr view` shows
+   the PR as `MERGED`, the merge itself succeeded — separately delete the
+   now-safe remote branch with `git push origin --delete <branch>`.
+
+   After each successful merge, move to the next entry. Do not batch all
+   the `gh pr merge` calls up front — each one can change the
+   mergeability and the correct base of the next.
 
 5. **Stop on the first failure.** If a merge fails (conflict, CI red,
    retarget didn't resolve cleanly), stop immediately. Report which PRs in
@@ -74,4 +121,10 @@ steps in order.
 6. **Final report.** Once the given list completes (or stops early), report
    final status of every entry, then separately list any *other* open PRs
    in the repo that were not part of `$ARGUMENTS` — the goal is to make it
-   obvious if the user forgot one, not to merge it for them.
+   obvious if the user forgot one, not to merge it for them. Before
+   declaring success, confirm `main`'s first-parent history actually has
+   one commit per entry in the given order
+   (`git log origin/main --oneline --first-parent -N`, where N is the
+   list length) — don't just trust that every `gh pr view` call reported
+   `MERGED`, since step 4 exists precisely because that alone doesn't
+   guarantee the commit landed where you think it did.
