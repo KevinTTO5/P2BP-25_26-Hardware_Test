@@ -43,12 +43,17 @@ steps in order.
    merge-strategy choice to make: this command always squash-merges with
    the branch deleted (see step 4) — never a plain merge commit.
 
-4. **Merge in order**, one at a time, always:
-   `gh pr merge <id> --squash --delete-branch`.
-   Never use `--merge`; a squash merge is the only mode this command uses,
-   so every PR's entire diff lands on `main` as one commit named from the
-   PR title/body — which is why PR content style matters (see the skill's
-   step 6a).
+4. **Merge in order**, one at a time, always with an explicit commit
+   message:
+   `gh pr merge <id> --squash --delete-branch --subject "<pr title>" --body "<pr body>"`.
+   Never omit `--subject`/`--body` and never use `--merge`. Individual
+   commits on a feature branch may carry trailers or wording that violate
+   the content style rules (they are working history, not the final
+   record), so the default squash message (which can fold in raw commit
+   messages) is not safe to use as-is. Always pass the PR's own
+   already-cleaned title and body explicitly, so the commit that lands on
+   `main` is exactly that text, never a concatenation of the branch's
+   individual commits.
    - Before merging any entry after the first: if that PR's base branch was
      the *previous* entry's branch (a stacked PR), confirm GitHub already
      retargeted it to `main` following the previous merge —
