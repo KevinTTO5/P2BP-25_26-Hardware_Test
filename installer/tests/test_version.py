@@ -108,6 +108,24 @@ def test_build_info_reads_the_ci_written_buildinfo(tmp_path, monkeypatch):
     )
 
 
+def test_build_stamp_drops_an_empty_tag(tmp_path, monkeypatch):
+    """A pull-request or branch build is stamped with a commit and a build
+    time but no tag, because there is no release for it to name. The tag
+    has to fall out of the suffix rather than leave a dangling comma."""
+    _make_package(
+        tmp_path,
+        "untagged_pkg",
+        buildinfo=(
+            'TAG = ""\n'
+            'COMMIT = "e215330"\n'
+            'BUILT_UTC = "2026-08-19T22:19:36Z"\n'
+        ),
+    )
+    module = _import_package(tmp_path, "untagged_pkg", monkeypatch)
+
+    assert module.build_stamp() == " (commit e215330, built 2026-08-19T22:19:36Z)"
+
+
 def test_build_stamp_composes_the_release_version_banner(tmp_path, monkeypatch):
     """The banner app.py's `--version` renders, assembled the same way."""
     _make_package(

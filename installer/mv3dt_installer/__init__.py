@@ -50,8 +50,13 @@ def build_stamp() -> str:
     Keeping the suffix empty rather than filling it with the placeholders
     means an operator pasting `--version` into a bug report can never
     mistake a hand-built binary for a published release.
+
+    The tag is dropped from the suffix when it is empty, which is the case
+    for the CI builds that run on a pull request or a branch dispatch: those
+    binaries have a real commit and build time but no release to name.
     """
     if not _STAMPED:
         return ""
     tag, commit, built = build_info()
-    return f" ({tag}, commit {commit}, built {built})"
+    parts = [part for part in (tag, f"commit {commit}", f"built {built}") if part]
+    return f" ({', '.join(parts)})"
