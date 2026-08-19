@@ -233,6 +233,57 @@ def test_reset_state_wipes_and_reinitializes(tmp_path, monkeypatch):
     assert after.steps["step1_prerequisites"].status == StepStatus.PENDING
 
 
+def test_reset_state_preserves_previously_chosen_install_dir(tmp_path, monkeypatch):
+    """Regression test (code review finding): `--reset-state` must not
+    silently discard a previously-chosen custom `--install-dir`.
+
+    `install_dir` is persisted inside `state.json` itself (doc 00 §6.2).
+    Before this fix, `_reset_state()` rewrote state.json via
+    `default_state()`, which hardcodes `install_dir` back to `/opt/mv3dt`.
+    Because state.json then *exists* again, `config.py`'s precedence chain
+    (`--install-dir override > state.json > ...`, §11.2) picked up that
+    hardcoded value ahead of the operator's real install location on the
+    very next run that doesn't re-pass `--install-dir` -- effectively
+    relocating a live install out from under the operator. `--reset-state`
+    is meant to clear step-completion status, not the install location.
+    """
+    monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    monkeypatch.setattr(app, "STEP_REGISTRY", [])
+
+    state_path = tmp_path / "var" / "state.json"
+    custom_install_dir = tmp_path / "custom-install-location"
+    log_dir = tmp_path / "logs"
+
+    # First run: operator picks a custom install dir; it's persisted.
+    rc1 = app.main(
+        [
+            "--install-dir",
+            str(custom_install_dir),
+            "--non-interactive",
+            "--log-dir",
+            str(log_dir),
+        ],
+        state_path=state_path,
+    )
+    assert rc1 == 0
+    sm = StateMachine(path=state_path)
+    assert sm.load().install_dir == str(custom_install_dir)
+
+    # Second run: --reset-state WITHOUT re-passing --install-dir. The
+    # previously-chosen custom dir must survive the reset.
+    rc2 = app.main(
+        [
+            "--reset-state",
+            "--non-interactive",
+            "--log-dir",
+            str(log_dir),
+        ],
+        state_path=state_path,
+    )
+    assert rc2 == 0
+    assert sm.load().install_dir == str(custom_install_dir)
+
+
 # ---------------------------------------------------------------------------
 # --reset-step (doc 00 §3.3)
 # ---------------------------------------------------------------------------

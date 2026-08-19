@@ -1,0 +1,43 @@
+name: installer-tests
+
+# Runs installer/tests/ (mv3dt-installer's pytest suite, doc 00 framework
+# modules) on every push/PR that touches the installer/ tree. Pure unit
+# tests -- everything goes through tmp_path/monkeypatch, so this never
+# needs root, apt, or a real Ubuntu 24.04 box (see installer/tests/*.py
+# module docstrings for the "never touches the real /var/lib or /opt/mv3dt"
+# discipline each test file follows).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "installer/**"
+      - ".github/workflows/installer-tests.yml"
+  pull_request:
+    paths:
+      - "installer/**"
+      - ".github/workflows/installer-tests.yml"
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is pyproject.toml's stated floor (requires-python >= 3.10);
+        # 3.12 is what Ubuntu 24.04 -- the actual install target -- ships.
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install mv3dt-installer + test deps
+        working-directory: installer
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run pytest
+        working-directory: installer
+        run: python -m pytest tests/ -v

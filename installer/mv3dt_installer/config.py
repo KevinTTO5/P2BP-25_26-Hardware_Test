@@ -22,11 +22,22 @@ default prefilled (doc 00 §11.1's "TUI prompts ... with /opt/mv3dt
 prefilled"); `--non-interactive` uses the default silently.
 
 `installer.conf` also carries the two §3.4 opt-in step-gate keys
-(`MV3DT_REMOTE_SUPERVISION`, `MV3DT_WEBAPP_INTEGRATION`), defaulting to
-`"off"` when absent so an unattended run never enables long-running services
-or outbound connections the operator did not ask for. `load()` parses both
-into the returned `Config` so a later module (`app.py`) can gate Steps 6/7
-without re-implementing KEY=VALUE parsing.
+(`MV3DT_REMOTE_SUPERVISION`, `MV3DT_WEBAPP_INTEGRATION`). The *first* time
+`load()` ever writes a fresh `installer.conf` (i.e. the key is not already
+present in the file), each gate is seeded from the like-named environment
+variable if one is set, else `"off"`. This closes the loop with
+`bootstrap.sh` §5.1 step 5, which decides whether to capture the web-app
+credential based on `MV3DT_WEBAPP_INTEGRATION` in its own environment and
+then `exec sudo -E`'s into the built binary -- without this seed step, that
+env var would never reach the persisted gate `app.py`'s dispatch loop
+actually reads, and Step 7 would stay auto-skipped regardless of what the
+operator did at bootstrap time. Once a gate is persisted, later runs never
+re-consult the environment for it -- same "capture once, then just read
+back" discipline as the NGC/webapp credentials (§10, §14) -- so an
+operator's env var doesn't silently flip an already-chosen value out from
+under them. `load()` parses both into the returned `Config` so a later
+module (`app.py`) can gate Steps 6/7 without re-implementing KEY=VALUE
+parsing.
 
 Only `install_dir` itself is created by this module. The subdirectories
 under it (`secrets/`, `bin/`, `deepstream/`, `projects/`, `agent/`,
@@ -224,7 +235,15 @@ def load(
     conf_path = resolved / CONF_FILENAME
     values = _read_conf(conf_path)
     for key, default_value in GATE_DEFAULTS.items():
-        values.setdefault(key, default_value)
+        if key not in values:
+            # First time this key is ever written: seed from the
+            # like-named env var if bootstrap.sh (or the operator) set one,
+            # else fall back to the hardcoded default. See the module
+            # docstring's "opt-in step gates" paragraph for why this exists
+            # -- it's what lets bootstrap.sh's MV3DT_WEBAPP_INTEGRATION=on
+            # actually reach the persisted gate app.py's dispatch loop
+            # reads, instead of silently defaulting to "off" forever.
+            values[key] = os.environ.get(key) or default_value
     values[_INSTALL_DIR_KEY] = str(resolved)
     _write_conf(conf_path, values)
 

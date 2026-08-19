@@ -240,6 +240,54 @@ def test_gate_keys_round_trip_when_present(tmp_path):
     assert cfg2.webapp_integration == "on"
 
 
+def test_gate_keys_seeded_from_env_var_on_first_write(tmp_path, monkeypatch):
+    """Regression test (code review finding): a gate's environment variable
+    must reach the persisted `installer.conf` on first write.
+
+    `bootstrap.sh` §5.1 step 5 decides whether to capture the web-app
+    credential based on `MV3DT_WEBAPP_INTEGRATION` in its own environment,
+    then `exec sudo -E`'s into the built binary -- so that env var *is*
+    present in the launched process's environment. Before this fix,
+    `config.load()` never consulted it: `installer.conf` was always created
+    with both gates hardcoded to "off", so Step 7 would stay auto-skipped
+    by the dispatch loop regardless of what the operator did at bootstrap
+    time, even after successfully capturing and storing credentials.
+    """
+    monkeypatch.setenv("MV3DT_WEBAPP_INTEGRATION", "on")
+    monkeypatch.setenv("MV3DT_REMOTE_SUPERVISION", "local")
+
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+
+    cfg = config.load(str(install_dir), sm, non_interactive=True)
+
+    assert cfg.webapp_integration == "on"
+    assert cfg.remote_supervision == "local"
+
+    conf_text = (install_dir / config.CONF_FILENAME).read_text(encoding="utf-8")
+    assert "MV3DT_WEBAPP_INTEGRATION=on" in conf_text
+    assert "MV3DT_REMOTE_SUPERVISION=local" in conf_text
+
+
+def test_gate_keys_env_var_does_not_override_already_persisted_value(
+    tmp_path, monkeypatch
+):
+    """A gate's env var only seeds the *first* write, mirroring the
+    "capture once, then just read back" discipline already used for the
+    NGC/webapp credentials (doc 00 §10, §14) -- once persisted, a later
+    env var must not silently flip an already-chosen gate value out from
+    under the operator."""
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+
+    cfg1 = config.load(str(install_dir), sm, non_interactive=True)
+    assert cfg1.webapp_integration == "off"
+
+    monkeypatch.setenv("MV3DT_WEBAPP_INTEGRATION", "on")
+    cfg2 = config.load(str(install_dir), sm, non_interactive=True)
+    assert cfg2.webapp_integration == "off"
+
+
 # ---------------------------------------------------------------------------
 # installer.conf shape
 # ---------------------------------------------------------------------------

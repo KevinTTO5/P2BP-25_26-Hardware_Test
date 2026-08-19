@@ -448,11 +448,28 @@ def _reset_state(sm: StateMachine) -> None:
     mirrors `00_bootstrap.sh --reset-state`'s `reset_state()`, which
     `rm -f`s the state file). Applied "before any phase runs" -- same
     discipline as the bash precedent -- then execution falls through to the
-    normal dispatch flow with a freshly (re)initialized state."""
+    normal dispatch flow with a freshly (re)initialized state.
+
+    Preserves the previously-recorded `install_dir` across the reset.
+    `install_dir` lives inside `state.json` (doc 00 §6.2), so naively
+    reinitializing to `default_state()` would silently reset it to the
+    hardcoded `/opt/mv3dt` -- and because `state.json` then *exists* again
+    with that value, `config.py`'s precedence chain (`--install-dir override
+    > state.json > ...`, §11.2) would pick it up ahead of the operator's
+    real, previously-chosen install location on the very next run that
+    doesn't re-pass `--install-dir`. `--reset-state` is meant to clear step
+    completion, not relocate a live install.
+    """
+    previous_install_dir = sm.load().install_dir
     with contextlib.suppress(FileNotFoundError):
         sm.path.unlink()
-    sm.save(default_state())
-    log.info(f"state reset: {sm.path} wiped and reinitialized")
+    fresh = default_state()
+    fresh.install_dir = previous_install_dir
+    sm.save(fresh)
+    log.info(
+        f"state reset: {sm.path} wiped and reinitialized "
+        f"(install_dir preserved: {previous_install_dir})"
+    )
 
 
 def _reset_step(sm: StateMachine, order: int) -> int:
