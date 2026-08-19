@@ -10,6 +10,7 @@ runner, and every unit directory is a `tmp_path`.
 from __future__ import annotations
 
 import pathlib
+import shlex
 import subprocess
 import sys
 
@@ -95,10 +96,15 @@ def test_render_unit_service_template_has_the_expected_execstart():
 
     assert "Type=oneshot" in rendered
     assert "ConditionPathIsDirectory=/exports" in rendered
-    assert (
-        "ExecStart=/opt/mv3dt/bin/mv3dt-installer ingest --project warehouse "
-        "--non-interactive --install-dir /opt/mv3dt" in rendered
-    )
+    assert _argv(rendered) == [
+        "/opt/mv3dt/bin/mv3dt-installer",
+        "ingest",
+        "--project",
+        "warehouse",
+        "--non-interactive",
+        "--install-dir",
+        "/opt/mv3dt",
+    ]
 
 
 def test_render_unit_raises_when_a_marker_survives(tmp_path, monkeypatch):
@@ -132,6 +138,18 @@ def _has_marker(text: str) -> bool:
     return systemd._MARKER_RE.search(text) is not None
 
 
+def _argv(unit_text: str) -> list[str]:
+    """The argument vector systemd would build from a unit's ExecStart=.
+
+    `shlex.split` stands in for systemd's own splitter: the two agree on the
+    subset used here (whitespace separation plus double-quoted words), and this
+    keeps the assertion about the resulting argv rather than about a string.
+    """
+    exec_start = systemd._directive(unit_text, "ExecStart")
+    assert exec_start is not None, "unit declares no ExecStart="
+    return shlex.split(exec_start)
+
+
 # ---------------------------------------------------------------------------
 # render_ingest_units
 # ---------------------------------------------------------------------------
@@ -161,13 +179,149 @@ def test_render_ingest_units_produces_both_files(slug):
     assert "[Install]" in path_unit and "WantedBy=multi-user.target" in path_unit
 
     assert "Type=oneshot" in service_unit
-    assert f"--project {slug}" in service_unit
+    assert _argv(service_unit)[2:4] == ["--project", slug]
     # The oneshot service is owned by the .path unit's lifecycle: it carries
     # no [Install] section, so it can never be enabled by accident.
     assert "[Install]" not in service_unit
 
     for text in (path_unit, service_unit):
         assert not _has_marker(text)
+
+
+def test_render_ingest_units_survives_a_project_name_containing_spaces():
+    """Regression: systemd word-splits ExecStart=, and PROJECT_NAME is
+    free-form operator text from the AMC GUI (STEP-5 section 3.1, worked
+    example "North Lobby #2"). Unquoted, `--project North Lobby #2` would
+    deliver `--project North` plus stray positional arguments and every
+    trigger would fail."""
+    units = systemd.render_ingest_units(
+        project="North Lobby #2",
+        slug="north-lobby-2",
+        export_dir="/home/op/auto-magic-calib/projects/North Lobby #2/exports",
+        install_dir="/opt/mv3dt",
+        installer_bin="/opt/mv3dt/bin/mv3dt-installer",
+    )
+    service_unit = units["mv3dt-ingest-north-lobby-2.service"]
+
+    assert _argv(service_unit) == [
+        "/opt/mv3dt/bin/mv3dt-installer",
+        "ingest",
+        "--project",
+        "North Lobby #2",
+        "--non-interactive",
+        "--install-dir",
+        "/opt/mv3dt",
+    ]
+
+    # The path-valued settings carry the spaced directory unquoted and whole:
+    # systemd does not word-split these, so quoting them would make the quotes
+    # part of the path.
+    path_unit = units["mv3dt-ingest-north-lobby-2.path"]
+    watched = "/home/op/auto-magic-calib/projects/North Lobby #2/exports"
+    assert f"PathChanged={watched}\n" in path_unit
+    assert f"PathModified={watched}\n" in path_unit
+    assert f"ConditionPathIsDirectory={watched}\n" in service_unit
+
+
+def test_render_ingest_units_escapes_a_literal_percent_in_operator_text():
+    """Every directive these markers land in expands systemd specifiers, so a
+    `%` in free-form project text must be doubled or systemd reads it as one
+    and refuses to load the unit."""
+    units = systemd.render_ingest_units(
+        project="50% Zone",
+        slug="50-zone",
+        export_dir="/exports/50% Zone",
+        install_dir="/opt/mv3dt",
+        installer_bin="/opt/mv3dt/bin/mv3dt-installer",
+    )
+    service_unit = units["mv3dt-ingest-50-zone.service"]
+
+    assert "--project \"50%% Zone\"" in service_unit
+    assert "Description=Ingest MV3DT calibration exports for project 50%% Zone" in service_unit
+    assert "ConditionPathIsDirectory=/exports/50%% Zone\n" in service_unit
+    assert "PathChanged=/exports/50%% Zone\n" in units["mv3dt-ingest-50-zone.path"]
+    # No bare `%` survives anywhere systemd would expand one.
+    assert "%" not in service_unit.replace("%%", "").replace("%i", "")
+
+
+def test_enable_now_unescapes_a_percent_in_the_execstart_binary(
+    tmp_path, monkeypatch
+):
+    """The existence check must compare against the real path, not the escaped
+    form written into the unit."""
+    unit_dir = tmp_path / "units"
+    binary = tmp_path / "50% dir" / "mv3dt-installer"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n")
+    units = systemd.render_ingest_units(
+        project="demo",
+        slug="demo",
+        export_dir=str(tmp_path / "exports"),
+        install_dir=str(tmp_path),
+        installer_bin=str(binary),
+    )
+    runner = RecordingRunner()
+    for name, content in units.items():
+        systemd.install_unit(name, content, unit_dir=unit_dir, runner=runner)
+    monkeypatch.setattr(systemd, "UNIT_DIR", unit_dir)
+
+    runner = RecordingRunner()
+    systemd.enable_now("mv3dt-ingest-demo.path", runner=runner)
+    assert runner.calls == [
+        ["systemctl", "enable", "--now", "mv3dt-ingest-demo.path"]
+    ]
+
+
+def test_render_ingest_units_survives_spaces_in_the_paths_it_execs():
+    """The install dir and the binary path are word-split by systemd too."""
+    units = systemd.render_ingest_units(
+        project="demo",
+        slug="demo",
+        export_dir="/exports",
+        install_dir="/opt/mv3dt lab",
+        installer_bin="/opt/mv3dt lab/bin/mv3dt-installer",
+    )
+
+    assert _argv(units["mv3dt-ingest-demo.service"]) == [
+        "/opt/mv3dt lab/bin/mv3dt-installer",
+        "ingest",
+        "--project",
+        "demo",
+        "--non-interactive",
+        "--install-dir",
+        "/opt/mv3dt lab",
+    ]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ['North "Lobby" 2', "back\\slash", "two\nlines", "bell\x07"],
+)
+def test_render_ingest_units_rejects_values_quoting_cannot_rescue(bad):
+    """Quoting handles whitespace; it cannot handle a value that closes the
+    quote or ends the directive. Refuse rather than emit a unit that fails on
+    every trigger."""
+    with pytest.raises(ValueError) as excinfo:
+        systemd.render_ingest_units(
+            project=bad,
+            slug="demo",
+            export_dir="/exports",
+            install_dir="/opt/mv3dt",
+            installer_bin="/opt/mv3dt/bin/mv3dt-installer",
+        )
+    assert "project" in str(excinfo.value)
+
+
+def test_render_ingest_units_rejects_an_unquotable_install_dir():
+    with pytest.raises(ValueError) as excinfo:
+        systemd.render_ingest_units(
+            project="demo",
+            slug="demo",
+            export_dir="/exports",
+            install_dir='/opt/"mv3dt"',
+            installer_bin="/opt/mv3dt/bin/mv3dt-installer",
+        )
+    assert "install_dir" in str(excinfo.value)
 
 
 def test_render_ingest_units_accepts_path_objects():

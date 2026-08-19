@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import shlex
 import subprocess
 from typing import Any, Callable, Iterable, Mapping
 
@@ -67,6 +68,12 @@ TEMPLATE_DIR = "systemd"
 #: digits and underscores only -- so a rendered value that happens to contain
 #: an at-sign (an email address, say) is not mistaken for a live marker.
 _MARKER_RE = re.compile(r"@[A-Z][A-Z0-9_]*@")
+
+#: Characters that double-quoting an interpolated `ExecStart=` value cannot
+#: rescue: a double quote or backslash escapes the quoting systemd applies, and
+#: any control character (newline included) ends the directive or is rejected
+#: outright by systemd's command-line parser.
+_UNQUOTABLE_RE = re.compile(r'["\\\x00-\x1f\x7f]')
 
 Runner = Callable[..., "subprocess.CompletedProcess[Any]"]
 
@@ -88,9 +95,16 @@ def render_unit(
 
     ``substitutions`` maps **bare** marker names to their values: the key
     ``"EXPORT_DIR"`` replaces every occurrence of ``@EXPORT_DIR@``. Values are
-    substituted literally, with no shell or systemd escaping applied -- unit
-    directives that need quoting are the template's problem, not this
-    function's.
+    substituted literally, with no shell or systemd escaping applied.
+
+    Because substitution is literal, **quoting is the template's job and the
+    templates do it**: any marker landing inside a word-split directive such as
+    `ExecStart=` is written double-quoted in the `.in` file, so a value
+    containing whitespace survives. Callers rendering their own templates owe
+    the same. What literal substitution cannot express is a value containing a
+    double quote, a backslash, or a newline -- those would break out of the
+    quoting or out of the directive entirely, so `render_ingest_units` rejects
+    them up front rather than emitting a unit that misbehaves.
 
     Raises `ValueError` if any marker survives substitution, naming the ones
     that were left behind. A partially rendered unit is worse than no unit at
@@ -135,13 +149,35 @@ def render_ingest_units(
     ``<installer_bin> ingest --project <project> --non-interactive
     --install-dir <install_dir>``. Only the `.path` is ever enabled -- see the
     module docstring.
+
+    ``project`` is free-form operator text typed into the AMC GUI
+    (`STEP-5-PER-PROJECT-EXES.md` section 3.1, worked example ``"North Lobby
+    #2"``), so it routinely contains spaces. systemd word-splits `ExecStart=`,
+    so the service template double-quotes every marker it interpolates there
+    and a spaced project name arrives as one argument. A literal percent sign
+    is escaped to `%%` for the same reason: every directive these markers land
+    in expands systemd specifiers, so an unescaped `%` in operator text would
+    be read as one. Raises `ValueError` for a value that neither quoting nor
+    escaping can rescue -- one containing a double quote, backslash, or newline
+    -- since such a value would escape the quoting or the directive and produce
+    a unit that fails on every trigger.
     """
+    for label, value in (
+        ("project", project),
+        ("install_dir", install_dir),
+        ("installer_bin", installer_bin),
+    ):
+        _reject_unquotable(label, str(value))
+
     substitutions = {
-        "PROJECT": str(project),
+        "PROJECT": _escape_specifiers(str(project)),
+        # `slug` is a sanitized identifier by construction (STEP-5 section 3.1
+        # narrows it to lower-case alphanumerics and hyphens) and it also forms
+        # the returned file names, so it is interpolated as given.
         "SLUG": str(slug),
-        "EXPORT_DIR": str(export_dir),
-        "INSTALL_DIR": str(install_dir),
-        "INSTALLER_BIN": str(installer_bin),
+        "EXPORT_DIR": _escape_specifiers(str(export_dir)),
+        "INSTALL_DIR": _escape_specifiers(str(install_dir)),
+        "INSTALLER_BIN": _escape_specifiers(str(installer_bin)),
     }
     return {
         f"mv3dt-ingest-{slug}.path": render_unit(
@@ -255,6 +291,35 @@ def is_enabled(name: str, runner: Runner = subprocess.run) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _escape_specifiers(value: str) -> str:
+    """Escape literal percent signs for a systemd unit value.
+
+    `ExecStart=`, `Description=`, `PathChanged=` and friends all expand
+    systemd specifiers, so a `%` in free-form operator text or in a path would
+    be read as the start of one (`%i`, `%h`, and so on). Doubling it is
+    systemd's own escape for a literal percent.
+    """
+    return value.replace("%", "%%")
+
+
+def _reject_unquotable(label: str, value: str) -> None:
+    """Raise `ValueError` if ``value`` cannot be safely double-quoted into a
+    systemd `ExecStart=` command line.
+
+    The templates quote every marker they interpolate into `ExecStart=`, which
+    handles whitespace. It does not handle a value that closes the quote or
+    ends the line, so those are refused here instead of silently producing a
+    unit that fails on every trigger.
+    """
+    match = _UNQUOTABLE_RE.search(value)
+    if match:
+        raise ValueError(
+            f"{label} contains {match.group()!r}, which cannot be quoted into "
+            "a systemd ExecStart= command line -- refusing to emit a unit "
+            "whose trigger would always fail"
+        )
+
+
 def _returncode(result: Any) -> int:
     """Best-effort exit status from whatever the injected runner returned.
 
@@ -301,11 +366,20 @@ def _exec_start_binary(name: str, *, _depth: int = 0) -> str | None:
 
     exec_start = _directive(text, "ExecStart")
     if exec_start:
-        tokens = exec_start.split()
+        try:
+            # shlex agrees with systemd on the subset the templates emit:
+            # whitespace separation plus double-quoted words. The quoting
+            # matters -- the binary path is quoted so it survives spaces, and
+            # an unstripped quote would make every existence check fail.
+            tokens = shlex.split(exec_start)
+        except ValueError:
+            tokens = exec_start.split()
         if not tokens:
             return None
         # systemd allows prefix characters on ExecStart (`-`, `@`, `+`, `!`).
-        return tokens[0].lstrip("-@+!:")
+        # `%%` in a rendered unit always denotes a literal percent, so undo the
+        # escaping before the path is compared against the filesystem.
+        return tokens[0].lstrip("-@+!:").replace("%%", "%")
 
     triggered = _directive(text, "Unit")
     if triggered:
