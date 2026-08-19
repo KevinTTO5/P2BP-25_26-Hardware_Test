@@ -121,7 +121,8 @@ apt install \
   gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
   libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-0 \
   libjansson4 libyaml-cpp-dev libjsoncpp-dev protobuf-compiler \
-  libmosquitto1 gcc make git python3
+  libmosquitto1 gcc make git python3 \
+  mosquitto mosquitto-clients arp-scan ffmpeg
 ```
 
 ### 3.1 Authoritative vs. repo-added packages
@@ -144,14 +145,104 @@ DS 9.1 §4.1 authoritative list, but harmless/required downstream:
 protobuf paths), and report each with the §8.3 strings like any other
 dependency. See the open decision in [§9](#9-open-decisions-for-the-human).
 
+Four further repo additions are carried for the installer's own subsystems
+rather than for DeepStream itself. They are on the §3 list, are not on the DS
+9.1 §4.1 authoritative list, and each has exactly one consumer:
+
+| Package | Why Step 1 installs it | Consumer |
+|---------|------------------------|----------|
+| `mosquitto` | the MQTT **broker daemon** the MV3DT sink publishes into; without it there is no listener on `127.0.0.1:1883` | [§3.2](#32-mosquitto-broker), [`STEP-6` §E.1](STEP-6-REMOTE-SUPERVISION.md#e1-lifecycle) |
+| `mosquitto-clients` | `mosquitto_sub` / `mosquitto_pub`, used by the broker reachability probe and by every documented validation helper | [`STEP-5` §6](STEP-5-PER-PROJECT-EXES.md#6-validation--monitoring) |
+| `arp-scan` | the MAC-OUI sweep that finds the cameras on the link-local segment; needs raw sockets, which the installer already has | [`00` §15](00-FRAMEWORK-AND-BOOTSTRAP.md#15-camera-discovery) |
+| `ffmpeg` | supplies `ffprobe` for the RTSP stream probe and `ffmpeg` for the single-frame still capture used in guided position binding | [`00` §15](00-FRAMEWORK-AND-BOOTSTRAP.md#15-camera-discovery), [`STEP-5` §3.3](STEP-5-PER-PROJECT-EXES.md#33-what-the-exe-does-at-runtime-pipeline-subcommand) |
+
 > `libmosquitto1` MUST NOT be omitted — it is the DS MQTT protocol client lib
 > required by `Gst-nvmsgbroker`
-> ([`DEEPSTREAM-SETUP.md` §4.1](../../laptop/docs/DEEPSTREAM-SETUP.md)).
+> ([`DEEPSTREAM-SETUP.md` §4.1](../../laptop/docs/DEEPSTREAM-SETUP.md)). It is
+> **not** the broker: it is a shared library that `libnvds_mqtt_proto.so`
+> links against, and installing it leaves nothing listening on port `1883`.
+> The broker daemon is the separate `mosquitto` package — see
+> [§3.2](#32-mosquitto-broker).
 
 `gstreamer1.0-plugins-rtp` / `gstreamer1.0-rtsp` from
 [`00_bootstrap.sh` Phase 4](../../laptop/scripts/00_bootstrap.sh) are optional
 extras and may be included in the same transaction; they are not on the DS 9.1
 §4.1 list.
+
+### 3.2 Mosquitto broker
+
+**LOCKED — Step 1 owns the Mosquitto broker.** Installing the broker daemon
+and its `/etc/mosquitto/conf.d/mv3dt.conf` drop-in is Step 1 work, executed as
+part of this step's `run()`. This closes gap 1 in
+[`DELETION-REVIEW` §6](DELETION-REVIEW.md#6-coverage-gaps-this-triage-exposed),
+which recorded that no step claimed the broker while
+[`STEP-6` §E.1](STEP-6-REMOTE-SUPERVISION.md#e1-lifecycle) `preflight`
+**requires** a reachable broker and
+[`STEP-6` §D](STEP-6-REMOTE-SUPERVISION.md#d-security-remote-control-must-be-authenticated)
+**rewrites** its configuration.
+
+The `libmosquitto1` line in §3 is a different thing and does not satisfy this
+requirement. Keep the two straight:
+
+| Package | Role | Provides |
+|---------|------|----------|
+| `libmosquitto1` | DeepStream's MQTT **client library** (DS 9.1 §4.1 prerequisite) | the shared object `libnvds_mqtt_proto.so` links against |
+| `mosquitto` | the MQTT **broker daemon** | `mosquitto.service`, the `127.0.0.1:1883` listener, `/etc/mosquitto/conf.d/` |
+
+#### Execution: the bundled script, never a typed command
+
+Step 1 does not re-implement the broker setup in Python. It runs the bundled
+script, staged as a **tree** so `source "$SCRIPT_DIR/lib/common.sh"` resolves
+([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-bundled-assets-at-runtime)):
+
+```python
+shellout.run_bundled_script("scripts", "10_setup_mosquitto.sh", tree=("scripts",))
+```
+
+The script ships inside the release binary
+([`00` §5](00-FRAMEWORK-AND-BOOTSTRAP.md#5-distribution-the-github-release-binary)),
+so the operator never types a script name and no repo checkout is involved.
+Its stdout and stderr land in the transcript through the shared logger
+([`00` §8.2](00-FRAMEWORK-AND-BOOTSTRAP.md#82-transcript-log-file)).
+
+What the script does, in order:
+
+1. **Packages**: `apt-get install -y --no-install-recommends mosquitto
+   mosquitto-clients libmosquitto1` when the broker is missing; a no-op when
+   it is already present.
+2. **Drop-in**: install the bundled `mv3dt.conf` to
+   `/etc/mosquitto/conf.d/mv3dt.conf` by atomic replace (write a temp file in
+   the destination directory, then `mv`), so a half-written config is never
+   visible to a restarting broker.
+3. **Service**: `systemctl enable mosquitto` then `systemctl restart
+   mosquitto`, and confirm with `systemctl is-active --quiet mosquitto`.
+4. **Firewall (optional, off by default)**: `--with-firewall` opens `1883/tcp`
+   and `9001/tcp` via `ufw`. Step 1 does not pass it; the default posture
+   assumes a workstation on a private segment.
+
+#### Idempotency and reporting
+
+Re-running is safe: apt is skipped when the packages are present, the drop-in
+is compared before replacement, and `restart` is unconditional but cheap. Step
+1 reports the outcome with the §8.3 strings like any other dependency —
+`installed mosquitto version <dpkg version>` on first install,
+`already installed mosquitto version <dpkg version>` thereafter — and reports
+the drop-in itself as `installed mv3dt.conf version <sha256[:12]>` /
+`already installed mv3dt.conf version <sha256[:12]>` so config drift is
+visible in the transcript.
+
+`verify()` (§7.3) treats the broker as a pass/fail check, not a pinned
+version: `systemctl is-active --quiet mosquitto` succeeds and
+`/etc/mosquitto/conf.d/mv3dt.conf` exists with the expected contents. Ubuntu
+24.04's `mosquitto` version is not pinned — nothing in the DS 9.1 docs or in
+[`mv3dt.conf`](../../laptop/mosquitto/mv3dt.conf) depends on a specific
+broker minor, so an equality pin here would create false failures with no
+corresponding benefit.
+
+Failure surface: apt failure or the broker refusing to start → `FAILED` with
+the `systemctl status mosquitto --no-pager` output in the transcript. Step 1
+never returns `USER_ACTION_REQUIRED` for the broker; there is no manual
+fallback to point the operator at.
 
 ---
 
@@ -224,9 +315,17 @@ the framework's reboot gate
 9. **TensorRT** (all `libnvinfer*` pinned to `10.16.0.72-1+cuda13.2`) and
    **cuDNN** (`libcudnn9*` at `9.20.0.48`) via apt (DS 9.1 §4.4).
 10. **GStreamer** pin is satisfied by the §3 prereq set; confirm `1.24.2`.
-11. **`verify()`** (§7.3): every pin via `verify_pinned`; confirm the driver
-    now loads (`nvidia-smi` succeeds and reports `595.58.03`).
-12. On all-match → `COMPLETE`; the dispatch loop advances to Step 2.
+11. **Mosquitto broker** ([§3.2](#32-mosquitto-broker)): run the bundled
+    `10_setup_mosquitto.sh` to install the daemon, drop in `mv3dt.conf`, and
+    enable + restart the service. Placed here because nothing in the NVIDIA
+    stack depends on it and the broker survives the driver reboot untouched;
+    it must nevertheless complete inside Step 1, since
+    [`STEP-6` §E.1](STEP-6-REMOTE-SUPERVISION.md#e1-lifecycle) `preflight`
+    fails without a reachable broker.
+12. **`verify()`** (§7.3): every pin via `verify_pinned`; confirm the driver
+    now loads (`nvidia-smi` succeeds and reports `595.58.03`) and the broker
+    is active.
+13. On all-match → `COMPLETE`; the dispatch loop advances to Step 2.
 
 > The single reboot in this spec is the **driver `.run`** reboot (step 8). The
 > nouveau/purge reboot (step 5) only fires on machines that shipped with
@@ -353,10 +452,12 @@ Against the protocol in
   transactions, nouveau blacklist, the `.run` invocation) are shelled out via
   `ctx.run_root(...)` after being located with `ctx.asset_path(...)`
   ([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-bundled-assets-at-runtime)).
+- The Mosquitto broker is installed through the bundled script
+  ([§3.2](#32-mosquitto-broker)) rather than open-coded apt/systemctl calls.
 - Every dependency touched is reported with `report_installed` /
-  `report_already_installed` (§2.2, §3). The "already installed" path is taken
-  when a pre-check (`dpkg -s` / `nvidia-smi` / `nvcc` / `gst-inspect-1.0`)
-  shows the component already at the pinned version.
+  `report_already_installed` (§2.2, §3, §3.2). The "already installed" path is
+  taken when a pre-check (`dpkg -s` / `nvidia-smi` / `nvcc` /
+  `gst-inspect-1.0`) shows the component already at the pinned version.
 - May return `REBOOT_REQUIRED` (§6), `USER_ACTION_REQUIRED` (Secure Boot,
   GDM-stop failure, driver failed to load), `FAILED` (apt/`.run` error), or
   `COMPLETE`.
@@ -452,7 +553,11 @@ LOCKED constraints):
    repo additions in §3.1 (`libgles2-mesa-dev`, `libjsoncpp-dev`,
    `protobuf-compiler`, `gcc`, `make`, `git`, `python3`). Confirm the superset
    is acceptable (recommended — they are needed downstream) or trim to the DS
-   9.1 §4.1 authoritative list only.
+   9.1 §4.1 authoritative list only. The four installer-subsystem additions
+   (`mosquitto`, `mosquitto-clients`, `arp-scan`, `ffmpeg`) are **not** part of
+   this open decision — they are RESOLVED and required by
+   [§3.2](#32-mosquitto-broker) and
+   [`00` §15](00-FRAMEWORK-AND-BOOTSTRAP.md#15-camera-discovery).
 4. **Documented drift from the existing script** — see [§10](#10-documented-drift-from-00_bootstrapsh);
    confirm the equality-pin enforcement replaces the old `>= 550` / `>= 12.4`
    preflight.
@@ -515,7 +620,10 @@ Step 1 is `COMPLETE` iff **all** of these pass:
 - [ ] `dpkg -s libnvinfer10` Version == `10.16.0.72-1+cuda13.2` (and the full
       `libnvinfer*` set from §2.1 all at that version).
 - [ ] `gst-inspect-1.0 --version` == `1.24.2`.
-- [ ] DS 9.1 §4.1 apt prereqs (§3) all installed.
+- [ ] DS 9.1 §4.1 apt prereqs (§3) all installed, including `mosquitto`,
+      `mosquitto-clients`, `arp-scan`, and `ffmpeg` (§3.1).
+- [ ] `systemctl is-active --quiet mosquitto` succeeds and
+      `/etc/mosquitto/conf.d/mv3dt.conf` matches the bundled config (§3.2).
 - [ ] No `reboot_pending` marker for `step1_prerequisites`
       ([`00` §7](00-FRAMEWORK-AND-BOOTSTRAP.md#7-reboot-detection--continuation-contract)).
 - [ ] (informational) `nvidia-smi --query-gpu=name,compute_cap` recorded for
@@ -562,3 +670,8 @@ Repo files referenced:
   preflight drift.
 - [`laptop/scripts/lib/common.sh`](../../laptop/scripts/lib/common.sh) —
   `require_version_eq` (ported to `verify_pinned`), logging, `require_root`.
+- [`laptop/scripts/10_setup_mosquitto.sh`](../../laptop/scripts/10_setup_mosquitto.sh)
+  — the original of the bundled broker-setup script this step now owns and
+  runs (§3.2).
+- [`laptop/mosquitto/mv3dt.conf`](../../laptop/mosquitto/mv3dt.conf) — the
+  drop-in installed to `/etc/mosquitto/conf.d/mv3dt.conf` (§3.2).

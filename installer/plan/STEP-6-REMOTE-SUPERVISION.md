@@ -76,8 +76,9 @@ Scope, from the product owner (LOCKED):
   (Step 5 §4.2), used to build the per-instance `ExecStart`.
 - The Step 5 `pipeline` subcommand of the frozen `mv3dt-installer` binary
   (Step 5 §3.3), refactored here into a systemctl controller ([§A.2](#a2-step-5-handoff--the-pipeline-slug-exe-becomes-a-systemctl-controller)).
-- The existing Mosquitto broker installed by the laptop tree
-  ([`laptop/mosquitto/mv3dt.conf`](../../laptop/mosquitto/mv3dt.conf)), TCP
+- The Mosquitto broker installed by
+  [`STEP-1` §3.2](STEP-1-PREREQUISITES.md#32-mosquitto-broker) from the bundled
+  [`mv3dt.conf`](../../laptop/mosquitto/mv3dt.conf), TCP
   `1883` + WebSocket `9001`.
 
 ### 1.2 Outputs (what Step 6 writes)
@@ -276,6 +277,19 @@ since that script is being removed
    step enabled it.
 4. `systemctl enable --now mv3dt-agent.service` ([§B](#b-the-control-agent-remote)).
 5. Report each touched unit via the framework reporters ([§E](#e-framework-integration)).
+
+> **REQUIRED — go through the shared `systemd.py` helper.** Unit rendering,
+> installation, `daemon-reload`, and `enable` are **not** open-coded
+> `subprocess` calls in this step. They use the framework's `systemd.py`, which
+> installs content-idempotently (read-compare-write, root-owned `0644`) and
+> returns whether the file changed, so the caller picks `report_installed` vs
+> `report_already_installed` with the exact framework §8.3 strings; refuses to
+> render a unit that still carries an unsubstituted placeholder; refuses to
+> enable a unit whose `ExecStart` binary is absent; and routes every
+> `systemctl` invocation through an injected runner, which production callers
+> set to `ctx.run_root`. [`STEP-4` §4.5](STEP-4-CALIB-OUTPUT-WIRING.md#45-re-ingest-on-later-recalibrations-systemd-path-unit)
+> uses the same helper for its ingest path units, so the two steps cannot
+> drift on unit-install semantics.
 
 **Sudo/root:** all of the above require root; Step 6 uses `ctx.run_root(...)`
 (framework §12.3). The installer already runs as root under `sudo -E`
@@ -835,8 +849,12 @@ Implements the `Step` protocol (framework §12.1).
   project).
 - Confirm **Mosquitto is reachable** — `systemctl is-active mosquitto` (the
   `ensure_mosquitto` precondition), or a `mosquitto_sub`/connect probe to
-  `127.0.0.1:1883`. Unreachable → `FAILED` with the remediation to re-run the
-  laptop Mosquitto setup.
+  `127.0.0.1:1883`. Unreachable → `FAILED`, with the remediation pointing at
+  [`STEP-1` §3.2](STEP-1-PREREQUISITES.md#32-mosquitto-broker), which owns the
+  broker daemon and its `/etc/mosquitto/conf.d/mv3dt.conf` drop-in. The
+  remediation is "re-run the installer so Step 1 reinstalls the broker", not
+  "run a laptop setup script by hand" — the operator never invokes a script
+  directly.
 - Confirm `systemctl` is present and the installer is root (framework §9.1).
 - If remote mode is opted in ([§E.2](#e2-gating-opt-in)) but the cloud broker
   endpoint/creds are missing, return `USER_ACTION_REQUIRED` listing the
