@@ -1,0 +1,16 @@
+# Template for /etc/systemd/system/mv3dt-ingest-@SLUG@.service
+#
+# Rendered by mv3dt_installer.systemd.render_ingest_units(). See the paired
+# mv3dt-ingest.path.in for why at-sign-delimited markers are used instead of a
+# systemd template unit with %i.
+#
+# Type=oneshot: this unit makes a single ingest pass and exits. It is triggered
+# by mv3dt-ingest-@SLUG@.path and must never be enabled itself -- enabling both
+# halves makes the boot-time state race the path unit.
+[Unit]
+Description=Ingest MV3DT calibration exports for project @PROJECT@
+ConditionPathIsDirectory=@EXPORT_DIR@
+
+[Service]
+Type=oneshot
+ExecStart=@INSTALLER_BIN@ ingest --project @PROJECT@ --non-interactive --install-dir @INSTALL_DIR@
