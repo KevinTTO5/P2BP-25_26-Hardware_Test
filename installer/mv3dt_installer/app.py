@@ -155,7 +155,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version=__version__,
+        # A release binary also names the tag, commit, and build time CI
+        # stamped into it (doc 00 section 4.1); a source checkout renders
+        # the bare version. The program name is spelled literally rather
+        # than via argparse's %(prog)s so the banner reads the same however
+        # the installer was invoked, which matters when an operator pastes
+        # it into a bug report.
+        version=f"mv3dt-installer {__version__}"
+        + __import__("mv3dt_installer").build_stamp(),
     )
     return parser
 

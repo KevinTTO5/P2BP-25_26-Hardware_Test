@@ -18,6 +18,14 @@ build/
 .pytest_cache/
 *.egg-info/
 
+# Build stamp written by .github/workflows/release.yml immediately before
+# PyInstaller runs (TAG / COMMIT / BUILT_UTC, doc 00 section 4.1). CI
+# generated and never committed: a source checkout has no such file and
+# mv3dt_installer/__init__.py falls back to the "source"/"unknown"
+# placeholders, which is exactly how a hand-built binary is told apart from
+# a published release.
+mv3dt_installer/_buildinfo.py
+
 # NOTE: installer.spec is a tracked source file (the PyInstaller build
 # recipe), not a build artifact — do not ignore it.
 # NOTE: mv3dt_installer/assets/ is tracked scaffolding populated by later

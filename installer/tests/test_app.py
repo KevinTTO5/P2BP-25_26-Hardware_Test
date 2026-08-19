@@ -150,7 +150,13 @@ def test_parse_args_version_prints_and_exits_zero(capsys):
         app.parse_args(["--version"])
     assert exc_info.value.code == 0
     captured = capsys.readouterr()
-    assert __version__ in captured.out
+    # Literal program name, not argparse's %(prog)s: under pytest `prog`
+    # would be the test runner's name, and an operator pasting the banner
+    # into a bug report must always see which tool it came from. Only the
+    # prefix is asserted here because a release build appends its CI build
+    # stamp; tests/test_version.py owns the full banner, both ways
+    # (doc 00 section 4.1).
+    assert captured.out.startswith(f"mv3dt-installer {__version__}")
 
 
 def test_parse_args_help_exits_zero(capsys):

@@ -8,3 +8,4 @@
 *.pth binary
 *.tar binary
 *.weights binary
+*.exe binary
