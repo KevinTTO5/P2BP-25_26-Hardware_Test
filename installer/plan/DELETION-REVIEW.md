@@ -72,7 +72,7 @@ is no pattern in them worth porting.
 | `amc/alignment_data (Copy)/`, `amc/single_view_results (Copy)/` | **964 MB, 14,606 tracked files** | AMC run output — `kitti_detector/` per-frame label dumps, overlay JPGs, per-camera YAMLs. The `(Copy)` suffixes mark a manual paste, not a curated fixture. [`STEP-4` §2](STEP-4-CALIB-OUTPUT-WIRING.md#2-what-the-amc-output-is) treats the AMC export as an opaque directory produced **at run time** under `$AMC_ROOT/projects/$PROJECT_NAME/exports/`, never read from the repo tree. |
 | `homographies/` (whole directory) | 15 files | EPFL multi-camera dataset samples — 14 `*-homography.yml` (`4p-c0`, `campus4-c*`, `passageway1-c*`, `terrace1-c*`) plus `4p-ground-truth.txt` (2,957 lines of frame/track/bbox annotations). The runtime resolved homographies **by MAC** — `camera_handler.py:241`, `aruco_scanner.py:101`, and `homography.py:760` all used `{safe_mac}_homography.yml`. No committed file matched that scheme, so nothing ever read these. |
 | `.DS_Store` | 6 KB | macOS Finder artifact. Also absent from `.gitignore` — add it there in the same change. |
-| `virtual-cameras/` (whole directory, incl. the 48 MB `mediamtx.exe`) | **48 MB** | Windows binary in a repo whose installer targets Ubuntu 24.04 `x86_64` ([`00` §5.1](00-FRAMEWORK-AND-BOOTSTRAP.md#51-exact-responsibilities-in-order)); also exposed to line-ending mangling (see the hazard note below). Both POSIX launchers already used the `bluenviron/mediamtx:latest` **Docker image** (`start_rtsp_cams.sh:22-24`) and the Windows launcher already fell back to it (`start_rtsp_cams.ps1:35-36`), so the whole directory is replaceable by one `docker run` — see [§4](#4-explicit-calls-resolved--both-deleted) item 2. |
+| `virtual-cameras/` (whole directory, incl. the 48 MB `mediamtx.exe`) | **48 MB** | Windows binary in a repo whose installer targets Ubuntu 24.04 `x86_64` ([`00` §5.2](00-FRAMEWORK-AND-BOOTSTRAP.md#52-what-the-binary-does-on-first-launch)); also exposed to line-ending mangling (see the hazard note below). Both POSIX launchers already used the `bluenviron/mediamtx:latest` **Docker image** (`start_rtsp_cams.sh:22-24`) and the Windows launcher already fell back to it (`start_rtsp_cams.ps1:35-36`), so the whole directory is replaceable by one `docker run` — see [§4](#4-explicit-calls-resolved--both-deleted) item 2. |
 | `config/config.json`, `config/cameras_runtime.json` | small | Committed before `config/` was added to `.gitignore`, so they still override the ignore rule. Device-specific runtime state — `cameras_runtime.json` is written by `camera_scanner.py`. **Harvest first:** these two files were the sole source of the fleet MAC inventory and the native sensor resolution — extracted to `cameras.yml` per [§4.1](#41-camera-facts-harvested-before-deletion) before removal. |
 
 > **Line-ending hazard (fix with the same change):** `.gitattributes` sets
@@ -344,7 +344,7 @@ still how this repo is exercised from a clone.
 | `99_stop_all.sh` | Superseded — ported into the per-project exe | — | [`STEP-5` §3.4](STEP-5-PER-PROJECT-EXES.md#34-stopping-the-pipeline) | Yes, developer-only |
 | `record_cameras_mp4.sh` | **Dropped** — no plan coverage | — | None | Yes, developer tool |
 | `view_cameras.sh` | **Dropped** — no plan coverage | — | None | Yes, developer tool |
-| `lib/common.sh` | Not bundled; a purpose-written sibling is | `assets/scripts/lib/common.sh` (sibling, **not** a copy) | [`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-bundled-assets-at-runtime) | Yes, developer-only |
+| `lib/common.sh` | Not bundled; a purpose-written sibling is | `assets/scripts/lib/common.sh` (sibling, **not** a copy) | [`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-and-staging-bundled-assets-at-runtime) | Yes, developer-only |
 
 ### 8.1 Which copy do I edit?
 
@@ -385,8 +385,10 @@ fact underlies a verdict, it is cited in the plan doc linked instead.
 Repo files referenced:
 
 - [`00-FRAMEWORK-AND-BOOTSTRAP.md`](00-FRAMEWORK-AND-BOOTSTRAP.md) — §4.1 asset
-  bundling, §5.1 target platform, §13 out-of-scope scope calls, and §14 the
-  web-app credential contract that gates [§3](#3-deletions-gated-on-the-harvest-the-jetson-tree).
+  bundling, §4.2 asset staging, §5 the Release-binary distribution and §5.2 the
+  Ubuntu 24.04 / `x86_64` platform gate, §13 out-of-scope scope calls, and §14
+  the web-app credential contract that gates
+  [§3](#3-deletions-gated-on-the-harvest-the-jetson-tree).
 - [`STEP-4-CALIB-OUTPUT-WIRING.md`](STEP-4-CALIB-OUTPUT-WIRING.md) — §2 treats
   the AMC export as run-time-produced (basis for deleting `amc/`); §4.4 is the
   auto-ingest that supersedes the export watcher operationally
