@@ -253,10 +253,10 @@ operator's only artifact is the file attached to a GitHub Release (§5).
 | Dry-run triggers | `pull_request` touching `installer/**` (builds, uploads a 7-day artifact, never publishes); `workflow_dispatch` with a `draft` input |
 | Runner | **`ubuntu-24.04`, pinned — never `ubuntu-latest`** |
 | Version gate | Fails the build unless `"v" + mv3dt_installer.__version__` equals `$GITHUB_REF_NAME` |
-| Build command | `pyinstaller installer/installer.spec --distpath dist --workpath /tmp/mv3dt-build --clean --noconfirm` |
+| Build command | `pyinstaller installer/installer.spec --distpath installer/dist --workpath /tmp/mv3dt-build --clean --noconfirm` |
 | Smoke test | As the unprivileged runner user: `--version` contains the tag's version and `--status` exits 0 |
 | Release assets | `mv3dt-installer` and `mv3dt-installer.sha256` |
-| Publish command | `gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag dist/mv3dt-installer dist/mv3dt-installer.sha256` |
+| Publish command | `gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag installer/dist/mv3dt-installer installer/dist/mv3dt-installer.sha256` |
 
 **Why the runner is pinned (LOCKED).** PyInstaller `--onefile` links its
 bootloader against the **build host's glibc**. A binary built on a newer
@@ -288,7 +288,12 @@ renders (§3.3). No workflow ever writes a tracked file.
   - [`laptop/mosquitto/mv3dt.conf`](../../laptop/mosquitto/mv3dt.conf)
   - [`laptop/config/cameras.yml`](../../laptop/config/cameras.yml) →
     `assets/cameras/cameras.yml`, the seed inventory §15 reads
-- `--onefile` → one executable at `dist/mv3dt-installer`.
+- `--onefile` → one executable at `installer/dist/mv3dt-installer`. The
+  output directory is `installer/dist` in CI and in a local build alike: it is
+  the path `installer.spec`'s own build header documents, and the one
+  `installer/.gitignore`'s `dist/` rule already covers. A developer copying
+  either the workflow's command or the spec header gets the same file in the
+  same place.
 - No hidden GUI toolkits and no third-party parsers on the hot path: the
   camera inventory reader in `cameras.py` is hand-rolled rather than pulling
   in PyYAML, so the frozen binary gains no hidden-import surface. Keep the dep
@@ -377,9 +382,11 @@ and inside the transcript (§3.2 gives the exact ordering):
 
 1. **Platform preflight** — Ubuntu 24.04 + `x86_64`, running as root via
    `sudo`, and `$SUDO_USER` resolving to a real non-root login (§9.2).
-   `MV3DT_SKIP_PLATFORM_CHECK=1` downgrades the platform half to a warning
-   for developers; the `$SUDO_USER` gate has no escape hatch, because
-   without it every secret and every per-user artifact lands in `/root`.
+   `MV3DT_SKIP_PLATFORM_CHECK=1` is the **planned** developer escape hatch
+   that downgrades the platform half to a warning; it arrives with
+   `preflight.py` and exists nowhere in the tree today. The `$SUDO_USER`
+   gate gets no escape hatch at all, because without it every secret and
+   every per-user artifact lands in `/root`.
 2. **Install location** — prompts with `/opt/mv3dt` prefilled (§11.1) and
    writes `installer.conf` (§11.2).
 3. **Opt-in gates** — asks once for remote supervision and web-app
@@ -1052,20 +1059,34 @@ the §3.4 gate is `on`:
 - `load_credentials(install_dir=...) -> Credentials | None` — reads back,
   re-normalizes the endpoint (§14.2), and returns `None` when either value is
   missing. Steps treat `None` as "not configured" and surface a USER-ACTION
-  block (§9.3), not a crash.
-- `enabled(install_dir=...) -> bool` — the §3.4 gate combined with a
-  successful `load_credentials()`. This is what a step's `preflight` checks.
+  block (§9.3), not a crash. This one **already** takes `install_dir` and
+  honors it.
+- `enabled(gate_value: str, install_dir=...) -> bool` — the §3.4 gate combined
+  with a successful `load_credentials()`. This is what a step's `preflight`
+  checks. `gate_value` is **mandatory and stays first**; see the callout.
 
-> **`install_dir` parameter (REQUIRED — fixes a real bug).**
-> `capture_credentials`, `enabled`, and `load_credentials` take an **optional**
-> `install_dir`, defaulting to the module-level `DEFAULT_INSTALL_DIR` so the
-> zero-argument call sites documented above keep working. Without it these
-> three read that module-level default unconditionally and therefore **ignore
-> `--install-dir`** (§3.3): with a non-default install root they write and
-> read `secrets/webapp.env` under `/opt/mv3dt` while every other component
-> uses the chosen root, so the credential appears to vanish between capture
-> and use. Framework callers MUST pass the path resolved by `config.load()`
-> (§11.2).
+> **`install_dir` parameter (REQUIRED — fixes a real bug).** The defect is
+> confined to `capture_credentials` and `enabled`: each calls a **bare
+> `load_credentials()`** internally, so both read the module-level
+> `DEFAULT_INSTALL_DIR` and **ignore `--install-dir`** (§3.3).
+> `load_credentials` itself is already correct. With a non-default install
+> root, `capture_credentials` compares against — and `enabled` reads — a
+> `secrets/webapp.env` under `/opt/mv3dt` while every other component uses the
+> chosen root, so a captured credential appears to vanish between capture and
+> use. Both gain the same **optional** `install_dir`, defaulting to
+> `DEFAULT_INSTALL_DIR` so the zero-argument call sites documented above keep
+> working, and both pass it through to `load_credentials`. Framework callers
+> MUST pass the path resolved by `config.load()` (§11.2).
+
+> **`gate_value` is not replaced (REQUIRED).** `enabled` keeps
+> `gate_value: str` as its first parameter and gains `install_dir` alongside
+> it. `webapp.py` must not import `config.py`, so the gate cannot be resolved
+> inside this module: the caller (`app.py`, which has both) resolves
+> `MV3DT_WEBAPP_INTEGRATION` and passes the string in. A signature that
+> dropped `gate_value` in favor of `install_dir` would force exactly the
+> import the module is designed to avoid. `app.WebappHandle.enabled()`'s
+> existing install-dir-bound workaround stays as it is — it is correct and
+> documented (§12.3) — the underlying function simply becomes bindable too.
 
 ### 14.4 Redaction (REQUIRED)
 
