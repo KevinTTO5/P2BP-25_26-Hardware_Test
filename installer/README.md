@@ -1,7 +1,7 @@
 # mv3dt-installer — operator download-and-run guide
 
-Status: operator guide for the released `mv3dt-installer` binary. This is the
-entry point for anyone setting up a workstation; it does **not** restate the
+Status: operator guide for the `mv3dt-installer` binary. This is the entry
+point for anyone setting up a workstation; it does **not** restate the
 framework contracts — those live in
 [`00`](plan/00-FRAMEWORK-AND-BOOTSTRAP.md) and the per-step specs under
 [`plan/`](plan/), and are linked from here section by section.
@@ -16,6 +16,19 @@ This guide covers the operator path: where to get the binary, how to verify
 and run it, every flag it accepts, what the first run asks for, and where it
 keeps state and logs. Developers building or testing the installer from a
 clone want [§8](#8-developer-workflow).
+
+> **REQUIRED reading — planned versus shipped.** The installer is being built
+> in stages, so this guide describes a system that is partly in flight.
+> Anything marked **(planned)** is specified in [`plan/`](plan/) and being
+> built, but is **not** in a binary you can run today; everything unmarked is
+> current behavior. The largest planned piece is the step modules themselves:
+> today's binary parses flags, resolves its install location, manages state,
+> and dispatches an empty step registry, so it installs no DeepStream yet.
+> [§4](#4-command-line-flags)'s table carries the same distinction in a
+> `Status` column. Where a citation into
+> [`00`](plan/00-FRAMEWORK-AND-BOOTSTRAP.md) backs a **(planned)**
+> statement, that section of the spec is itself being rewritten by the same
+> work and may still read the other way today.
 
 ---
 
@@ -57,8 +70,12 @@ Run the installer under `sudo` from your normal user account. It resolves the
 invoking user from `SUDO_USER` and writes every secret, and every file under
 that user's home, as that user
 ([`00` §9.2](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#92-resolving-the-invoking-user--home)).
-Launching from a bare root shell where `SUDO_USER` is unset would put those
-files in `/root` instead.
+From a bare root shell where `SUDO_USER` is unset, the resolver falls back to
+the current user, and those files land in `/root` instead.
+
+**(planned)** A startup preflight that refuses an unsupported Ubuntu release,
+a non-`x86_64` machine, or exactly that unset-`SUDO_USER` case, rather than
+proceeding. Until it lands, the table above is yours to honor.
 
 ---
 
@@ -69,6 +86,14 @@ Releases are published at:
 ```
 https://github.com/KevinTTO5/P2BP-25_26-Hardware_Test/releases
 ```
+
+> **(planned) — the release job.** The CI workflow that builds the binary on
+> a pinned Ubuntu 24.04 runner and publishes it is in flight. Until it lands
+> there is nothing on the Releases page to download, and the only way to
+> obtain a binary is the local build in [§8.3](#83-local-build). The
+> procedure below is the operator path once that job exists, and is what
+> [`00` §4.1](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#41-what-builds-the-binary)
+> is being rewritten to specify.
 
 Each release carries exactly two assets — the binary `mv3dt-installer` and
 its checksum `mv3dt-installer.sha256`. Download both into the same directory,
@@ -94,9 +119,9 @@ is incomplete or the two files came from different releases. Delete both and
 download them again; do not run a binary that failed verification.
 
 To pin a specific release instead of `latest`, replace `latest/download` with
-`download/<tag>`, for example `download/v0.2.0`. The tag and the binary's own
-`--version` output always agree: the release build fails outright if they
-drift ([`00` §4.1](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#41-what-builds-the-binary)).
+`download/<tag>`, for example `download/v0.2.0`. **(planned)** The tag and
+the binary's own `--version` output will always agree, because the release
+job asserts it and fails the build on drift.
 
 ---
 
@@ -104,9 +129,9 @@ drift ([`00` §4.1](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#41-what-builds-the-binary
 
 Framework-level flags
 ([`00` §3.3](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#33-cli-flags-framework-level)).
-The `Status` column separates what the binary accepts today from what is
-specified and still landing — check `./mv3dt-installer --help` on the release
-you actually downloaded.
+`Status` separates what the binary accepts today from what is specified and
+still landing — check `./mv3dt-installer --help` on the build you actually
+have.
 
 | Flag | Argument | What it does | Status |
 |---|---|---|---|
@@ -118,14 +143,17 @@ you actually downloaded.
 | `--non-interactive` | — | Never prompt; use defaults and already-persisted config, and fail if a required value is missing | shipped |
 | `--no-pause` | — | Skip the "press Enter" confirmations | shipped |
 | `--log-dir` | `PATH` | Override the transcript directory ([§6.2](#62-logs)) | shipped |
-| `--version` | — | Print the version and exit; release builds also carry the tag, commit, and build timestamp | shipped |
-| `--remote-supervision` | `off`, `local`, `remote` | Set the Step 6 gate ([`00` §3.4](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#34-opt-in-step-gates)) without being prompted; overrides an already-persisted value and logs the change | planned |
-| `--webapp-integration` | `off`, `on` | Set the Step 7 gate the same way | planned |
-| `--scan-cameras` | — | Discover the camera fleet, probe RTSP, run the one-time position binding, write the inventory, print the table, and exit; needs `sudo` for raw sockets | planned |
+| `--version` | — | Print the version and exit | shipped; the stamped form carrying tag, commit, and build timestamp is **planned**, arriving with the release job |
+| `--remote-supervision` | `off`, `local`, `remote` | Set the Step 6 gate ([`00` §3.4](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#34-opt-in-step-gates)) without being prompted; overrides an already-persisted value and logs the change | **planned** |
+| `--webapp-integration` | `off`, `on` | Set the Step 7 gate the same way | **planned** |
+| `--scan-cameras` | — | Discover the camera fleet, probe RTSP, run the one-time position binding, write the inventory, print the table, and exit; needs `sudo` for raw sockets | **planned** |
 
-Not passing a gate flag is different from passing `off`: an unpassed flag
-leaves the value to the next tier of precedence — environment variable, then
-prompt, then `off` — while `--webapp-integration off` sets it explicitly.
+**(planned)** Once the two gate flags exist, not passing one will differ from
+passing `off`: an unpassed flag leaves the value to the next tier of
+precedence — environment variable, then an interactive prompt, then `off` —
+while `--webapp-integration off` sets it explicitly. Today there is no gate
+flag at all, and a gate key absent from `installer.conf` is seeded from the
+like-named environment variable if one is set, else `off`.
 
 `--status` is deliberately allowed without `sudo`. It runs before the root
 check, performs no writes, and reads a world-readable `state.json`, so an
@@ -147,28 +175,40 @@ second launch is a bug, not the design.
    ([`00` §11.1](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#111-default-and-selection)).
    Blank accepts the default. Everything the installer owns lives under this
    directory, and the choice is recorded so later runs need no flag.
-2. **Remote supervision gate** (`off`, `local`, `remote`), prefilled `off`.
-   `off` skips Step 6 entirely — systemd supervision and the MQTT control
-   plane ([`STEP-6`](plan/STEP-6-REMOTE-SUPERVISION.md)). Take the default
-   unless you have been told otherwise.
-3. **Web-app integration gate** (`off`, `on`), prefilled `off`. `off` skips
-   Step 7, the HTTP data plane
+2. **Remote supervision gate** (`off`, `local`, `remote`). **(planned)**
+   Prompted once with `off` prefilled. `off` skips Step 6 entirely — systemd
+   supervision and the MQTT control plane
+   ([`STEP-6`](plan/STEP-6-REMOTE-SUPERVISION.md)). Take the default unless
+   you have been told otherwise. Today this value is never prompted for; it
+   is seeded as described in [§4](#4-command-line-flags).
+3. **Web-app integration gate** (`off`, `on`). **(planned)** on the same
+   terms as prompt 2. `off` skips Step 7, the HTTP data plane
    ([`STEP-7`](plan/STEP-7-WEBAPP-INTEGRATION.md)).
-4. **NGC API key.** A secret prompt — nothing is echoed as you type, and the
-   key is never written to the transcript
+4. **NGC API key. (planned)** A secret prompt — nothing is echoed as you
+   type, and the key is never written to the transcript
    ([`00` §10.1](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#101-storage-contract)).
    **Blank is a valid answer**: it selects the guided manual fallback, so any
    step needing NGC-gated content prints a USER-ACTION block with the
    sign-in-and-download instructions and re-verifies on the next launch
    ([`00` §10.3](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#103-manual-fallback)).
-   Blank is recorded as an answer, so you are not asked again.
-5. **Web-app credential** — endpoint plus API key, and **only** if you set
-   the web-app gate to `on` in prompt 3. A blank endpoint writes nothing and
-   warns; Step 7 then surfaces its own USER-ACTION block on first run
+   Blank is still recorded as an answer — the secret file is written either
+   way, carrying a fallback marker — so you are not asked again. The capture
+   and storage code is in the binary today; the planned part is the
+   onboarding call site that invokes it on launch and the file-existence
+   check that keeps it quiet afterwards.
+5. **Web-app credential. (planned)** Endpoint plus API key, and **only** if
+   you set the web-app gate to `on` in prompt 3. A blank endpoint writes
+   nothing and warns; Step 7 then surfaces its own USER-ACTION block on first
+   run
    ([`00` §14.3](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#143-capture--handoff-api-webapppy)).
+   Same status as prompt 4: the capture code is present, the call site is
+   planned.
 
-Under `--non-interactive` nothing is prompted: both gates resolve to `off`,
-and a missing required value fails the run rather than blocking on a human.
+Under `--non-interactive` nothing is prompted. A gate with no recorded value
+resolves to `off`; a gate already recorded in `installer.conf` keeps the
+value it has
+([`00` §3.4](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#34-opt-in-step-gates)). A
+required value that is missing fails the run rather than blocking on a human.
 
 > **Still manual, by design:** camera activation, disabling the on-screen
 > display, and setting each camera's stream profile happen once in the vendor
@@ -191,8 +231,17 @@ and a missing required value fails the run rather than blocking on a human.
 The path is fixed and independent of `--install-dir`
 ([`00` §6.1](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#61-state-file)). The file is
 world-readable, which is what lets `--status` work without `sudo`. A missing
-or corrupt file is read as "nothing has run yet" rather than as an error, so
-deleting it is equivalent to `--reset-state`.
+or corrupt file is read as "nothing has run yet" rather than as an error.
+
+> **Do not delete `state.json` by hand — it is not equivalent to
+> `--reset-state`.** `--reset-state` clears step completion but writes the
+> recorded install directory back into the fresh state file. Deleting the
+> file loses that record, so the next run falls through to the lower
+> precedence tiers
+> ([`00` §11.2](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#112-persistence--sharing-with-later-steps))
+> and can silently resolve to `/opt/mv3dt` instead of the directory a live
+> install actually occupies. Use `--reset-state`; if the file is already
+> gone, pass `--install-dir` explicitly on the next run.
 
 ### 6.2 Logs
 
@@ -203,10 +252,16 @@ deleting it is equivalent to `--reset-state`.
 
 `--log-dir PATH` moves both
 ([`00` §8.2](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#82-transcript-log-file)). The
-transcript captures the installer's own output and the output of every bash
-fragment it shells out to. Secrets are redacted before anything is written —
-a log line that would contain the NGC key prints `NGC_API_KEY=<redacted>`.
-When reporting a problem, attach `latest.log`:
+transcript captures the installer's own output. **(planned)** Capturing the
+stdout and stderr of the bash fragments it shells out to as well — today that
+output is collected and then discarded rather than logged.
+
+Secrets are redacted before anything is written: a log line that would carry
+the NGC key or the web-app API key prints `NGC_API_KEY=<redacted>` or
+`API_KEY=<redacted>` instead, and the modules that own those secrets do that
+redaction themselves. **(planned)** Extending the same redaction over the
+shelled-out script output described above, once it is captured. When
+reporting a problem, attach `latest.log`:
 
 ```bash
 sudo tail -n 200 /var/lib/mv3dt-installer/logs/latest.log
@@ -219,11 +274,11 @@ directory `0700` and files `0600`
 ([`00` §10.1](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#101-storage-contract),
 [`00` §14.1](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#141-storage-contract)):
 
-| Path | Contents |
-|---|---|
-| `<install_dir>/secrets/ngc.env` | `NGC_API_KEY=...`, or the manual-fallback marker |
-| `<install_dir>/secrets/webapp.env` | `API_KEY=...` and `ENDPOINT=...` |
-| `<install_dir>/installer.conf` | Non-secret `KEY=VALUE` config: the two gates, the resolved install directory, and the shared values later steps read |
+| Path | Contents | Status |
+|---|---|---|
+| `<install_dir>/secrets/ngc.env` | `NGC_API_KEY=...`, or the manual-fallback marker | **planned**: written once the [§5](#5-first-run-what-it-asks-for) capture is wired into launch |
+| `<install_dir>/secrets/webapp.env` | `API_KEY=...` and `ENDPOINT=...` | **planned**, same reason |
+| `<install_dir>/installer.conf` | Non-secret `KEY=VALUE` config: the two gates, the resolved install directory, and the shared values later steps read | shipped |
 
 ---
 
@@ -233,16 +288,19 @@ directory `0700` and files `0600`
   exits cleanly. Reboot, then run `sudo ./mv3dt-installer` again — it detects
   that the reboot happened and continues
   ([`00` §7](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#7-reboot-detection--continuation-contract)).
+  The detection is shipped; the steps that request a reboot are **(planned)**
+  with the step modules.
 - **After a manual action.** A USER-ACTION block lists exactly what to do by
   hand; do it, then run the installer again. Nothing already complete is
-  repeated.
+  repeated. Same split as above: the block is shipped, its callers are
+  **(planned)**.
 - **Force one step to re-run.** `sudo ./mv3dt-installer --reset-step N` with
   that step's order number, then run normally.
 - **Start over.** `sudo ./mv3dt-installer --reset-state` clears all step
-  completion. The recorded install directory is kept, so a reset never
-  silently relocates a live install. Captured credentials and gates are not
-  cleared either — remove `<install_dir>/secrets/` and
-  `<install_dir>/installer.conf` by hand if that is genuinely what you want.
+  completion while keeping the recorded install directory ([§6.1](#61-state)).
+  Captured credentials and gates are not cleared — remove
+  `<install_dir>/secrets/` and `<install_dir>/installer.conf` by hand if that
+  is genuinely what you want.
 - **Upgrade the installer.** Download the newer release, verify it as in
   [§3](#3-download-verify-run), and run it; state carries forward.
 
@@ -286,10 +344,11 @@ installer/dist/mv3dt-installer --version
 installer/dist/mv3dt-installer --status
 ```
 
-This produces the same `--onefile` executable the release job publishes, but
-it is **not** a substitute for it: a locally built binary links against the
-build host's glibc, so only a build on Ubuntu 24.04 is guaranteed to start on
-the target
+This produces the same `--onefile` executable the release job will publish,
+and until that job lands it is the only way to get a binary at all
+([§3](#3-download-verify-run)). It is still not a substitute for a released
+one: a locally built binary links against the build host's glibc, so only a
+build on Ubuntu 24.04 is guaranteed to start on the target
 ([`00` §4.1](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#41-what-builds-the-binary)).
 Use a local build to confirm a newly added asset is actually bundled, and the
 release job for anything an operator will run.
@@ -307,6 +366,8 @@ release job for anything an operator will run.
 - **The scripted `laptop/` harness**, which remains a developer tool and is
   not the operator path; see
   [`laptop/docs/SCRIPTED-WORKFLOW.md`](../laptop/docs/SCRIPTED-WORKFLOW.md).
+  While the step modules are still **(planned)**, it is also the only way to
+  actually stand the pipeline up.
 - **Camera activation, OSD, and stream-profile setup**, which stay manual
   ([`00` §13](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#13-out-of-scope--defer-to-human)).
 
@@ -317,7 +378,8 @@ release job for anything an operator will run.
 Release artifacts and their verification come from this repository's own
 release job. The framework behavior summarized above is specified in
 [`00`](plan/00-FRAMEWORK-AND-BOOTSTRAP.md), which is authoritative wherever
-this guide condenses it.
+this guide condenses it; on a **(planned)** item the spec states the intent
+while this guide records what the binary does meanwhile.
 
 - <https://github.com/KevinTTO5/P2BP-25_26-Hardware_Test/releases> — the
   Releases page; **the only supported source** of the `mv3dt-installer`
