@@ -31,8 +31,24 @@ Three properties this module owes its callers:
    `inherit_env=False` for the hermetic replace semantics.
 3. **Transcript capture (§8.2).** The command line, any explicit environment
    overrides, and both output streams of every shelled-out fragment go to
-   `logs.log` -- stdout at info level, stderr at warn level -- with
-   `_REDACT_KEYS` applied so no secret reaches the transcript.
+   `logs.log` -- stdout at info level, stderr at warn level.
+
+Exactly what redaction guarantees, stated precisely because the transcript
+is an audited artifact:
+
+- **By value.** Every value the child environment carries under a
+  `_REDACT_KEYS` name is scrubbed wherever it appears in the command line,
+  the environment dump, or either output stream, prefix or no prefix. This
+  is what covers `set -x` tracing, `curl -H "Authorization: Bearer
+  $NGC_API_KEY"`, and a tool echoing an argument back in an error message.
+  Value scrubbing is exact-substring, so a fragment that transforms a secret
+  before printing it (base64, URL-encoding, splitting it across lines)
+  defeats it.
+- **By key.** Any `KEY=` occurrence for a `_REDACT_KEYS` name additionally
+  blanks the rest of that line, which catches a secret this process never
+  held -- one the fragment read from a file or generated itself.
+- **Not covered.** A secret under a key not in `_REDACT_KEYS`, and an empty
+  or whitespace-only value (scrubbing those would match everywhere).
 """
 
 from __future__ import annotations
@@ -45,6 +61,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import Mapping, Sequence
 
 from .logs import log
 
@@ -52,10 +69,12 @@ from .logs import log
 # stage_assets() / run_bundled_script().
 STAGE_PREFIX = "mv3dt-shellout-"
 
-# Environment variable pointing the staged bash at the root of its own
-# staged tree, so a fragment never has to guess where it was copied to.
-# The installer-side `lib/common.sh` reads this as `${MV3DT_ASSET_ROOT:?}`
-# in place of the repo-relative `repo_root()` the laptop/ scripts use.
+# Environment variable exported by run_bundled_script() when it stages a
+# tree. Its meaning is invariant: it is always the root of the staged assets
+# tree -- the staged stand-in for `assets/` itself -- no matter which subtree
+# was staged. A fragment therefore addresses asset subtrees as
+# `$MV3DT_ASSET_ROOT/<subtree>/...` in every mode, and locates its own
+# directory from `$0` rather than from this variable.
 ASSET_ROOT_ENV = "MV3DT_ASSET_ROOT"
 
 # Environment keys whose values must never reach the transcript (§8.2).
@@ -63,10 +82,17 @@ ASSET_ROOT_ENV = "MV3DT_ASSET_ROOT"
 # not as a bare `API_KEY` suffix.
 _REDACT_KEYS = ("NGC_API_KEY", "API_KEY", "CAM_PASSWORD", "MQTT_PASSWORD")
 _REDACTED = "<redacted>"
+
+# `KEY=` blanks the remainder of the line, not just the next whitespace-free
+# run: a password may legitimately contain spaces, and `\S*` would have
+# logged `MQTT_PASSWORD=hunter 2 three` as `MQTT_PASSWORD=<redacted> 2 three`.
+# Once a secret key is named on a line, no part of that line's tail can be
+# assumed safe. Callers wanting per-argument granularity redact each argument
+# separately before joining, which _command_dump() below does.
 _REDACT_RE = re.compile(
     r"(?<![A-Za-z0-9_])("
     + "|".join(sorted(_REDACT_KEYS, key=len, reverse=True))
-    + r")=\S*"
+    + r")=[^\n]*"
 )
 
 # Modes applied to a staged tree: executable for shell fragments, plain
@@ -98,20 +124,72 @@ def asset_path(*parts: str) -> pathlib.Path:
     return pathlib.Path(__file__).parent.joinpath("assets", *parts)  # dev mode
 
 
+# ---------------------------------------------------------------------------
+# Redaction (§8.2)
+# ---------------------------------------------------------------------------
+
+
 def _redact(text: str) -> str:
-    """Blank the value of any ``KEY=value`` occurrence for a redacted key."""
+    """Blank a ``KEY=...`` occurrence, and its line's tail, for a secret key."""
     return _REDACT_RE.sub(lambda m: f"{m.group(1)}={_REDACTED}", text)
 
 
-def _env_dump(env: dict[str, str]) -> str:
-    """Render an environment overlay as a single redacted, sorted line."""
-    rendered = " ".join(
-        f"{key}={_REDACTED}" if key in _REDACT_KEYS else f"{key}={shlex.quote(value)}"
-        for key, value in sorted(env.items())
-    )
-    # Belt and braces: a key not in _REDACT_KEYS may still carry a secret in
-    # `KEY=value` form inside its own value (e.g. a composed command line).
-    return _redact(rendered)
+def _secret_values(env: Mapping[str, str]) -> tuple[str, ...]:
+    """Collect the plaintext this process is handing the fragment.
+
+    Longest first, so a value that contains a shorter one is replaced whole
+    rather than shredded around it. Empty and whitespace-only values are
+    excluded: substituting those would match at every position and destroy
+    the transcript without protecting anything.
+    """
+    values = set()
+    for key in _REDACT_KEYS:
+        value = env.get(key, "")
+        if value.strip():
+            values.add(value)
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def _scrub(text: str, secrets: Sequence[str]) -> str:
+    """Apply value-based scrubbing, then key-based, to one line of text."""
+    for secret in secrets:
+        text = text.replace(secret, _REDACTED)
+    return _redact(text)
+
+
+def _command_dump(command: Sequence[str], secrets: Sequence[str]) -> str:
+    """Render an argv for the transcript, redacting each argument alone.
+
+    Redacting per argument rather than over the joined string keeps a
+    ``KEY=`` argument from swallowing every argument that follows it.
+    """
+    return " ".join(_scrub(shlex.quote(part), secrets) for part in command)
+
+
+def _env_dump(env: Mapping[str, str], secrets: Sequence[str]) -> str:
+    """Render an environment overlay as a single sorted, redacted line.
+
+    Each entry is redacted on its own for the same reason as ``_command_dump``:
+    a secret entry must not blank the entries sorted after it.
+    """
+    entries = []
+    for key, value in sorted(env.items()):
+        if key in _REDACT_KEYS:
+            entries.append(f"{key}={_REDACTED}")
+        else:
+            entries.append(_scrub(f"{key}={shlex.quote(value)}", secrets))
+    return " ".join(entries)
+
+
+def _log_stream(emit, name: str, text: str, secrets: Sequence[str]) -> None:
+    """Append a captured stream to the transcript, one redacted line each."""
+    for line in text.splitlines():
+        emit(f"[{name}] {_scrub(line, secrets)}")
+
+
+# ---------------------------------------------------------------------------
+# Staging
+# ---------------------------------------------------------------------------
 
 
 def _apply_tree_modes(root: pathlib.Path) -> None:
@@ -140,15 +218,22 @@ def stage_assets(*parts: str, prefix: str = STAGE_PREFIX) -> pathlib.Path:
     whole directory has to land together, keeping its internal layout.
 
     ``parts`` names the directory relative to the assets root, exactly as
-    ``asset_path`` takes it. The tree is re-created *at the same relative
-    path* under the returned staging directory, so relative navigation
-    between asset subtrees (``../mosquitto/mv3dt.conf``) resolves the same
-    way it does inside the bundle. With no ``parts`` the entire ``assets/``
-    tree is staged.
+    ``asset_path`` takes it, and the tree is re-created at that same relative
+    path under the returned staging directory. Returns the staging directory
+    itself -- the thing to hand to ``shutil.rmtree`` when done -- with the
+    requested tree at ``<returned>/<parts...>``.
 
-    Returns the staging directory itself -- the thing to hand to
-    ``shutil.rmtree`` when done. The requested tree is at
-    ``<returned>/<parts...>``.
+    **Only the requested subtree is copied.** ``stage_assets("scripts")``
+    produces a staging dir containing ``scripts/`` and nothing else, so a
+    fragment reaching outside its own directory (``../mosquitto/mv3dt.conf``)
+    gets ENOENT. Call ``stage_assets()`` with no parts to stage the whole
+    ``assets/`` tree when a fragment needs a sibling subtree; that is the
+    only mode in which cross-subtree paths resolve as they do inside the
+    bundle.
+
+    This function sets no environment variable. ``MV3DT_ASSET_ROOT`` is
+    exported by ``run_bundled_script``, which is where a child process
+    exists to receive it.
     """
     source = asset_path(*parts)
     if not source.is_dir():
@@ -164,7 +249,9 @@ def stage_assets(*parts: str, prefix: str = STAGE_PREFIX) -> pathlib.Path:
     return stage_root
 
 
-def _stage_single_file(*asset_parts: str, prefix: str) -> tuple[pathlib.Path, pathlib.Path]:
+def _stage_single_file(
+    *asset_parts: str, prefix: str
+) -> tuple[pathlib.Path, pathlib.Path]:
     """Copy one bundled fragment out to a fresh staging dir and chmod it.
 
     Backward-compatible path for ``run_bundled_script`` calls that pass no
@@ -179,10 +266,9 @@ def _stage_single_file(*asset_parts: str, prefix: str) -> tuple[pathlib.Path, pa
     return stage_root, script
 
 
-def _log_stream(emit, name: str, text: str) -> None:
-    """Append a captured stream to the transcript, one redacted line each."""
-    for line in text.splitlines():
-        emit(f"[{name}] {_redact(line)}")
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
 
 
 def run_bundled_script(
@@ -200,11 +286,21 @@ def run_bundled_script(
 
     ``tree`` names an ancestor directory of the fragment, also relative to
     the assets root; when given, that whole directory is staged with
-    ``stage_assets`` and the fragment runs from inside the staged copy with
-    ``cwd`` set to it and ``MV3DT_ASSET_ROOT`` exported to its absolute
-    path. ``asset_parts`` must start with ``tree``. Use ``tree=()`` to stage
-    the entire ``assets/`` tree; ``tree=None`` (the default) keeps the
-    original single-file copy behaviour.
+    ``stage_assets`` and the fragment runs from inside the staged copy, with
+    ``cwd`` set to the staged copy of ``tree``. ``asset_parts`` must start
+    with ``tree``. Use ``tree=()`` to stage the entire ``assets/`` tree --
+    the mode a fragment needs if it reads a sibling subtree, since a partial
+    stage copies only the subtree named. ``tree=None`` (the default) keeps
+    the original single-file copy behaviour.
+
+    ``MV3DT_ASSET_ROOT`` is exported to the child whenever a tree is staged,
+    and always means **the root of the staged assets tree**, whichever
+    subtree was staged. So ``$MV3DT_ASSET_ROOT/scripts/lib/common.sh`` is the
+    correct spelling under both ``tree=("scripts",)`` and ``tree=()``; what
+    differs between them is only what else exists beside ``scripts/``. A
+    value for it supplied in ``env`` is ignored, with a warning -- the real
+    staging path is the only correct answer, and a stale one sends the
+    fragment somewhere that no longer exists.
 
     ``env`` is an already-prepared environment mapping (e.g. produced by
     ``privilege.py``, §9). By default (``inherit_env=True``) it is merged
@@ -219,10 +315,11 @@ def run_bundled_script(
     debugging of the executed fragment.
 
     The command line, the explicit environment overrides, and both captured
-    streams are written to the transcript per §8.2, with ``_REDACT_KEYS``
-    redacted throughout. The ``CompletedProcess`` -- including the
-    unredacted ``stdout``/``stderr`` the caller may need to parse -- is
-    returned unchanged.
+    streams are written to the transcript per §8.2. Secrets are scrubbed by
+    value and by key with the guarantees and limits spelled out in this
+    module's docstring; note that transformed output (a base64-encoded key,
+    say) is beyond any scrubber's reach. The ``CompletedProcess`` returned
+    to the caller is unredacted, since callers parse it.
     """
     if tree is not None:
         tree_parts = tuple(tree)
@@ -230,32 +327,40 @@ def run_bundled_script(
             raise ValueError(
                 f"asset_parts {asset_parts!r} is not inside tree {tree_parts!r}"
             )
-        relative_parts = asset_parts[len(tree_parts) :]
-        if not relative_parts:
+        if not asset_parts[len(tree_parts) :]:
             raise ValueError(
                 "asset_parts must name a fragment inside tree, not the tree itself"
             )
         stage_root = stage_assets(*tree_parts, prefix=prefix)
-        tree_root = stage_root.joinpath(*tree_parts)
-        script = tree_root.joinpath(*relative_parts)
-        cwd: str | None = str(tree_root)
+        script = stage_root.joinpath(*asset_parts)
+        cwd: str | None = str(stage_root.joinpath(*tree_parts))
+        asset_root: str | None = str(stage_root)
     else:
         stage_root, script = _stage_single_file(*asset_parts, prefix=prefix)
-        tree_root = None
         cwd = None
+        asset_root = None
 
     child_env: dict[str, str] = dict(os.environ) if inherit_env else {}
-    if tree_root is not None:
-        child_env[ASSET_ROOT_ENV] = str(tree_root)
     if env:
         child_env.update(env)
+    if asset_root is not None:
+        # Assigned after the overlay, deliberately: the staged path is a fact
+        # about this run, not a preference the caller gets to state.
+        supplied = child_env.get(ASSET_ROOT_ENV)
+        if supplied is not None and supplied != asset_root:
+            log.warn(
+                f"shellout: ignoring supplied {ASSET_ROOT_ENV}={supplied}; "
+                f"using the staged tree at {asset_root}"
+            )
+        child_env[ASSET_ROOT_ENV] = asset_root
 
     command = [str(script), *(args or [])]
+    secrets = _secret_values(child_env)
 
     try:
-        log.info(f"shellout: {_redact(shlex.join(command))}")
+        log.info(f"shellout: {_command_dump(command, secrets)}")
         if env:
-            log.info(f"shellout env: {_env_dump(env)}")
+            log.info(f"shellout env: {_env_dump(env, secrets)}")
         result = subprocess.run(
             command,
             env=child_env,
@@ -263,8 +368,8 @@ def run_bundled_script(
             capture_output=True,
             text=True,
         )
-        _log_stream(log.info, script.name, result.stdout)
-        _log_stream(log.warn, script.name, result.stderr)
+        _log_stream(log.info, script.name, result.stdout, secrets)
+        _log_stream(log.warn, script.name, result.stderr, secrets)
         log.info(f"shellout: {script.name} exited {result.returncode}")
         return result
     finally:

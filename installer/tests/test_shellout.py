@@ -157,6 +157,18 @@ def test_stage_assets_with_no_parts_stages_whole_assets_tree(assets_root):
     assert resolved.read_text() == "listener 1883\n"
 
 
+def test_partial_stage_does_not_bring_sibling_subtrees(assets_root):
+    """A partial stage copies only what was asked for, so a fragment reaching
+    across to `../mosquitto/mv3dt.conf` gets ENOENT. This is the documented
+    precondition behind the whole-tree case above, and the reason a fragment
+    that needs a sibling subtree has to be run with `tree=()`."""
+    stage_root = shellout.stage_assets("scripts")
+
+    assert (stage_root / "scripts" / "run.sh").is_file()
+    assert not (stage_root / "mosquitto").exists()
+    assert sorted(p.name for p in stage_root.iterdir()) == ["scripts"]
+
+
 def test_stage_assets_honours_prefix(assets_root):
     stage_root = shellout.stage_assets("scripts", prefix="custom-prefix-")
 
@@ -185,21 +197,60 @@ def test_staged_script_can_source_its_sibling_library(assets_root):
     assert "hello-from-common" in result.stdout
 
 
-def test_tree_run_exports_asset_root_and_runs_from_inside_the_tree(assets_root):
-    """The fragment is told where it was staged, and its cwd is the tree."""
-    (assets_root / "scripts" / "where.sh").write_text(
-        '#!/bin/sh\necho "root=$MV3DT_ASSET_ROOT"\necho "cwd=$(pwd)"\n'
-    )
+_WHERE_PROBE = '#!/bin/sh\necho "root=$MV3DT_ASSET_ROOT"\necho "cwd=$(pwd)"\n'
+
+
+def test_partial_tree_run_exports_the_staged_assets_root(assets_root):
+    """`MV3DT_ASSET_ROOT` is the staged stand-in for `assets/` itself, so a
+    fragment addresses subtrees as `$MV3DT_ASSET_ROOT/<subtree>/...`. cwd is
+    the staged copy of the tree that was asked for."""
+    (assets_root / "scripts" / "where.sh").write_text(_WHERE_PROBE)
 
     result = shellout.run_bundled_script(
         "scripts", "where.sh", tree=("scripts",), cleanup=False
     )
 
     lines = dict(line.split("=", 1) for line in result.stdout.splitlines())
-    staged_tree = pathlib.Path(lines["root"])
-    assert staged_tree.name == "scripts"
-    assert (staged_tree / "lib" / "common.sh").is_file()
-    assert pathlib.Path(lines["cwd"]).resolve() == staged_tree.resolve()
+    asset_root = pathlib.Path(lines["root"])
+    assert (asset_root / "scripts" / "lib" / "common.sh").is_file()
+    assert pathlib.Path(lines["cwd"]).resolve() == (asset_root / "scripts").resolve()
+
+
+def test_whole_tree_run_exports_the_same_asset_root_spelling(assets_root):
+    """The variable means the same thing under `tree=()`; only what else sits
+    beside `scripts/` differs. A bundled `common.sh` resolving a path against
+    it therefore behaves identically in both modes."""
+    (assets_root / "scripts" / "where.sh").write_text(_WHERE_PROBE)
+
+    result = shellout.run_bundled_script(
+        "scripts", "where.sh", tree=(), cleanup=False
+    )
+
+    lines = dict(line.split("=", 1) for line in result.stdout.splitlines())
+    asset_root = pathlib.Path(lines["root"])
+    assert (asset_root / "scripts" / "lib" / "common.sh").is_file()
+    assert (asset_root / "mosquitto" / "mv3dt.conf").is_file()
+    assert pathlib.Path(lines["cwd"]).resolve() == asset_root.resolve()
+
+
+def test_caller_supplied_asset_root_never_wins(assets_root, capsys):
+    """The staged path is a fact about this run, not a caller preference: a
+    supplied value is ignored and the override is logged, since honouring it
+    would point the fragment at a directory that does not exist."""
+    (assets_root / "scripts" / "where.sh").write_text(_WHERE_PROBE)
+
+    result = shellout.run_bundled_script(
+        "scripts",
+        "where.sh",
+        tree=("scripts",),
+        env={shellout.ASSET_ROOT_ENV: "/nowhere/stale"},
+        cleanup=False,
+    )
+
+    lines = dict(line.split("=", 1) for line in result.stdout.splitlines())
+    assert lines["root"] != "/nowhere/stale"
+    assert (pathlib.Path(lines["root"]) / "scripts").is_dir()
+    assert "ignoring supplied MV3DT_ASSET_ROOT" in capsys.readouterr().err
 
 
 def test_tree_run_rejects_a_fragment_outside_the_tree(assets_root):
@@ -362,9 +413,9 @@ def test_tree_run_removes_the_whole_staged_tree_by_default(assets_root):
 
     result = shellout.run_bundled_script("scripts", "where.sh", tree=("scripts",))
 
-    staged_tree = pathlib.Path(result.stdout.strip())
-    assert not staged_tree.exists()
-    assert not staged_tree.parent.exists()
+    asset_root = pathlib.Path(result.stdout.strip())
+    assert not (asset_root / "scripts").exists()
+    assert not asset_root.exists()
 
 
 def test_cleanup_still_happens_when_the_fragment_fails(tmp_path, monkeypatch):
@@ -464,6 +515,119 @@ def test_non_secret_env_keys_are_logged_in_full(tmp_path, monkeypatch):
     )
 
     assert "LOCATION_ID=gainesville-01" in run_file.read_text()
+
+
+def test_secret_value_without_a_key_prefix_never_reaches_the_transcript(
+    tmp_path, monkeypatch
+):
+    """Key-based redaction only fires on a literal `KEY=` occurrence, and real
+    fragments leak secrets without one: `set -x` tracing, an Authorization
+    header, a tool echoing an argument back in an error. The value itself is
+    scrubbed, so none of those reach the transcript."""
+    fixture = _fixture_script(
+        tmp_path,
+        "bearer.sh",
+        "#!/bin/sh\n"
+        'echo "curl -H \'Authorization: Bearer $NGC_API_KEY\' https://ngc"\n'
+        'echo "+ login --token $NGC_API_KEY" >&2\n',
+    )
+    monkeypatch.setattr(shellout, "asset_path", lambda *parts: fixture)
+    run_file = logs.open_transcript(tmp_path / "logs")
+
+    result = shellout.run_bundled_script(
+        "scripts", "bearer.sh", env={"NGC_API_KEY": "nvapi-plaintext-key"}
+    )
+
+    assert "nvapi-plaintext-key" in result.stdout  # the caller still sees it
+    transcript = run_file.read_text()
+    assert "nvapi-plaintext-key" not in transcript
+    assert transcript.count(shellout._REDACTED) >= 2
+    assert "Authorization: Bearer" in transcript  # only the value is scrubbed
+
+
+def test_secret_value_containing_whitespace_is_redacted_whole(tmp_path, monkeypatch):
+    """A password may legitimately contain spaces. Matching the value up to the
+    next space would have logged `MQTT_PASSWORD=hunter 2 three` as
+    `MQTT_PASSWORD=<redacted> 2 three`, exposing the remainder."""
+    secret = "hunter 2 three"
+    fixture = _fixture_script(
+        tmp_path,
+        "spaces.sh",
+        "#!/bin/sh\n"
+        'echo "MQTT_PASSWORD=$MQTT_PASSWORD"\n'
+        'echo "connecting as admin with $MQTT_PASSWORD"\n'
+        'echo "MQTT_PASSWORD=$MQTT_PASSWORD" >&2\n',
+    )
+    monkeypatch.setattr(shellout, "asset_path", lambda *parts: fixture)
+    run_file = logs.open_transcript(tmp_path / "logs")
+
+    shellout.run_bundled_script("scripts", "spaces.sh", env={"MQTT_PASSWORD": secret})
+
+    transcript = run_file.read_text()
+    assert secret not in transcript
+    assert "2 three" not in transcript  # the tail must not survive either
+    assert f"MQTT_PASSWORD={shellout._REDACTED}" in transcript
+
+
+def test_secret_inherited_from_the_parent_environment_is_scrubbed(
+    tmp_path, monkeypatch
+):
+    """Doc 00 §9.1 lets `NGC_API_KEY` arrive from the parent environment rather
+    than an explicit `env`; it must be scrubbed on that path too."""
+    fixture = _fixture_script(
+        tmp_path, "inherited.sh", '#!/bin/sh\necho "token is $NGC_API_KEY"\n'
+    )
+    monkeypatch.setattr(shellout, "asset_path", lambda *parts: fixture)
+    monkeypatch.setenv("NGC_API_KEY", "inherited-plaintext-key")
+    run_file = logs.open_transcript(tmp_path / "logs")
+
+    shellout.run_bundled_script("scripts", "inherited.sh")
+
+    transcript = run_file.read_text()
+    assert "inherited-plaintext-key" not in transcript
+    assert f"token is {shellout._REDACTED}" in transcript
+
+
+def test_blank_secret_value_does_not_scrub_the_whole_transcript(tmp_path, monkeypatch):
+    """An unset-but-present secret has an empty value; substituting that would
+    match at every position and shred the transcript for no benefit."""
+    fixture = _fixture_script(
+        tmp_path, "quiet.sh", "#!/bin/sh\necho ordinary-output-line\n"
+    )
+    monkeypatch.setattr(shellout, "asset_path", lambda *parts: fixture)
+    run_file = logs.open_transcript(tmp_path / "logs")
+
+    shellout.run_bundled_script("scripts", "quiet.sh", env={"CAM_PASSWORD": ""})
+
+    assert "ordinary-output-line" in run_file.read_text()
+
+
+def test_a_secret_argument_does_not_swallow_later_arguments(tmp_path, monkeypatch):
+    """The command line is redacted per argument, so a `KEY=` argument blanks
+    only itself and the rest of the invocation stays auditable."""
+    fixture = _fixture_script(tmp_path, "noop.sh", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setattr(shellout, "asset_path", lambda *parts: fixture)
+    run_file = logs.open_transcript(tmp_path / "logs")
+
+    shellout.run_bundled_script(
+        "scripts", "noop.sh", args=["MQTT_PASSWORD=hunter2", "--with-firewall"]
+    )
+
+    transcript = run_file.read_text()
+    assert "hunter2" not in transcript
+    assert "--with-firewall" in transcript
+
+
+def test_redact_blanks_the_rest_of_the_line_after_a_secret_key(tmp_path):
+    """The key-based rule covers a secret this process never held, so it cannot
+    stop at the first space: everything after `KEY=` on that line goes."""
+    assert (
+        shellout._redact("MQTT_PASSWORD=hunter 2 three")
+        == f"MQTT_PASSWORD={shellout._REDACTED}"
+    )
+    assert shellout._redact("first line\nCAM_PASSWORD=a b\nlast line") == (
+        f"first line\nCAM_PASSWORD={shellout._REDACTED}\nlast line"
+    )
 
 
 def test_redact_leaves_a_longer_key_intact(tmp_path):
