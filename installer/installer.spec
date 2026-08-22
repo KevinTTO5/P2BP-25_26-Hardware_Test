@@ -14,11 +14,12 @@
 # mv3dt_installer.shellout.asset_path() (doc 00 §4.2). This spec ships two
 # kinds of data:
 #   1. Everything already under mv3dt_installer/assets/ (bundled bash
-#      fragments, plus whatever config templates later steps drop there).
-#   2. The DeepStream/mosquitto config templates that still live under
-#      laptop/ (tracker/infer/app/msgconv + the mosquitto drop-in), pulled
-#      in directly from the laptop/ harness at build time so the single
-#      binary is self-contained without duplicating those files by hand.
+#      fragments, the tracked mosquitto/mv3dt.conf copy, plus whatever
+#      config templates later steps drop there).
+#   2. The DeepStream config templates that still live under laptop/
+#      (tracker/infer/app/msgconv), pulled in directly from the laptop/
+#      harness at build time so the single binary is self-contained
+#      without duplicating those files by hand.
 #
 # NOTE: this file is executed by PyInstaller's own runtime, which injects
 # `Analysis`, `PYZ`, `EXE`, and `SPECPATH` as globals before running it —
@@ -36,7 +37,6 @@ INSTALLER_DIR = os.path.join(ROOT, "installer")
 PACKAGE_DIR = os.path.join(INSTALLER_DIR, "mv3dt_installer")
 ASSETS_DIR = os.path.join(PACKAGE_DIR, "assets")
 LAPTOP_DEEPSTREAM_DIR = os.path.join(ROOT, "laptop", "deepstream")
-LAPTOP_MOSQUITTO_DIR = os.path.join(ROOT, "laptop", "mosquitto")
 
 
 def _collect_tree_datas(src_dir: str, dest_prefix: str) -> list[tuple[str, str]]:
@@ -78,11 +78,6 @@ for _fname in (
     _fpath = os.path.join(LAPTOP_DEEPSTREAM_DIR, _fname)
     if os.path.isfile(_fpath):
         datas.append((_fpath, "assets/deepstream"))
-
-# 3. laptop/mosquitto/mv3dt.conf -> assets/mosquitto/
-_mosquitto_conf = os.path.join(LAPTOP_MOSQUITTO_DIR, "mv3dt.conf")
-if os.path.isfile(_mosquitto_conf):
-    datas.append((_mosquitto_conf, "assets/mosquitto"))
 
 a = Analysis(  # noqa: F821 (PyInstaller global)
     [os.path.join(PACKAGE_DIR, "__main__.py")],

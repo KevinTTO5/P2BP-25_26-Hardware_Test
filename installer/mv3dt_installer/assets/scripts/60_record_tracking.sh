@@ -91,7 +91,7 @@ fi
 if [[ -n "$OUTPUT_ROOT_OVERRIDE" ]]; then
   OUTPUT_ROOT="$OUTPUT_ROOT_OVERRIDE"
 else
-  OUTPUT_ROOT="${MV3DT_TRACKING_EXPORTS:-${MV3DT_INSTALL_DIR:?}/tracking_exports}"
+  OUTPUT_ROOT="${MV3DT_TRACKING_EXPORTS:-${INSTALL_DIR:?}/tracking_exports}"
 fi
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"

@@ -70,6 +70,40 @@ def test_record_tracking_help_exits_zero_without_root():
     assert "Usage: 60_record_tracking.sh" in result.stdout
 
 
+def test_record_tracking_output_root_falls_back_to_install_dir(tmp_path):
+    """OUTPUT_ROOT's fallback must read the `INSTALL_DIR` key that
+    config.py actually persists into installer.conf (doc 00 section
+    11.2), not some other name -- a fixture installer.conf here defines
+    only INSTALL_DIR, with no MV3DT_TRACKING_EXPORTS override, mirroring
+    the real conf a sourced installer.conf would produce."""
+    install_dir = tmp_path / "opt" / "mv3dt"
+    conf = tmp_path / "installer.conf"
+    conf.write_text(f"INSTALL_DIR={install_dir}\n")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_mosquitto_sub = fake_bin / "mosquitto_sub"
+    fake_mosquitto_sub.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_mosquitto_sub.chmod(0o755)
+
+    result = shellout.run_bundled_script(
+        "scripts",
+        "60_record_tracking.sh",
+        tree=("scripts",),
+        env={
+            "MV3DT_INSTALLER_CONF": str(conf),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    expected_root = install_dir / "tracking_exports"
+    assert f"Run directory: {expected_root}" in result.stderr
+    assert list(expected_root.glob("*_site")), (
+        f"expected a run dir under {expected_root}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # lib/common.sh -- load_installer_conf
 # ---------------------------------------------------------------------------
