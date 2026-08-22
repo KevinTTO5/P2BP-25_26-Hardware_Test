@@ -38,6 +38,13 @@ jobs:
         working-directory: installer
         run: python -m pip install -e ".[dev]"
 
+      - name: Shell-lint bundled scripts (bash -n)
+        run: |
+          bash -n installer/mv3dt_installer/assets/scripts/10_setup_mosquitto.sh
+          bash -n installer/mv3dt_installer/assets/scripts/60_record_tracking.sh
+          bash -n installer/mv3dt_installer/assets/scripts/lib/common.sh
+          echo "bundled scripts parse OK"
+
       - name: Run pytest
         working-directory: installer
         run: python -m pytest tests/ -v
