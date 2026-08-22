@@ -53,21 +53,20 @@ Re-runs are resumable via `/var/lib/mv3dt-laptop-bootstrap.state`.
 | # | Script | Notion § | Purpose | Disposition |
 |---|--------|----------|---------|-------------|
 | 00 | [`scripts/00_bootstrap.sh`](scripts/00_bootstrap.sh) | §4–§5 + §6 + §8.2 + §9.3 | Phased full stack + `laptop.env` + PeopleNet | developer-only — superseded by STEP-1 / STEP-2 |
-| 10 | [`scripts/10_setup_mosquitto.sh`](scripts/10_setup_mosquitto.sh) | §6 | Install `mv3dt.conf` into `/etc/mosquitto/conf.d/`, enable service | **bundled** — `assets/scripts/` copy is authoritative |
+| 10 | [`scripts/10_setup_mosquitto.sh`](scripts/10_setup_mosquitto.sh) | §6 | Install `mv3dt.conf` into `/etc/mosquitto/conf.d/`, enable service | **bundled (PLANNED)** — `assets/scripts/` copy is meant to be authoritative once U12 (`feat/installer-bundled-scripts`) merges |
 | 20 | [`scripts/20_verify_cameras.sh`](scripts/20_verify_cameras.sh) | §7.5 | Ping + `ffprobe` C1..C8, print pass/fail table | **dropped** — `ffprobe` check ported to `cameras.py` |
 | 30 | [`scripts/30_start_amc.sh`](scripts/30_start_amc.sh) | §8.3–8.5 | Clone AMC into `$HOME/auto-magic-calib/`, `docker compose up -d`, open UI | developer-only — superseded by STEP-3 |
 | — | _human_ | §8.6 | AMC 6-step workflow in the browser | unchanged — still manual under the binary |
 | 40 | [`scripts/40_export_watcher.sh`](scripts/40_export_watcher.sh) | §8.7 | Ingest AMC exports, render pipeline config | developer-only — superseded by the STEP-4 auto-ingest |
 | 50 | [`scripts/50_start_pipeline.sh`](scripts/50_start_pipeline.sh) | §10.1–10.2 | Start mosquitto, source DS env, launch `deepstream-app` | developer-only — superseded by the STEP-5 per-project exe |
-| 60 | [`scripts/60_record_tracking.sh`](scripts/60_record_tracking.sh) | §10.2 extension | Record `mv3dt/#` to `tracks.jsonl` / `tracks.csv` / `summary.json` | **bundled** — `assets/scripts/` copy is authoritative |
+| 60 | [`scripts/60_record_tracking.sh`](scripts/60_record_tracking.sh) | §10.2 extension | Record `mv3dt/#` to `tracks.jsonl` / `tracks.csv` / `summary.json` | **bundled (PLANNED)** — `assets/scripts/` copy is meant to be authoritative once U12 (`feat/installer-bundled-scripts`) merges |
 | 70 | [`scripts/70_plot_floorplan.py`](scripts/70_plot_floorplan.py) | sponsor artifact | Plot recorded trajectories to a PNG | **dropped** — the web app visualizes |
 | 99 | [`scripts/99_stop_all.sh`](scripts/99_stop_all.sh) | — | Stop deepstream-app, AMC compose, mosquitto | developer-only — superseded by the STEP-5 per-project exe |
 
 The unnumbered `record_cameras_mp4.sh` and `view_cameras.sh` capture helpers
-are likewise **dropped** from the binary and retained as developer tools. For
-the two bundled scripts, edit the copy under
-`installer/mv3dt_installer/assets/scripts/` when changing what the binary
-does — see
+are likewise **dropped** from the binary and retained as developer tools. Once
+U12 lands, edit the copy under `installer/mv3dt_installer/assets/scripts/`
+when changing what the binary does — see
 [`DELETION-REVIEW.md` §8.1](../installer/plan/DELETION-REVIEW.md#81-which-copy-do-i-edit).
 
 ## Layout
