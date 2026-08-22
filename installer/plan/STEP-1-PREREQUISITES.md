@@ -193,7 +193,7 @@ requirement. Keep the two straight:
 
 Step 1 does not re-implement the broker setup in Python. It runs the bundled
 script, staged as a **tree** so `source "$SCRIPT_DIR/lib/common.sh"` resolves
-([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-bundled-assets-at-runtime)):
+([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-and-staging-bundled-assets-at-runtime)):
 
 ```python
 args = ["--non-interactive"] if ctx.non_interactive else []
@@ -396,7 +396,7 @@ using the NVIDIA **local-repo `.deb`** (an older `cuda-drivers-590` pin); Step
 is the ruling constraint. Only the `.run` path is documented.
 
 The `.run` file is a bundled asset located via `ctx.asset_path(...)`
-([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-bundled-assets-at-runtime))
+([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-and-staging-bundled-assets-at-runtime))
 or, if too large to bundle, surfaced as a `USER_ACTION_REQUIRED` download from
 NVIDIA's driver download search (<https://www.nvidia.com/en-us/drivers/>) for
 driver `595.58.03` — resolve the exact `driver/details/<id>` URL for that
@@ -491,7 +491,7 @@ Against the protocol in
 - Executes the §5 order for the current stage. Bundled bash fragments (apt
   transactions, nouveau blacklist, the `.run` invocation) are shelled out via
   `ctx.run_root(...)` after being located with `ctx.asset_path(...)`
-  ([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-bundled-assets-at-runtime)).
+  ([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-and-staging-bundled-assets-at-runtime)).
 - The Mosquitto broker is installed through the bundled script
   ([§3.2](#32-mosquitto-broker)) rather than open-coded apt/systemctl calls.
 - Every dependency touched is reported with `report_installed` /

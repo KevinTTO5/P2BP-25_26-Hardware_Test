@@ -676,7 +676,7 @@ Implements the `Step` protocol
 1. Create `<install_dir>/webapp/` and `<install_dir>/run/`, chowned to the
    invoking user.
 2. Install `mv3dt-uploader.service` and `mv3dt-reporter.service` from bundled
-   assets ([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-bundled-assets-at-runtime)),
+   assets ([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-and-staging-bundled-assets-at-runtime)),
    `systemctl daemon-reload`, then `systemctl enable --now` both — mirroring
    the flow in [`STEP-6` §A.4](STEP-6-REMOTE-SUPERVISION.md#a4-installer-integration-mirror-installsh).
 3. Report each unit via the framework reporters
