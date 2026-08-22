@@ -253,10 +253,10 @@ operator's only artifact is the file attached to a GitHub Release (§5).
 | Dry-run triggers | `pull_request` touching `installer/**` (builds, uploads a 7-day artifact, never publishes); `workflow_dispatch` with a `draft` input |
 | Runner | **`ubuntu-24.04`, pinned — never `ubuntu-latest`** |
 | Version gate | Fails the build unless `"v" + mv3dt_installer.__version__` equals `$GITHUB_REF_NAME` |
-| Build command | `pyinstaller installer/installer.spec --distpath installer/dist --workpath /tmp/mv3dt-build --clean --noconfirm` |
+| Build command | `pyinstaller installer/installer.spec --distpath dist --workpath /tmp/mv3dt-build --clean --noconfirm` |
 | Smoke test | As the unprivileged runner user: `--version` contains the tag's version and `--status` exits 0 |
 | Release assets | `mv3dt-installer` and `mv3dt-installer.sha256` |
-| Publish command | `gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag installer/dist/mv3dt-installer installer/dist/mv3dt-installer.sha256` |
+| Publish command | `gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag dist/mv3dt-installer dist/mv3dt-installer.sha256` |
 
 **Why the runner is pinned (LOCKED).** PyInstaller `--onefile` links its
 bootloader against the **build host's glibc**. A binary built on a newer
@@ -288,12 +288,16 @@ renders (§3.3). No workflow ever writes a tracked file.
   - [`laptop/mosquitto/mv3dt.conf`](../../laptop/mosquitto/mv3dt.conf)
   - [`laptop/config/cameras.yml`](../../laptop/config/cameras.yml) →
     `assets/cameras/cameras.yml`, the seed inventory §15 reads
-- `--onefile` → one executable at `installer/dist/mv3dt-installer`. The
-  output directory is `installer/dist` in CI and in a local build alike: it is
-  the path `installer.spec`'s own build header documents, and the one
-  `installer/.gitignore`'s `dist/` rule already covers. A developer copying
-  either the workflow's command or the spec header gets the same file in the
-  same place.
+- `--onefile` → one executable at `dist/mv3dt-installer`. The build step
+  passes `--distpath dist` with no `working-directory` override, so the
+  output directory is `dist` at the **repo root**, not under `installer/`.
+  (`installer.spec`'s own build-header comment still says `installer/dist`;
+  that comment is stale against the actual workflow and is not fixed here —
+  it lives in a different plan unit's file.) The repo-root `dist/` is not
+  covered by any `.gitignore` rule today: `installer/.gitignore`'s `dist/`
+  line is scoped to the `installer/` subtree and only ignores
+  `installer/dist/`. A developer running the build command locally from the
+  repo root gets the same `dist/mv3dt-installer` the workflow does.
 - No hidden GUI toolkits and no third-party parsers on the hot path: the
   camera inventory reader in `cameras.py` is hand-rolled rather than pulling
   in PyYAML, so the frozen binary gains no hidden-import surface. Keep the dep
