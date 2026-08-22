@@ -4,7 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mv3dt-installer"
-version = "0.1.0"
+# The version is read from mv3dt_installer.__version__ (see
+# [tool.setuptools.dynamic] below) instead of being restated here. That
+# module attribute is the single source of truth: the release workflow
+# gates on "v" + __version__ == the pushed tag, so a hardcoded copy in this
+# file would be one more place to forget to bump and one more way to ship a
+# binary whose --version disagrees with its release.
+dynamic = ["version"]
 description = "Single self-contained installer for the DeepStream 9.1 / AutoMagicCalib MV3DT workstation stack."
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
@@ -31,6 +37,12 @@ dev = [
 # (doc 00 §4.1), and a pip-installed `mv3dt-installer` console script would
 # shadow/conflate with that binary's name on operator PATHs. Local dev runs
 # via `python -m mv3dt_installer` instead, once __main__.py lands.
+
+# Resolves `dynamic = ["version"]` above. setuptools reads the attribute
+# out of mv3dt_installer/__init__.py without importing the package, so this
+# stays cheap and works even before the dependencies are installed.
+[tool.setuptools.dynamic]
+version = { attr = "mv3dt_installer.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["mv3dt_installer*"]
