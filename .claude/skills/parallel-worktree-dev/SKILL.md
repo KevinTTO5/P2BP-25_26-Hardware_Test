@@ -1,6 +1,6 @@
 ---
 name: parallel-worktree-dev
-description: Use whenever a development task in this repo is big enough to split into more than one independently reviewable piece of work — implementing a spec/design doc (e.g. installer/plan/*.md), building out a multi-file feature, or any request to "parallelize this with agents," "build this out," "implement this doc/spec," or "use worktrees for this." Decomposes the work into a dependency-ordered set of units, builds each in its own isolated git worktree/branch, opens one real PR per unit, has a fresh-context agent review and iterate on each PR until approved, then hands the user one consolidated summary before anything merges. Actual merging is deliberately never done by this skill — it hands off to the paired /merge-prs command so merge order stays an explicit, caller-given decision. This is the standing "how we build things here" workflow: it exists so every non-trivial change in this repo leaves the same kind of PR-based paper trail, not a one-off procedure for a single task. Not needed for single-file or single-line changes — the worktree/PR/review overhead isn't worth it below that size.
+description: Use whenever a development task in this repo is big enough to split into more than one independently reviewable piece of work — implementing a spec/design doc (e.g. installer/plan/*.md), building out a multi-file feature, or any request to "parallelize this with agents," "build this out," "implement this doc/spec," or "use worktrees for this." Decomposes the work into a dependency-ordered set of units, builds each in its own isolated git worktree/branch, opens one real PR per unit, has a fresh-context agent review and iterate on each PR until approved, then hands the user one consolidated summary before anything merges. Actual merging is deliberately never done by this skill — it hands off to the paired /merge-prs command so merge order stays an explicit, caller-given decision. This is the standing "how we build things here" workflow: it exists so every non-trivial change in this repo leaves the same kind of PR-based paper trail, not a one-off procedure for a single task. Not needed for single-file or single-line changes — the worktree/PR/review overhead isn't worth it below that size. Also use when *authoring* a plan, design, or spec doc for this repo, before any code exists: this skill defines the unit and wave decomposition table every such doc must end with, which is exactly the decomposition the execution path above consumes.
 ---
 
 # Parallel worktree development
@@ -149,6 +149,50 @@ summarize → stop. Merging is a separate, explicit step owned by
      that goes to the user — don't have the reviewer unilaterally
      approve just to stop looping, and don't have the implementer give up
      and merge anyway (it can't; merging isn't available to either agent).
+
+## Plan docs must carry their own decomposition
+
+This applies when you are *writing* a plan, design, or spec doc for this
+repo rather than executing one. The doc is the handoff artifact step 3
+consumes, so it has to arrive in the shape step 3 expects.
+
+1. **End the doc with a decomposition table** — every plan, design, or
+   spec doc written for this repo ends with one, placed after the design
+   content and immediately before its `## References` section. Exactly
+   these columns, in this order:
+   `Unit | Branch | Files touched | Depends on | Wave`.
+
+2. **One row equals one independently reviewable PR.** Split any row
+   whose "Files touched" spans unrelated concerns. Merge any row too
+   small to review on its own into the neighboring row it belongs with.
+   The test is the same one step 3 applies: could a reviewer with only
+   the spec and `gh pr diff` judge this row on its own merits?
+
+3. **Name branches to the repo convention** — `feat/installer-*`, one
+   branch per row, matching the unit's scope closely enough that the
+   branch name alone says what the PR does.
+
+4. **Make the wave column a real topological ordering.** Wave 1 rows
+   depend on nothing else in the batch; a wave *N* row depends only on
+   rows in waves earlier than *N*. Read the table top to bottom and
+   confirm no row's "Depends on" points at its own wave or a later one.
+
+5. **Name the true serialization points in prose beneath the table** —
+   shared files, cutover ordering, anything that forces a merge sequence.
+   The "Depends on" column records *that* an edge exists; the prose says
+   *why*, which is what the caller needs to pick a merge order later.
+
+6. **Never put two concurrently-open PRs on the same file.** Two rows
+   listing the same path in "Files touched" is a conflict the batch will
+   hit at merge time, not a scheduling detail. Where the design genuinely
+   forces it, the table serializes those rows into different waves and
+   the prose beneath states the reason.
+
+7. **A conforming table is consumed verbatim.** Step 3 says that if the
+   caller already supplied a decomposition, use it as given instead of
+   re-deriving one — the table above *is* that shape. A plan doc that
+   follows this section is read straight into step 4's wave loop, with
+   only the sanity-check against the spec that step 3 already requires.
 
 ## Before starting
 

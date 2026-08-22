@@ -1,0 +1,20 @@
+# Template for /etc/systemd/system/mv3dt-ingest-@SLUG@.path
+#
+# Rendered by mv3dt_installer.systemd.render_ingest_units(). Placeholders are
+# at-sign-delimited markers substituted at render time -- deliberately NOT a
+# systemd template unit with %i, because the watched export directory is an
+# absolute path under the invoking user's home, and instance-name path escaping
+# is exactly the cleverness STEP-6 section B.1 already weighed and rejected.
+#
+# This is the only half of the pair that is ever `systemctl enable`d; the paired
+# .service is Type=oneshot and owned by this unit's lifecycle.
+[Unit]
+Description=Watch MV3DT calibration exports for project @PROJECT@ and trigger ingest
+
+[Path]
+PathChanged=@EXPORT_DIR@
+PathModified=@EXPORT_DIR@
+Unit=mv3dt-ingest-@SLUG@.service
+
+[Install]
+WantedBy=multi-user.target

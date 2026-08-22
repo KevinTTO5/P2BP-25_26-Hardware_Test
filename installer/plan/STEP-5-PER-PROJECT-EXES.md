@@ -39,6 +39,16 @@ and (d) exposes the reusable **AMC exe** flows for new/existing projects.
 
 - `<install_dir>/bin/pipeline-<slug>` — the project-named DeepStream pipeline
   exe ([§3](#3-the-project-named-deepstream-exe)).
+- `<install_dir>/bin/record-<slug>` — the project-named **tracking recorder**
+  exe, and the sole owner of the bundled `60_record_tracking.sh`. It is
+  generated in the same wrapper form as `pipeline-<slug>`
+  ([§3.2](#32-generation-approach-locked-thin-generated-wrapper)) and runs the
+  bundled script through the installer binary, passing the project's
+  `LOCATION_ID` and writing under `<install_dir>/tracking_exports/`. The
+  operator runs `record-<slug>`; they never type the script's name, and the
+  script itself is never on any documented operator path. The artifacts it
+  produces (`tracks.jsonl`, `tracks.csv`, `summary.json`) are what
+  [`STEP-7` §E.1](STEP-7-WEBAPP-INTEGRATION.md#e1-what-gets-uploaded) uploads.
 - `<install_dir>/projects/registry.json` — the project registry
   ([§4](#4-the-project-registry)), plus a per-project entry dir
   `<install_dir>/projects/<slug>/`.
@@ -88,8 +98,9 @@ What next?
 
 ### 2.2 Path C — close
 
-- Print the "how to start later" summary (the exe path, the `amc` exe path,
-  and the stop command from [§3.4](#34-stopping-the-pipeline)) and return
+- Print the "how to start later" summary (the pipeline exe path, the
+  `record-<slug>` recorder path, the `amc` exe path, and the stop command from
+  [§3.4](#34-stopping-the-pipeline)) and return
   `StepResult(status=COMPLETE, ...)`. The dispatch loop then prints the
   final success banner (framework §6.3 `all_complete()`).
 
@@ -164,17 +175,32 @@ resolving the config from the registry rather than the repo tree:
 2. **Ensure Mosquitto is up** — idempotent `systemctl start mosquitto`
    (port `ensure_mosquitto()` from `50_start_pipeline.sh` lines 112–132),
    using `ctx.run_root` for the privileged start.
-3. **Ping-sweep the cameras** — read the camera list from the project's
-   `cameras.yml` (the successor to
-   [`laptop/config/cameras.yml`](../../laptop/config/cameras.yml)) and ping
-   each enabled entry; warn on misses, do not block (port lines 137–196).
+3. **Ping-sweep the cameras** — read the discovered inventory named by
+   **`CAMERAS_FILE`** in `installer.conf`
+   ([`00` §11.2](00-FRAMEWORK-AND-BOOTSTRAP.md#112-persistence--sharing-with-later-steps))
+   and ping each enabled entry; warn on misses, do not block (port lines
+   137–196). The inventory is produced by camera discovery
+   ([`00` §15](00-FRAMEWORK-AND-BOOTSTRAP.md#15-camera-discovery)); the
+   `pipeline` subcommand never reads
+   [`laptop/config/cameras.yml`](../../laptop/config/cameras.yml) and never
+   compiles in a path. If `CAMERAS_FILE` is unset or missing, the sweep is
+   skipped with a warning pointing at the discovery scan — a stale inventory
+   must not block a pipeline start.
 
-   > **Partial port (flagged).** Only the ping sweep is ported. The
-   > `ffprobe`-over-RTSP stream check and the pass/fail table in
-   > [`20_verify_cameras.sh`](../../laptop/scripts/20_verify_cameras.sh) have
-   > no equivalent in any step, so that script stays load-bearing for genuine
-   > pre-flight camera verification — a ping proves the host is up, not that it
-   > serves a decodable RTSP stream. Tracked in
+   > **RESOLVED — the RTSP check is not orphaned; it moved into `cameras.py`.**
+   > The ping sweep here is deliberately shallow, and the distinction this note
+   > has always drawn still holds: *a ping proves the host is up, not that it
+   > serves a decodable RTSP stream.* What changed is where that stronger check
+   > lives. The `ffprobe`-over-RTSP probe from
+   > [`20_verify_cameras.sh`](../../laptop/scripts/20_verify_cameras.sh) is
+   > ported into the camera discovery module
+   > ([`00` §15](00-FRAMEWORK-AND-BOOTSTRAP.md#15-camera-discovery)), which
+   > probes every discovered camera and records the result as a `stream_ok`
+   > field on its inventory entry. The pass/fail table becomes that field plus
+   > the scan record, read back from `CAMERAS_FILE` — so the guarantee is
+   > preserved by a module the installer calls, not by a script an operator
+   > has to remember to run. `20_verify_cameras.sh` is therefore no longer
+   > load-bearing; it is retained in git as a developer tool. Closes gap 2 in
    > [`DELETION-REVIEW` §6](DELETION-REVIEW.md#6-coverage-gaps-this-triage-exposed).
 4. **Source the DeepStream env** — `. /etc/profile.d/deepstream.sh` (written
    by Step 2) so `deepstream-app` and `DEEPSTREAM_DIR` are in the environment
@@ -511,7 +537,14 @@ Repo files referenced (ported/reused by this step):
 - [`laptop/scripts/99_stop_all.sh`](../../laptop/scripts/99_stop_all.sh)
   — teardown logic ported into the `--stop` / `--stop-all` modes (§3.4).
 - [`laptop/config/cameras.yml`](../../laptop/config/cameras.yml)
-  — camera list format the ping-sweep consumes.
+  — camera inventory format; the ping sweep consumes the **generated**
+  inventory named by `CAMERAS_FILE`, not this committed file (§3.3).
+- [`laptop/scripts/60_record_tracking.sh`](../../laptop/scripts/60_record_tracking.sh)
+  — the tracking recorder bundled into the installer binary and owned by the
+  generated `record-<slug>` exe (§1.2).
+- [`laptop/scripts/20_verify_cameras.sh`](../../laptop/scripts/20_verify_cameras.sh)
+  — origin of the `ffprobe`-over-RTSP check, now carried by the camera
+  discovery module's `stream_ok` probe (§3.3).
 - [`laptop/docs/SCRIPTED-WORKFLOW.md`](../../laptop/docs/SCRIPTED-WORKFLOW.md)
   — §10 startup sequence and §10.2 validation helpers (§6).
 
@@ -528,7 +561,9 @@ Repo files referenced (ported/reused by this step):
 - Project **removal** is handled by the AMC-GUI-driven reconciliation check in
   [§5.4](#54-project-removal-amc-gui-driven--reconciliation-check).
 - **Per-camera network/RTSP configuration** — the pipeline only consumes the
-  resulting `cameras.yml`; camera web-UI setup stays manual (framework §13).
+  inventory at `CAMERAS_FILE`; camera activation, OSD-disable, and stream
+  profile stay manual (framework §13). Finding the cameras is **not** manual:
+  that is [`00` §15](00-FRAMEWORK-AND-BOOTSTRAP.md#15-camera-discovery).
 - **Alternate detectors** — PeopleNet-only, matching the DS 9.1 MV3DT
   reference; `yolo11n` remains future work (framework §13).
 - **Shipping per-project artifacts to the web app** — the tracking exports,

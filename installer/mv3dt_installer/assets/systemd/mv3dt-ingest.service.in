@@ -1,0 +1,27 @@
+# Template for /etc/systemd/system/mv3dt-ingest-@SLUG@.service
+#
+# Rendered by mv3dt_installer.systemd.render_ingest_units(). See the paired
+# mv3dt-ingest.path.in for why at-sign-delimited markers are used instead of a
+# systemd template unit with %i.
+#
+# Type=oneshot: this unit makes a single ingest pass and exits. It is triggered
+# by mv3dt-ingest-@SLUG@.path and must never be enabled itself -- enabling both
+# halves makes the boot-time state race the path unit.
+#
+# Every marker inside ExecStart= is double-quoted. systemd word-splits
+# ExecStart=, and PROJECT_NAME is free-form operator text from the AMC GUI
+# (STEP-5 section 3.1, whose own worked example is "North Lobby #2"), so an
+# unquoted --project marker would deliver only the first word plus a stray
+# positional argument, failing every trigger for such a project. STEP-5
+# section 3.2's generated wrapper quotes it for the same reason. The [Path]
+# settings and ConditionPathIsDirectory= are left unquoted because systemd does
+# not word-split path-valued settings. A literal percent sign in any
+# interpolated value arrives already doubled, since every directive here
+# expands systemd specifiers.
+[Unit]
+Description=Ingest MV3DT calibration exports for project @PROJECT@
+ConditionPathIsDirectory=@EXPORT_DIR@
+
+[Service]
+Type=oneshot
+ExecStart="@INSTALLER_BIN@" ingest --project "@PROJECT@" --non-interactive --install-dir "@INSTALL_DIR@"

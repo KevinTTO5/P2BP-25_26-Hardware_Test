@@ -427,15 +427,22 @@ workstation's output visible in the web app without an operator copying files.
 
 ### E.1 What gets uploaded
 
-| Producer | Artifact | Suggested remote prefix |
-|---|---|---|
-| [`60_record_tracking.sh`](../../laptop/scripts/60_record_tracking.sh) | `tracks.jsonl`, `tracks.csv`, `summary.json` | `/vision/tracks-raw` |
-| [`70_plot_floorplan.py`](../../laptop/scripts/70_plot_floorplan.py) | floor-plan trajectory PNGs | `/vision/plots` |
-| [`record_cameras_mp4.sh`](../../laptop/scripts/record_cameras_mp4.sh) | per-camera MP4 clips | `/vision/clips` |
-| [`STEP-4`](STEP-4-CALIB-OUTPUT-WIRING.md) | the ingested AMC calibration export | `/vision/calibration/<LOCATION_ID>` |
+| Producer | Artifact | Watch directory | Suggested remote prefix |
+|---|---|---|---|
+| the bundled `60_record_tracking.sh`, run through `<install_dir>/bin/record-<slug>` ([`STEP-5` §1.2](STEP-5-PER-PROJECT-EXES.md#12-outputs-what-step-5-writes)) | `tracks.jsonl`, `tracks.csv`, `summary.json` | `<install_dir>/tracking_exports/` | `/vision/tracks-raw` |
+| [`STEP-4`](STEP-4-CALIB-OUTPUT-WIRING.md) | the ingested AMC calibration export | the chosen calibration dir | `/vision/calibration/<LOCATION_ID>` |
 
 Watch directories and their remote prefixes are configuration, not constants —
 read them from `installer.conf` so a deployment can retarget without a rebuild.
+
+> **Visualizations are the web app's job (product decision).** Floor-plan
+> trajectory plots and per-camera MP4 clips are **not** produced by the
+> installer and have no upload rows: `70_plot_floorplan.py` and
+> `record_cameras_mp4.sh` are not bundled into the binary, and nothing on the
+> workstation renders them. The web app renders its own visualizations from the
+> uploaded `tracks.jsonl` / `tracks.csv`, which keeps a matplotlib dependency
+> out of the release build. Both scripts remain in `laptop/scripts/` as
+> developer tools.
 
 ### E.2 Dedupe and upload state
 
@@ -669,7 +676,7 @@ Implements the `Step` protocol
 1. Create `<install_dir>/webapp/` and `<install_dir>/run/`, chowned to the
    invoking user.
 2. Install `mv3dt-uploader.service` and `mv3dt-reporter.service` from bundled
-   assets ([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-bundled-assets-at-runtime)),
+   assets ([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-and-staging-bundled-assets-at-runtime)),
    `systemctl daemon-reload`, then `systemctl enable --now` both — mirroring
    the flow in [`STEP-6` §A.4](STEP-6-REMOTE-SUPERVISION.md#a4-installer-integration-mirror-installsh).
 3. Report each unit via the framework reporters
@@ -791,10 +798,12 @@ Repo files referenced:
   the precedent for flagging credential provisioning.
 - [`DELETION-REVIEW.md`](DELETION-REVIEW.md) — §3.2 lists the five behaviors
   this document must capture before the source files are removed.
-- [`laptop/scripts/60_record_tracking.sh`](../../laptop/scripts/60_record_tracking.sh),
-  [`70_plot_floorplan.py`](../../laptop/scripts/70_plot_floorplan.py),
-  [`record_cameras_mp4.sh`](../../laptop/scripts/record_cameras_mp4.sh) — the
-  artifact producers in [§E.1](#e1-what-gets-uploaded).
+- [`laptop/scripts/60_record_tracking.sh`](../../laptop/scripts/60_record_tracking.sh)
+  — the sole script-based artifact producer in
+  [§E.1](#e1-what-gets-uploaded); bundled into the installer binary and driven
+  by the generated `record-<slug>` exe
+  ([`STEP-5` §1.2](STEP-5-PER-PROJECT-EXES.md#12-outputs-what-step-5-writes)),
+  writing into `<install_dir>/tracking_exports/`.
 
 > **Attribution — sources no longer in this fork.** [§B](#b-signed-url-upload)
 > ports `scripts/cloud_storage_media.py`; [§C](#c-the-dto-contract) ports
