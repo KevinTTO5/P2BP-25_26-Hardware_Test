@@ -24,20 +24,36 @@ prefilled"); `--non-interactive` uses the default silently.
 `installer.conf` also carries the two §3.4 opt-in step-gate keys
 (`MV3DT_REMOTE_SUPERVISION`, `MV3DT_WEBAPP_INTEGRATION`). The *first* time
 `load()` ever writes a fresh `installer.conf` (i.e. the key is not already
-present in the file), each gate is seeded from the like-named environment
-variable if one is set, else `"off"`. This closes the loop with
-`bootstrap.sh` §5.1 step 5, which decides whether to capture the web-app
-credential based on `MV3DT_WEBAPP_INTEGRATION` in its own environment and
-then `exec sudo -E`'s into the built binary -- without this seed step, that
-env var would never reach the persisted gate `app.py`'s dispatch loop
-actually reads, and Step 7 would stay auto-skipped regardless of what the
-operator did at bootstrap time. Once a gate is persisted, later runs never
-re-consult the environment for it -- same "capture once, then just read
-back" discipline as the NGC/webapp credentials (§10, §14) -- so an
-operator's env var doesn't silently flip an already-chosen value out from
-under them. `load()` parses both into the returned `Config` so a later
-module (`app.py`) can gate Steps 6/7 without re-implementing KEY=VALUE
-parsing.
+present in the file), each gate is seeded through four tiers, in order:
+
+    1. `gate_overrides[key]`  -- the matching CLI flag doc 00 §3.4's own
+       table promises for every gate (`--remote-supervision`,
+       `--webapp-integration`, parsed by `app.build_parser()` with
+       `default=None` so "not passed" stays distinguishable from an
+       explicit `off`).
+    2. `os.environ.get(key)`  -- the like-named environment variable, so
+       `sudo -E ./mv3dt-installer MV3DT_WEBAPP_INTEGRATION=on ...` keeps
+       working for anyone scripting an unattended run.
+    3. An interactive prompt (`prompt`, injectable) listing the allowed
+       values with `"off"` prefilled. Skipped entirely under
+       `non_interactive`.
+    4. `GATE_DEFAULTS[key]` -- `"off"`, which is also what
+       `--non-interactive` yields when neither flag nor env var was given
+       (doc 00 §3.4: an unattended run never blocks on a human and never
+       opts itself into a gated step).
+
+Once a gate is persisted, later runs never re-consult the environment or
+the prompt for it -- same "capture once, then just read back" discipline as
+the NGC/webapp credentials (§10, §14) -- so an operator's env var doesn't
+silently flip an already-chosen value out from under them. The *flag* is
+the one deliberate exception: passing `--webapp-integration on` against an
+already-persisted `off` overwrites it and logs the change, because
+otherwise there would be no way to turn a gate on after the first run
+except by hand-editing `installer.conf`, which is exactly the "the
+operator types a thing" failure mode the design rules out.
+
+`load()` parses both gates into the returned `Config` so a later module
+(`app.py`) can gate Steps 6/7 without re-implementing KEY=VALUE parsing.
 
 Only `install_dir` itself is created by this module. The subdirectories
 under it (`secrets/`, `bin/`, `deepstream/`, `projects/`, `agent/`,
@@ -49,9 +65,17 @@ Public API:
     GATE_REMOTE_SUPERVISION / GATE_WEBAPP_INTEGRATION -- the §3.4 key names.
     GATE_KEYS            -- both key names, in table order.
     GATE_DEFAULTS         -- {key: "off"} for both.
+    GATE_CHOICES          -- {key: allowed values}, in doc 00 §3.4's table
+        order. `app.build_parser()` reads these straight into its argparse
+        `choices=`, so the flag and the prompt can never disagree about
+        what a gate accepts.
+    GATE_FLAGS            -- {key: the CLI flag that overrides it}, used
+        only to name the source in the "flag overrode a persisted value"
+        log line.
     Config                -- dataclass: install_dir, remote_supervision,
         webapp_integration, values (full parsed KEY=VALUE dict).
-    load(install_dir_override, state, non_interactive, ...) -> Config
+    load(install_dir_override, state, non_interactive, ...,
+        gate_overrides=None) -> Config
 """
 
 from __future__ import annotations
@@ -61,6 +85,7 @@ import pathlib
 from dataclasses import dataclass, field
 from typing import Callable
 
+from mv3dt_installer.logs import log
 from mv3dt_installer.state import DEFAULT_INSTALL_DIR, StateMachine
 
 __all__ = [
@@ -69,6 +94,8 @@ __all__ = [
     "GATE_WEBAPP_INTEGRATION",
     "GATE_KEYS",
     "GATE_DEFAULTS",
+    "GATE_CHOICES",
+    "GATE_FLAGS",
     "Config",
     "load",
 ]
@@ -84,6 +111,26 @@ GATE_KEYS: tuple[str, ...] = (GATE_REMOTE_SUPERVISION, GATE_WEBAPP_INTEGRATION)
 GATE_DEFAULTS: dict[str, str] = {
     GATE_REMOTE_SUPERVISION: "off",
     GATE_WEBAPP_INTEGRATION: "off",
+}
+
+# Allowed values per gate, in doc 00 §3.4's table order. Step 6's remote
+# supervision is three-valued; Step 7's web-app integration is binary. Note
+# that "off" is the uniform skip indicator across both, which is why
+# `app._gate_is_off()` tests for it by name rather than for "not on".
+# `app.build_parser()` feeds these tuples straight into argparse's
+# `choices=`, and `_prompt_for_gate()` below lists them in its prompt, so
+# there is exactly one place to change if a gate ever grows a value.
+GATE_CHOICES: dict[str, tuple[str, ...]] = {
+    GATE_REMOTE_SUPERVISION: ("off", "local", "remote"),
+    GATE_WEBAPP_INTEGRATION: ("off", "on"),
+}
+
+# The CLI flag that overrides each gate (doc 00 §3.4: "a matching CLI
+# flag"). Used only to name the source in the log line emitted when a flag
+# overwrites an already-persisted value; `app.py` owns the argparse wiring.
+GATE_FLAGS: dict[str, str] = {
+    GATE_REMOTE_SUPERVISION: "--remote-supervision",
+    GATE_WEBAPP_INTEGRATION: "--webapp-integration",
 }
 
 # installer.conf also records the resolved install_dir under this key
@@ -184,6 +231,98 @@ def _prompt_for_install_dir(
     return pathlib.Path(answer).expanduser() if answer else default
 
 
+def _prompt_for_gate(key: str, prompt: Callable[[str], str]) -> str:
+    """Tier 3 of the §3.4 gate seeding chain: ask the operator once, with
+    the allowed values listed and `"off"` prefilled.
+
+    An empty answer accepts the prefilled default, matching
+    `_prompt_for_install_dir()`'s convention. An answer outside
+    `GATE_CHOICES[key]` is rejected with a one-line explanation and the
+    question is asked again rather than silently coerced, because a typo
+    here decides whether a whole step ever runs. Answers are compared
+    case-insensitively and stored lowercase so `installer.conf` only ever
+    holds the canonical spelling the dispatch loop compares against.
+    """
+    choices = GATE_CHOICES[key]
+    default = GATE_DEFAULTS[key]
+    question = f"{key} ({'/'.join(choices)}) [{default}]: "
+    while True:
+        answer = prompt(question).strip().lower()
+        if not answer:
+            return default
+        if answer in choices:
+            return answer
+        log.warn(
+            f"{key}: {answer!r} is not one of {', '.join(choices)}; "
+            "please answer again"
+        )
+
+
+def _seed_gate(
+    key: str,
+    *,
+    gate_overrides: dict[str, str],
+    non_interactive: bool,
+    prompt: Callable[[str], str],
+) -> str:
+    """Resolve a gate's value for the *first* write of `installer.conf`.
+
+    Four tiers, in the order the module docstring documents: CLI flag, then
+    the like-named environment variable, then an interactive prompt, then
+    `"off"`. `--non-interactive` skips only tier 3, so an unattended run
+    with neither flag nor env var lands on `"off"` without ever blocking on
+    a human (doc 00 §3.4).
+    """
+    override = gate_overrides.get(key)
+    if override:
+        return override
+
+    env_value = os.environ.get(key)
+    if env_value:
+        return env_value
+
+    if not non_interactive:
+        return _prompt_for_gate(key, prompt)
+
+    return GATE_DEFAULTS[key]
+
+
+def _resolve_gates(
+    values: dict[str, str],
+    *,
+    gate_overrides: dict[str, str],
+    non_interactive: bool,
+    prompt: Callable[[str], str],
+) -> None:
+    """Fill in / update the two §3.4 gate keys of an already-parsed
+    `installer.conf` map, in place.
+
+    A key absent from the file is being written for the first time and goes
+    through `_seed_gate()`'s four tiers. A key already present is read
+    straight back -- the "capture once, then just read back" discipline --
+    with exactly one exception: an explicit CLI flag overwrites it and logs
+    the change, since otherwise the only way to turn a gate on after the
+    first run would be to hand-edit `installer.conf`.
+    """
+    for key in GATE_KEYS:
+        if key not in values:
+            values[key] = _seed_gate(
+                key,
+                gate_overrides=gate_overrides,
+                non_interactive=non_interactive,
+                prompt=prompt,
+            )
+            continue
+
+        override = gate_overrides.get(key)
+        if override and override != values[key]:
+            log.info(
+                f"{key}: {values[key]} -> {override} "
+                f"(overridden by {GATE_FLAGS[key]})"
+            )
+            values[key] = override
+
+
 def _sync_state(state: StateMachine, resolved: pathlib.Path) -> None:
     """Write `resolved` into state.json's install_dir field (doc 00 §11.2)
     whenever it wasn't already recorded there -- i.e. state.json didn't
@@ -202,6 +341,7 @@ def load(
     *,
     default_install_dir: str | os.PathLike[str] = DEFAULT_INSTALL_DIR,
     prompt: Callable[[str], str] = input,
+    gate_overrides: dict[str, str] | None = None,
 ) -> Config:
     """Resolve the install directory, persist it, and return the parsed
     `installer.conf` config (doc 00 §11, §3.4).
@@ -217,7 +357,16 @@ def load(
             this; it exists so tests can exercise the "installer.conf
             default" precedence tier without touching the real
             `/opt/mv3dt`.
-        prompt: injectable stand-in for `input()`, for testability.
+        prompt: injectable stand-in for `input()`, for testability. Used
+            both for the §11.1 install-dir question and for the §3.4 gate
+            questions.
+        gate_overrides: `{gate key: value}` from the matching CLI flags
+            (`--remote-supervision`, `--webapp-integration`). Only keys the
+            operator actually passed appear here -- `app.py` builds the map
+            from arguments whose argparse default is `None`, so an explicit
+            `--webapp-integration off` is distinguishable from the flag
+            being omitted, and only the former overwrites a persisted
+            value.
 
     Side effects: creates `install_dir` if missing, reads-or-writes
     `installer.conf` under it, and -- when a new path was just resolved --
@@ -234,16 +383,12 @@ def load(
 
     conf_path = resolved / CONF_FILENAME
     values = _read_conf(conf_path)
-    for key, default_value in GATE_DEFAULTS.items():
-        if key not in values:
-            # First time this key is ever written: seed from the
-            # like-named env var if bootstrap.sh (or the operator) set one,
-            # else fall back to the hardcoded default. See the module
-            # docstring's "opt-in step gates" paragraph for why this exists
-            # -- it's what lets bootstrap.sh's MV3DT_WEBAPP_INTEGRATION=on
-            # actually reach the persisted gate app.py's dispatch loop
-            # reads, instead of silently defaulting to "off" forever.
-            values[key] = os.environ.get(key) or default_value
+    _resolve_gates(
+        values,
+        gate_overrides=gate_overrides or {},
+        non_interactive=non_interactive,
+        prompt=prompt,
+    )
     values[_INSTALL_DIR_KEY] = str(resolved)
     _write_conf(conf_path, values)
 

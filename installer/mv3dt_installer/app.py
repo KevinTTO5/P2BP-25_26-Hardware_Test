@@ -57,7 +57,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from mv3dt_installer import __version__
+from mv3dt_installer import __version__, build_stamp
 from mv3dt_installer import config as config_mod
 from mv3dt_installer import ngc as ngc_mod
 from mv3dt_installer import privilege
@@ -152,6 +152,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the transcript directory (doc 00 §8.2).",
     )
+    # doc 00 §3.4's gate table promises "a matching CLI flag" for each
+    # opt-in gate. Both default to None rather than to "off" on purpose:
+    # config.load() must be able to tell "the operator did not pass this"
+    # (fall through to env var, then prompt, then "off") from "the operator
+    # explicitly passed off" (which overwrites an already-persisted value).
+    # Collapsing the two would make every run silently reassert "off" over
+    # whatever the operator had previously chosen.
+    parser.add_argument(
+        "--remote-supervision",
+        choices=config_mod.GATE_CHOICES[config_mod.GATE_REMOTE_SUPERVISION],
+        default=None,
+        help="Set the Step 6 remote-supervision gate "
+        "(MV3DT_REMOTE_SUPERVISION in installer.conf, doc 00 §3.4). "
+        "Overrides an already-persisted value.",
+    )
+    parser.add_argument(
+        "--webapp-integration",
+        choices=config_mod.GATE_CHOICES[config_mod.GATE_WEBAPP_INTEGRATION],
+        default=None,
+        help="Set the Step 7 web-app-integration gate "
+        "(MV3DT_WEBAPP_INTEGRATION in installer.conf, doc 00 §3.4). "
+        "Overrides an already-persisted value.",
+    )
     parser.add_argument(
         "--version",
         action="version",
@@ -161,8 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
         # than via argparse's %(prog)s so the banner reads the same however
         # the installer was invoked, which matters when an operator pastes
         # it into a bug report.
-        version=f"mv3dt-installer {__version__}"
-        + __import__("mv3dt_installer").build_stamp(),
+        version=f"mv3dt-installer {__version__}{build_stamp()}",
     )
     return parser
 
@@ -307,6 +329,33 @@ _GATE_ORDER_TO_CONF_ATTR: dict[int, str] = {
     6: "remote_supervision",
     7: "webapp_integration",
 }
+
+# Maps each installer.conf gate key to the argparse destination its
+# matching flag parses into. The dests happen to equal the `Config`
+# attribute names above, but they are listed separately because they are
+# two different contracts: one is argparse's, the other is `config.py`'s.
+_GATE_KEY_TO_ARG_DEST: dict[str, str] = {
+    config_mod.GATE_REMOTE_SUPERVISION: "remote_supervision",
+    config_mod.GATE_WEBAPP_INTEGRATION: "webapp_integration",
+}
+
+
+def _gate_overrides_from_args(args: argparse.Namespace) -> dict[str, str]:
+    """Collect the §3.4 gate flags the operator actually passed, keyed by
+    their `installer.conf` key, for `config.load(gate_overrides=...)`.
+
+    Flags that were not passed parse to `None` and are omitted entirely
+    rather than mapped to `"off"` -- `config.load()` distinguishes "absent"
+    (fall through to env var / prompt / default) from "explicitly off"
+    (overwrite whatever is persisted), and that distinction only survives
+    if it is preserved here.
+    """
+    overrides: dict[str, str] = {}
+    for key, dest in _GATE_KEY_TO_ARG_DEST.items():
+        value = getattr(args, dest, None)
+        if value is not None:
+            overrides[key] = value
+    return overrides
 
 
 def _gate_value_for_step(step: Step, cfg: config_mod.Config) -> Optional[str]:
@@ -553,7 +602,10 @@ def main(
     # exists at this point, so config.load() gets a real one to check
     # state.json's install_dir precedence tier against (doc 00 §11.2).
     cfg = config_mod.load(
-        args.install_dir, sm, non_interactive=args.non_interactive
+        args.install_dir,
+        sm,
+        non_interactive=args.non_interactive,
+        gate_overrides=_gate_overrides_from_args(args),
     )
 
     log_dir = pathlib.Path(args.log_dir) if args.log_dir else None

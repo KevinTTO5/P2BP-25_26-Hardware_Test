@@ -22,6 +22,23 @@ from mv3dt_installer import config  # noqa: E402
 from mv3dt_installer.state import StateMachine  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _force_no_colour(monkeypatch):
+    """Match test_logs.py / test_privilege.py's convention. `config.load()`
+    now logs (the "flag overrode a persisted gate" line), so the assertions
+    below must see plain, un-escaped stderr."""
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_transcript_state():
+    from mv3dt_installer import logs
+
+    logs._transcript_path = None
+    yield
+    logs._transcript_path = None
+
+
 def _state(tmp_path: Path) -> StateMachine:
     """A StateMachine pointed at an isolated state.json under tmp_path."""
     return StateMachine(path=tmp_path / "var" / "state.json")
@@ -30,6 +47,23 @@ def _state(tmp_path: Path) -> StateMachine:
 def _refuse_prompt(_msg: str) -> str:
     """Stand-in for input() that fails the test if load() ever prompts."""
     raise AssertionError("load() prompted interactively when it should not have")
+
+
+def _scripted_prompt(*answers: str):
+    """A prompt returning `answers` in order, recording every question it
+    was asked. Raises rather than blocking if load() asks more questions
+    than the test scripted."""
+    remaining = list(answers)
+    asked: list[str] = []
+
+    def _prompt(msg: str) -> str:
+        asked.append(msg)
+        if not remaining:
+            raise AssertionError(f"unscripted prompt: {msg!r}")
+        return remaining.pop(0)
+
+    _prompt.asked = asked  # type: ignore[attr-defined]
+    return _prompt
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +201,13 @@ def test_interactive_prompts_when_nothing_else_resolved(tmp_path):
 
     def _fake_prompt(msg: str) -> str:
         prompts_seen.append(msg)
-        assert str(default_dir) in msg  # prefilled with the default
-        return str(chosen_dir)
+        # A fresh install also asks the two §3.4 gate questions through
+        # this same injected prompt; only the install-dir one is under
+        # test here, so the gate questions take their prefilled default.
+        if msg.startswith("Install directory"):
+            assert str(default_dir) in msg  # prefilled with the default
+            return str(chosen_dir)
+        return ""
 
     cfg = config.load(
         None,
@@ -289,6 +328,343 @@ def test_gate_keys_env_var_does_not_override_already_persisted_value(
 
 
 # ---------------------------------------------------------------------------
+# §3.4 gate seeding precedence: flag > env var > prompt > "off"
+# ---------------------------------------------------------------------------
+
+
+def test_gate_flag_seeds_first_write(tmp_path):
+    """Tier 1 in isolation: the CLI flag with no env var and no prompt."""
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+
+    cfg = config.load(
+        str(install_dir),
+        sm,
+        non_interactive=True,
+        gate_overrides={
+            config.GATE_REMOTE_SUPERVISION: "remote",
+            config.GATE_WEBAPP_INTEGRATION: "on",
+        },
+    )
+
+    assert cfg.remote_supervision == "remote"
+    assert cfg.webapp_integration == "on"
+
+    conf_text = (install_dir / config.CONF_FILENAME).read_text(encoding="utf-8")
+    assert "MV3DT_REMOTE_SUPERVISION=remote" in conf_text
+    assert "MV3DT_WEBAPP_INTEGRATION=on" in conf_text
+
+
+def test_gate_flag_wins_over_env_var_and_prompt(tmp_path, monkeypatch):
+    """Tiers 1, 2 and 3 in combination: the flag outranks both, and the
+    prompt is never reached for a gate the flag already answered."""
+    monkeypatch.setenv("MV3DT_WEBAPP_INTEGRATION", "on")
+    monkeypatch.setenv("MV3DT_REMOTE_SUPERVISION", "local")
+
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+
+    cfg = config.load(
+        str(install_dir),
+        sm,
+        non_interactive=False,
+        prompt=_refuse_prompt,
+        gate_overrides={
+            config.GATE_REMOTE_SUPERVISION: "remote",
+            config.GATE_WEBAPP_INTEGRATION: "off",
+        },
+    )
+
+    assert cfg.remote_supervision == "remote"
+    assert cfg.webapp_integration == "off"
+
+
+def test_gate_env_var_wins_over_prompt(tmp_path, monkeypatch):
+    """Tier 2 outranks tier 3, which is what keeps `sudo -E` working for
+    anyone scripting an otherwise-interactive run."""
+    monkeypatch.setenv("MV3DT_REMOTE_SUPERVISION", "local")
+    monkeypatch.setenv("MV3DT_WEBAPP_INTEGRATION", "on")
+
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+
+    cfg = config.load(
+        str(install_dir), sm, non_interactive=False, prompt=_refuse_prompt
+    )
+
+    assert cfg.remote_supervision == "local"
+    assert cfg.webapp_integration == "on"
+
+
+def test_gate_env_var_seeds_only_the_gate_it_names(tmp_path, monkeypatch):
+    """Tiers 2 and 3 side by side: one gate comes from the environment,
+    the other still falls through to the prompt."""
+    monkeypatch.setenv("MV3DT_WEBAPP_INTEGRATION", "on")
+    monkeypatch.delenv("MV3DT_REMOTE_SUPERVISION", raising=False)
+
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+    prompt = _scripted_prompt("remote")
+
+    cfg = config.load(
+        str(install_dir), sm, non_interactive=False, prompt=prompt
+    )
+
+    assert cfg.webapp_integration == "on"
+    assert cfg.remote_supervision == "remote"
+    # Exactly one question: the web-app gate never reached the prompt.
+    assert len(prompt.asked) == 1
+    assert prompt.asked[0].startswith("MV3DT_REMOTE_SUPERVISION")
+
+
+def test_gate_prompt_lists_choices_and_prefills_off(tmp_path, monkeypatch):
+    """Tier 3 in isolation, including the prompt's shape: every allowed
+    value is named and `off` is shown as the prefilled default."""
+    monkeypatch.delenv("MV3DT_REMOTE_SUPERVISION", raising=False)
+    monkeypatch.delenv("MV3DT_WEBAPP_INTEGRATION", raising=False)
+
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+    prompt = _scripted_prompt("local", "on")
+
+    cfg = config.load(
+        str(install_dir), sm, non_interactive=False, prompt=prompt
+    )
+
+    assert cfg.remote_supervision == "local"
+    assert cfg.webapp_integration == "on"
+
+    remote_question, webapp_question = prompt.asked
+    for value in config.GATE_CHOICES[config.GATE_REMOTE_SUPERVISION]:
+        assert value in remote_question
+    for value in config.GATE_CHOICES[config.GATE_WEBAPP_INTEGRATION]:
+        assert value in webapp_question
+    assert "[off]" in remote_question
+    assert "[off]" in webapp_question
+
+
+def test_gate_prompt_empty_answer_accepts_prefilled_off(tmp_path, monkeypatch):
+    monkeypatch.delenv("MV3DT_REMOTE_SUPERVISION", raising=False)
+    monkeypatch.delenv("MV3DT_WEBAPP_INTEGRATION", raising=False)
+
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+
+    cfg = config.load(
+        str(install_dir),
+        sm,
+        non_interactive=False,
+        prompt=_scripted_prompt("", ""),
+    )
+
+    assert cfg.remote_supervision == "off"
+    assert cfg.webapp_integration == "off"
+
+
+def test_gate_prompt_rejects_invalid_value_and_asks_again(
+    tmp_path, monkeypatch, capsys
+):
+    """A typo must not be silently coerced -- it decides whether a whole
+    step ever runs -- so the question is asked again."""
+    monkeypatch.delenv("MV3DT_REMOTE_SUPERVISION", raising=False)
+    monkeypatch.delenv("MV3DT_WEBAPP_INTEGRATION", raising=False)
+
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+    prompt = _scripted_prompt("yes-please", "local", "on")
+
+    cfg = config.load(
+        str(install_dir), sm, non_interactive=False, prompt=prompt
+    )
+
+    assert cfg.remote_supervision == "local"
+    assert cfg.webapp_integration == "on"
+    # Three questions for two gates: the rejected answer cost one re-ask.
+    assert len(prompt.asked) == 3
+    assert prompt.asked[0] == prompt.asked[1]
+    assert "yes-please" in capsys.readouterr().err
+
+
+def test_gate_prompt_answer_is_case_insensitive(tmp_path, monkeypatch):
+    monkeypatch.delenv("MV3DT_REMOTE_SUPERVISION", raising=False)
+    monkeypatch.delenv("MV3DT_WEBAPP_INTEGRATION", raising=False)
+
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+
+    cfg = config.load(
+        str(install_dir),
+        sm,
+        non_interactive=False,
+        prompt=_scripted_prompt("Remote", " ON "),
+    )
+
+    # Stored lowercase, so the dispatch loop's string comparisons hold.
+    assert cfg.remote_supervision == "remote"
+    assert cfg.webapp_integration == "on"
+
+
+def test_non_interactive_never_prompts_and_yields_off(tmp_path, monkeypatch):
+    """Tier 4 (doc 00 §3.4): `--non-interactive` with no flag and no env
+    var leaves an unset gate at `off` without ever blocking on a human."""
+    monkeypatch.delenv("MV3DT_REMOTE_SUPERVISION", raising=False)
+    monkeypatch.delenv("MV3DT_WEBAPP_INTEGRATION", raising=False)
+
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+
+    cfg = config.load(
+        str(install_dir), sm, non_interactive=True, prompt=_refuse_prompt
+    )
+
+    assert cfg.remote_supervision == "off"
+    assert cfg.webapp_integration == "off"
+
+
+# ---------------------------------------------------------------------------
+# §3.4 gates: flag overriding an already-persisted value
+# ---------------------------------------------------------------------------
+
+
+def test_gate_flag_overrides_persisted_value_and_logs_the_change(
+    tmp_path, capsys
+):
+    """Without this, the only way to turn a gate on after the first run
+    would be to hand-edit `installer.conf`."""
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+
+    first = config.load(str(install_dir), sm, non_interactive=True)
+    assert first.webapp_integration == "off"
+    capsys.readouterr()  # discard anything the first run emitted
+
+    second = config.load(
+        str(install_dir),
+        sm,
+        non_interactive=True,
+        gate_overrides={config.GATE_WEBAPP_INTEGRATION: "on"},
+    )
+
+    assert second.webapp_integration == "on"
+    # The other gate is untouched by a flag that does not name it.
+    assert second.remote_supervision == "off"
+
+    err = capsys.readouterr().err
+    assert "MV3DT_WEBAPP_INTEGRATION" in err
+    assert "off -> on" in err
+    assert "--webapp-integration" in err
+
+    # And the new value is what a third, flagless run reads back.
+    third = config.load(str(install_dir), sm, non_interactive=True)
+    assert third.webapp_integration == "on"
+
+
+def test_gate_flag_can_turn_a_persisted_gate_back_off(tmp_path):
+    """`--webapp-integration off` is an explicit instruction, not the
+    absence of one -- which is exactly why the flag defaults to None."""
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+
+    config.load(
+        str(install_dir),
+        sm,
+        non_interactive=True,
+        gate_overrides={config.GATE_WEBAPP_INTEGRATION: "on"},
+    )
+
+    cfg = config.load(
+        str(install_dir),
+        sm,
+        non_interactive=True,
+        gate_overrides={config.GATE_WEBAPP_INTEGRATION: "off"},
+    )
+
+    assert cfg.webapp_integration == "off"
+
+
+def test_gate_flag_matching_persisted_value_logs_nothing(tmp_path, capsys):
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+
+    config.load(
+        str(install_dir),
+        sm,
+        non_interactive=True,
+        gate_overrides={config.GATE_REMOTE_SUPERVISION: "local"},
+    )
+    capsys.readouterr()
+
+    cfg = config.load(
+        str(install_dir),
+        sm,
+        non_interactive=True,
+        gate_overrides={config.GATE_REMOTE_SUPERVISION: "local"},
+    )
+
+    assert cfg.remote_supervision == "local"
+    assert "MV3DT_REMOTE_SUPERVISION" not in capsys.readouterr().err
+
+
+def test_env_var_ignored_once_persisted_even_though_flag_is_not(
+    tmp_path, monkeypatch, capsys
+):
+    """The two tiers behave differently on a re-run on purpose: the env
+    var only ever seeds the first write, while the flag is an explicit
+    per-run instruction that overwrites."""
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+
+    config.load(str(install_dir), sm, non_interactive=True)
+
+    monkeypatch.setenv("MV3DT_WEBAPP_INTEGRATION", "on")
+    monkeypatch.setenv("MV3DT_REMOTE_SUPERVISION", "remote")
+    capsys.readouterr()
+
+    # Env var alone: ignored, the persisted "off" is read straight back.
+    from_env_only = config.load(str(install_dir), sm, non_interactive=True)
+    assert from_env_only.webapp_integration == "off"
+    assert from_env_only.remote_supervision == "off"
+
+    # Same env, plus the flag: the flag lands.
+    with_flag = config.load(
+        str(install_dir),
+        sm,
+        non_interactive=True,
+        gate_overrides={config.GATE_WEBAPP_INTEGRATION: "on"},
+    )
+    assert with_flag.webapp_integration == "on"
+    # The env var still did nothing for the gate no flag named.
+    assert with_flag.remote_supervision == "off"
+
+
+def test_gate_prompt_not_reached_for_an_already_persisted_gate(
+    tmp_path, monkeypatch
+):
+    """"Capture once, then just read back": a second interactive run must
+    not re-ask a question the operator has already answered."""
+    monkeypatch.delenv("MV3DT_REMOTE_SUPERVISION", raising=False)
+    monkeypatch.delenv("MV3DT_WEBAPP_INTEGRATION", raising=False)
+
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+
+    first = config.load(
+        str(install_dir),
+        sm,
+        non_interactive=False,
+        prompt=_scripted_prompt("local", "on"),
+    )
+    assert (first.remote_supervision, first.webapp_integration) == ("local", "on")
+
+    second = config.load(
+        None, sm, non_interactive=False, prompt=_refuse_prompt
+    )
+
+    assert second.remote_supervision == "local"
+    assert second.webapp_integration == "on"
+
+
+# ---------------------------------------------------------------------------
 # installer.conf shape
 # ---------------------------------------------------------------------------
 
@@ -306,3 +682,40 @@ def test_conf_file_is_plain_key_value_no_quoting(tmp_path):
         assert '"' not in line
         assert "'" not in line
         assert "=" in line
+
+
+def test_write_conf_sorts_keys_and_preserves_keys_config_does_not_own(tmp_path):
+    """`_write_conf` rewrites the whole file on every load, so a gate
+    override must not cost the file its stable ordering or the vars other
+    modules (ngc.py, webapp.py, cameras.py) park in it."""
+    sm = _state(tmp_path)
+    install_dir = tmp_path / "install"
+    install_dir.mkdir()
+    (install_dir / config.CONF_FILENAME).write_text(
+        "ZZZ_LAST_ALPHABETICALLY=z\n"
+        "MV3DT_WEBAPP_INTEGRATION=off\n"
+        "AAA_FIRST_ALPHABETICALLY=a\n",
+        encoding="utf-8",
+    )
+
+    cfg = config.load(
+        str(install_dir),
+        sm,
+        non_interactive=True,
+        gate_overrides={config.GATE_WEBAPP_INTEGRATION: "on"},
+    )
+
+    assert cfg.values["AAA_FIRST_ALPHABETICALLY"] == "a"
+    assert cfg.values["ZZZ_LAST_ALPHABETICALLY"] == "z"
+    assert cfg.webapp_integration == "on"
+
+    conf_text = (install_dir / config.CONF_FILENAME).read_text(encoding="utf-8")
+    keys = [
+        line.partition("=")[0]
+        for line in conf_text.splitlines()
+        if line and not line.startswith("#")
+    ]
+    assert keys == sorted(keys)
+    assert "AAA_FIRST_ALPHABETICALLY" in keys
+    assert "ZZZ_LAST_ALPHABETICALLY" in keys
+    assert "MV3DT_WEBAPP_INTEGRATION=on" in conf_text
