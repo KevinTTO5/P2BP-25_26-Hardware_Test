@@ -27,7 +27,8 @@ In scope (this step only):
 1. **Ingest** the AMC calibration/MV3DT export from the user's AMC project
    into the install tree — porting the logic in
    [`laptop/scripts/40_export_watcher.sh`](../../laptop/scripts/40_export_watcher.sh)
-   into a one-shot Python `run()` (watcher mode noted as an option, §4.4).
+   into a one-shot Python `run()`, preceded by an in-session wait for the
+   export (§4.4) and followed by the re-ingest path units (§4.5).
 2. **Prompt** (on success) for the calibration location using the
    framework path-prompt helper with a sensible default, and **persist** the
    chosen location.
@@ -49,20 +50,11 @@ Out of scope (deferred / other steps):
   (§7 handoff).
 - Running AMC or defining the AMC project — that is the human (Step 3 brings up
   the UI; the operator drives the 6-step workflow).
-- Mosquitto install/config — Step 4 only references `127.0.0.1:1883` to match
-  the local broker.
-
-  > **Open gap (flagged, not resolved).** No step currently owns Mosquitto
-  > installation. This bullet previously deferred it to "Step 1/2 bootstrap",
-  > but neither [`STEP-1`](STEP-1-PREREQUISITES.md) nor
-  > [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) installs it, while
-  > [`STEP-6` §E.1](STEP-6-REMOTE-SUPERVISION.md#e1-lifecycle) `preflight`
-  > **requires** a reachable broker and
-  > [`STEP-6` §D](STEP-6-REMOTE-SUPERVISION.md#d-security-remote-control-must-be-authenticated)
-  > **rewrites** its configuration. Until a step adopts it,
-  > [`10_setup_mosquitto.sh`](../../laptop/scripts/10_setup_mosquitto.sh) is
-  > load-bearing and must be run by hand. Tracked in
-  > [`DELETION-REVIEW` §6](DELETION-REVIEW.md#6-coverage-gaps-this-triage-exposed).
+- Mosquitto install/config — owned by
+  [`STEP-1` §3.2](STEP-1-PREREQUISITES.md#32-mosquitto-broker), which installs
+  the broker daemon and the `/etc/mosquitto/conf.d/mv3dt.conf` drop-in. Step 4
+  only references `127.0.0.1:1883` so the tracker config matches that
+  listener (§6.1); it never installs or reconfigures the broker.
 
 The tracker YAML schema is **settled** (see §6.1): Step 4 uses the repo's
 `SV3DT.calibrationDirectory` field and does not re-schematize to NVIDIA's
@@ -125,8 +117,14 @@ config at that directory. It does not parse or validate individual matrices
 
 ## 3. Preflight (`preflight(ctx)`)
 
-Cheap gating checks (framework §12.1). Returns `COMPLETE` (== "ok to run"),
-`USER_ACTION_REQUIRED`, or `FAILED`.
+Cheap gating checks (framework §12.1), with one deliberate exception: step 4
+below blocks on the AMC export via the wait helper, budgeted rather than
+open-ended (see [§4.4](#44-waiting-for-the-export-in-session)). Every other
+check here is a cheap read, matching §12.1's contract; the export wait is
+called out because it is the one place `preflight` deviates from "cheap" on
+purpose, and the deviation is bounded by `AMC_EXPORT_WAIT_S` so `TIMEOUT`
+means something concrete rather than "blocks forever." Returns `COMPLETE`
+(== "ok to run"), `USER_ACTION_REQUIRED`, or `FAILED`.
 
 1. **Step 3 complete.** If `state.status("step3_amc_launcher") != COMPLETE`,
    return `FAILED` with a message pointing at Step 3 (the framework halts
@@ -141,17 +139,20 @@ Cheap gating checks (framework §12.1). Returns `COMPLETE` (== "ok to run"),
    `30_start_amc.sh` first"), matching the `die` in `40_export_watcher.sh`.
 4. **Export exists (the key case).** Resolve
    `EXPORT_DIR = $AMC_ROOT/projects/$PROJECT_NAME/exports`. If it is missing or
-   empty, the human has not finished AMC's Results/Export yet — return
-   **`USER_ACTION_REQUIRED`** (§9 display) with actions:
-   - "Open the AMC UI (Step 3 left it running at `http://localhost:5000`)."
-   - "Complete the 6-step workflow through **Execute** and **Results /
-     Export**; on Results choose **MV3DT ZIP AMC** (or **MV3DT ZIP VGGT**)."
-   - "Confirm files appear under `$AMC_ROOT/projects/$PROJECT_NAME/exports/`."
-   - closing framework line: "Then run the installer again to continue."
-5. **Template present.** Confirm the committed
+   empty, the human has not finished AMC's Results/Export yet — **wait for it
+   in-session** rather than bailing out. The hint list, the poll, and the
+   outcome mapping are specified in [§4.4](#44-waiting-for-the-export-in-session);
+   `USER_ACTION_REQUIRED` is returned only on the give-up outcomes.
+5. **Template and camera inventory present.** Confirm the committed
    `deepstream_app_config.txt` and `config_tracker_NvMOT.yml` templates are
-   resolvable via `ctx.asset_path("deepstream", ...)` (framework §4.2) and that
-   `cameras.yml` is available; else `FAILED`.
+   resolvable via `ctx.asset_path("deepstream", ...)` (framework §4.2), and
+   that the camera inventory named by **`CAMERAS_FILE`** in `installer.conf`
+   exists and parses; else `FAILED`. `CAMERAS_FILE` is written by camera
+   discovery ([`00` §15](00-FRAMEWORK-AND-BOOTSTRAP.md#15-camera-discovery))
+   and is the **only** way Step 4 locates the inventory — never
+   `laptop/config/cameras.yml`, never a path compiled into the step. A missing
+   or unset `CAMERAS_FILE` is `USER_ACTION_REQUIRED` telling the operator to
+   run the discovery scan, not `FAILED`.
 
 `preflight` performs no writes.
 
@@ -198,7 +199,10 @@ Mirror `ingest_exports()` precisely:
    produced ("MV3DT ZIP AMC/VGGT"), unpack it into `<dest>` so the tracker sees
    a flat `camInfo`-style directory.
 3. If `EXPORT_DIR` is empty at this point, return `USER_ACTION_REQUIRED`
-   (§3 step 4) — nothing to ingest yet.
+   ([§4.4](#44-waiting-for-the-export-in-session)) — nothing to ingest yet.
+   This should not happen in the ordinary flow, since `preflight` already
+   waited for the export; it is a defensive re-check inside `run()`, not a
+   second, independent bailout.
 4. Append an ingest breadcrumb (`.ingest.log` with a UTC stamp), matching the
    script.
 
@@ -214,25 +218,122 @@ Re-running Step 4 is safe: the copy/unpack is a no-op overwrite into the same
 is `COMPLETE` (framework §6). Matches the "idempotent" contract in the
 `40_export_watcher.sh` header.
 
-### 4.4 One-shot vs watcher
+### 4.4 Waiting for the export (in-session)
 
-- **Installer context = one-shot.** Step 4 does the copy+render pass **once**
-  and returns (equivalent to `40_export_watcher.sh --oneshot`). The installer
-  must not block on a long-running `inotifywait` loop inside `run()`.
-- **Watcher option (noted, not default).** The long-running watch mode
-  (`inotifywait`, 5 s polling fallback) remains available as the standalone
-  `40_export_watcher.sh` for operators who want to iterate on AMC exports after
-  install. Step 4 may print a hint pointing at it. It is not invoked by the
-  installer flow.
+**LOCKED — the operator never types a command to run a script.** Step 4 waits
+for the AMC export in-session and continues by itself the moment the human
+finishes in the browser. This supersedes the earlier design, in which
+`preflight` bailed out with `USER_ACTION_REQUIRED` the instant the export
+directory was empty and the operator was told to run
+`40_export_watcher.sh` by hand.
 
-> **[`40_export_watcher.sh`](../../laptop/scripts/40_export_watcher.sh) is NOT
-> superseded — do not delete it when the installer ships.** Step 4 ports only
-> the *one-shot* ingest+render path; the watch mode above has no equivalent
-> anywhere in the installer, by design (the dispatch loop must not block on an
-> `inotifywait`, §4.4 above). Unlike the other numbered scripts, which the
-> installer replaces outright, this one survives the port. Recorded in
-> [`DELETION-REVIEW` §5](DELETION-REVIEW.md#5-retained-files-and-why) so it is
-> not removed on the assumption that Step 4 replaced it.
+`preflight` (§3 step 4) does **not** return `USER_ACTION_REQUIRED` on an empty
+export directory. Instead it:
+
+1. **Prints the AMC instructions once**, as a hint list — the same
+   `UserAction` shape the framework renders elsewhere
+   (framework §9.3), so the list is written once and reused verbatim below:
+   - "Open the AMC UI (Step 3 left it running at `http://localhost:5000`)."
+   - "Complete the 6-step workflow through **Execute** and **Results /
+     Export**; on Results choose **MV3DT ZIP AMC** (or **MV3DT ZIP VGGT**)."
+   - "Confirm files appear under `$AMC_ROOT/projects/$PROJECT_NAME/exports/`."
+2. **Blocks on the wait helper**, polling the export directory, budgeted by
+   **`AMC_EXPORT_WAIT_S`** (`ctx.conf` / `installer.conf`, default `3600`):
+
+   ```python
+   outcome = waitui.wait_until(
+       waitui.dir_has_files(export_dir),
+       description=f"Waiting for the AMC export for {project_name}",
+       hint_actions=hints,
+       timeout_s=ctx.conf.get("AMC_EXPORT_WAIT_S", 3600),
+       non_interactive=ctx.non_interactive,
+   )
+   ```
+
+3. **Maps the outcome** onto the step protocol:
+
+| `WaitOutcome` | Cause | Step 4 does |
+|---|---|---|
+| `SATISFIED` | files appeared in `EXPORT_DIR` | falls straight through to `run()` — the ingest proceeds with no further operator input |
+| `TIMEOUT` | `AMC_EXPORT_WAIT_S` (default 3600s / 1h) elapsed with no export | returns `USER_ACTION_REQUIRED` carrying the **same** hint list |
+| `CANCELLED` | the operator pressed Ctrl-C — "I'll finish this later" | returns `USER_ACTION_REQUIRED` carrying the same hint list |
+| `SKIPPED` | `--non-interactive`; an unattended run must never block on a human | returns `USER_ACTION_REQUIRED` carrying the same hint list |
+
+`AMC_EXPORT_WAIT_S` is an ordinary optional `installer.conf` value, sourced the
+same way as the required inputs in §3 step 2; an operator who expects AMC to
+take longer than an hour raises it there. It is not part of the "missing a
+required value" branch in §3 step 2 — it always has a default and preflight
+never blocks on its absence.
+
+The three give-up outcomes are indistinguishable to the operator: each prints
+the identical hint list and closes with the framework's contract phrase
+**"Then run the installer again to continue."** (framework §9.3). That
+preserves the pre-existing resume contract exactly — relaunching the installer
+re-enters Step 4, which re-enters the wait — while the `SATISFIED` path removes
+the relaunch entirely from the normal case.
+
+`run()` still performs the copy+render pass **once** and returns; the dispatch
+loop is never blocked by a long-running `inotifywait`. Continuous re-ingest
+after install is not `run()`'s job — it is the systemd path unit in
+[§4.5](#45-re-ingest-on-later-recalibrations-systemd-path-unit).
+
+> **[`40_export_watcher.sh`](../../laptop/scripts/40_export_watcher.sh) is
+> superseded operationally, and retained in git as a developer tool.** Its
+> one-shot ingest+render path is ported into `run()` (§4.2, §6); its watch mode
+> is replaced for operators by the two mechanisms above — the in-session wait
+> (§4.4) during install, and the `mv3dt-ingest-<slug>.path` unit
+> ([§4.5](#45-re-ingest-on-later-recalibrations-systemd-path-unit)) afterwards.
+> Neither requires the operator to type a script name. The script stays in
+> `laptop/scripts/` because it remains a convenient way for a **developer** to
+> iterate on AMC exports from a clone, not because any operator flow depends on
+> it. Recorded in
+> [`DELETION-REVIEW` §5](DELETION-REVIEW.md#5-retained-files-and-why).
+
+### 4.5 Re-ingest on later recalibrations (systemd path unit)
+
+After the **first successful ingest**, `run()` installs a pair of systemd units
+so that every later recalibration is picked up with no installer run at all:
+
+| Unit | Type | Role |
+|---|---|---|
+| `mv3dt-ingest-<slug>.path` | `path` | watches the project's `EXPORT_DIR` (`PathChanged=` / `PathModified=`) and triggers the service |
+| `mv3dt-ingest-<slug>.service` | `oneshot` | `ExecStart=<install_dir>/bin/mv3dt-installer ingest --project <slug>` — the same ingest+render pass as §4.2/§6 |
+
+`<slug>` is the sanitized project slug from
+[`STEP-5` §3.1](STEP-5-PER-PROJECT-EXES.md#31-naming-and-filename-sanitization),
+so the unit names line up with `pipeline-<slug>` and the registry.
+
+Rendering and installation go through the shared systemd helper, not
+open-coded `subprocess` calls — the same helper
+[`STEP-6` §A.4](STEP-6-REMOTE-SUPERVISION.md#a4-installer-integration-mirror-installsh)
+uses: render the templates, install into `/etc/systemd/system` (root-owned
+`0644`, content-idempotent so a no-change install reports
+`already installed`), `daemon-reload`, then enable.
+
+> **Carve-out (REQUIRED): enable only the `.path`.** The `.service` is
+> `Type=oneshot` and is owned by the path unit's lifecycle — the path unit
+> starts it on every trigger. Enabling both would additionally start the
+> oneshot at boot, racing the path unit's own trigger for the same export
+> directory. So Step 4 runs `systemctl enable --now mv3dt-ingest-<slug>.path`
+> and **never** enables `mv3dt-ingest-<slug>.service`. This is the same lesson
+> [`STEP-6` §A.4](STEP-6-REMOTE-SUPERVISION.md#a4-installer-integration-mirror-installsh)
+> records for its own unit pair.
+
+Two guards on installation:
+
+- **First successful ingest only.** The units are installed after `run()` has
+  ingested at least once, so a unit is never enabled against an export
+  directory that has never produced anything.
+- **`ExecStart` must exist.** The helper refuses to enable a unit whose
+  `ExecStart` binary is absent. `<install_dir>/bin/mv3dt-installer` is placed
+  by [`STEP-3` §6.1](STEP-3-AMC-LAUNCHER.md#61-relationship-to-the-installer-binary);
+  if it is missing, Step 4 reports the units as installed-but-not-enabled
+  rather than enabling a unit that would fail on every trigger.
+
+The `ingest --project <slug>` subcommand itself needs the framework's
+subcommand dispatch, which is flagged as owed in
+[`STEP-3` §6.2](STEP-3-AMC-LAUNCHER.md#62-framework-coordination-flagged) —
+Step 4 consumes that extension, it does not define it.
 
 ---
 
@@ -315,7 +416,7 @@ to `<install_dir>/deepstream/deepstream_app_config.rendered.txt`, reusing the
 | `${CAM_USER}` | camera RTSP user | `laptop.env` `CAM_USER` |
 | `${CAM_PASSWORD}` | camera RTSP password | `laptop.env` `CAM_PASSWORD` |
 | `${LOCATION_ID}` | site id (used in `[sink1] topic=mv3dt/${LOCATION_ID}/sv3d`) | `laptop.env` `LOCATION_ID` |
-| each `[sourceN] uri=` | `rtsp://<user>:<pass>@<ip>:554<rtsp_path>` | rewritten per enabled entry in [`cameras.yml`](../../laptop/config/cameras.yml), preserving YAML order (`rewrite_source_uris()`) |
+| each `[sourceN] uri=` | `rtsp://<user>:<pass>@<ip>:554<rtsp_path>` | rewritten per enabled entry in the inventory at `CAMERAS_FILE` ([`00` §15](00-FRAMEWORK-AND-BOOTSTRAP.md#15-camera-discovery)), preserving file order (`rewrite_source_uris()`) |
 
 Left **as-is** in the rendered file (these already point the pipeline at the
 tracker config, which is what carries the calibration dir — so the calibration
@@ -417,6 +518,11 @@ Checks:
 4. **Referenced siblings present.** `config_infer_primary.txt` and
    `msgconv_config.txt` exist alongside the rendered app config so relative
    references resolve.
+5. **Re-ingest units present** ([§4.5](#45-re-ingest-on-later-recalibrations-systemd-path-unit)).
+   Both unit files exist in `/etc/systemd/system`, `mv3dt-ingest-<slug>.path`
+   is enabled, and `mv3dt-ingest-<slug>.service` is **not** enabled. A missing
+   `<install_dir>/bin/mv3dt-installer` downgrades this to a reported warning
+   rather than a failure, matching the enable guard.
 
 `report()` prints a summary block: chosen calibration dir, number of calibration
 files ingested, exporter-vs-copy path used, and the rendered/patched file paths
@@ -424,9 +530,10 @@ files ingested, exporter-vs-copy path used, and the rendered/patched file paths
 
 ### 8.1 User-action / failure surfaces (framework §9.3)
 
-- **Export missing / empty** → `USER_ACTION_REQUIRED` (finish AMC Results /
-  Export first; §3 step 4). This is the primary "AMC not done yet" surface the
-  framework contract calls out.
+- **Export missing / empty** → the in-session wait
+  ([§4.4](#44-waiting-for-the-export-in-session)), which continues on its own
+  once the export lands. Only a timeout, a Ctrl-C, or `--non-interactive`
+  turns this into `USER_ACTION_REQUIRED`, and then with the same hint list.
 - **Poor calibration (bad RMSE)** → Step 4 cannot judge calibration quality
   itself, but if the ingest produced an obviously incomplete export (e.g. fewer
   camInfo files than enabled cameras), surface `USER_ACTION_REQUIRED`: "Re-run
@@ -434,8 +541,10 @@ files ingested, exporter-vs-copy path used, and the rendered/patched file paths
   rejected on the Results screen," then re-verify on next launch.
 - **Exporter present but failing** → logged warning, fall back to raw copy
   (§4.2); only `FAILED` if both exporter and copy yield nothing.
-- **Config parse/render error** (bad `cameras.yml`, missing template) →
-  `FAILED` with the offending path.
+- **Config parse/render error** (unparseable inventory at `CAMERAS_FILE`,
+  missing template) → `FAILED` with the offending path. An **unset or missing**
+  `CAMERAS_FILE` is `USER_ACTION_REQUIRED` instead (§3 step 5) — the operator
+  runs the camera scan, they do not hand-write an inventory.
 - No reboots are ever required by Step 4.
 
 ---
@@ -469,8 +578,11 @@ Repo files referenced:
 - [`laptop/config/laptop.env.example`](../../laptop/config/laptop.env.example)
   — `LOCATION_ID` / `PROJECT_NAME` / `AMC_ROOT` / `CAM_USER` / `CAM_PASSWORD`
   sourcing.
-- [`laptop/config/cameras.yml`](../../laptop/config/cameras.yml) — per-camera
-  RTSP URIs for `[sourceN]` rewrite.
+- [`laptop/config/cameras.yml`](../../laptop/config/cameras.yml) — the
+  committed fleet inventory whose header and pinned IPs seed the generated
+  runtime inventory; Step 4 reads the generated file via `CAMERAS_FILE`
+  ([`00` §15](00-FRAMEWORK-AND-BOOTSTRAP.md#15-camera-discovery)), not this
+  one.
 - [`laptop/docs/DEEPSTREAM-SETUP.md`](../../laptop/docs/DEEPSTREAM-SETUP.md)
   §8.6 (AMC workflow), §8.7 (export ingest), §9 (MV3DT layout / tracker YAML).
 - [`00-FRAMEWORK-AND-BOOTSTRAP.md`](00-FRAMEWORK-AND-BOOTSTRAP.md) — step
