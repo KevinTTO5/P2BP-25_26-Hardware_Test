@@ -169,6 +169,25 @@ def test_capture_credentials_non_interactive_missing_left_unset(monkeypatch):
     assert creds.endpoint is None
 
 
+def test_capture_credentials_passes_install_dir_through_to_load_credentials(
+    monkeypatch, tmp_path
+):
+    """The C9 bug: capture_credentials used to call a bare load_credentials()
+    and silently ignore --install-dir. It must now forward its install_dir
+    argument through unchanged."""
+    captured = {}
+
+    def _fake_load_credentials(install_dir=None):
+        captured["install_dir"] = install_dir
+        return None
+
+    monkeypatch.setattr(webapp, "load_credentials", _fake_load_credentials)
+
+    webapp.capture_credentials(non_interactive=True, install_dir=tmp_path / "custom")
+
+    assert captured["install_dir"] == tmp_path / "custom"
+
+
 # ---------------------------------------------------------------------------
 # 14.1/14.3 -- store_credentials
 # ---------------------------------------------------------------------------
@@ -322,6 +341,23 @@ def test_enabled_false_when_gate_on_but_credentials_missing(monkeypatch):
     monkeypatch.setattr(webapp, "load_credentials", lambda *a, **kw: None)
 
     assert webapp.enabled("on") is False
+
+
+def test_enabled_passes_install_dir_through_to_load_credentials(monkeypatch, tmp_path):
+    """The C9 bug, same as capture_credentials: enabled() used to call a
+    bare load_credentials() and silently ignore --install-dir."""
+    captured = {}
+
+    def _fake_load_credentials(install_dir=None):
+        captured["install_dir"] = install_dir
+        return webapp.Credentials(api_key="k", endpoint="https://e")
+
+    monkeypatch.setattr(webapp, "load_credentials", _fake_load_credentials)
+
+    result = webapp.enabled("on", install_dir=tmp_path / "custom")
+
+    assert result is True
+    assert captured["install_dir"] == tmp_path / "custom"
 
 
 # ---------------------------------------------------------------------------

@@ -152,16 +152,17 @@ have.
 | `--no-pause` | — | Skip the "press Enter" confirmations | shipped |
 | `--log-dir` | `PATH` | Override the transcript directory ([§6.2](#62-logs)) | shipped |
 | `--version` | — | Print the version and exit | shipped; the stamped form carrying tag, commit, and build timestamp is **planned**, arriving with the release job |
-| `--remote-supervision` | `off`, `local`, `remote` | Set the Step 6 gate ([`00` §3.4](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#34-opt-in-step-gates)) without being prompted; overrides an already-persisted value and logs the change | **planned** |
-| `--webapp-integration` | `off`, `on` | Set the Step 7 gate the same way | **planned** |
+| `--remote-supervision` | `off`, `local`, `remote` | Set the Step 6 gate ([`00` §3.4](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#34-opt-in-step-gates)) without being prompted; overrides an already-persisted value and logs the change | shipped |
+| `--webapp-integration` | `off`, `on` | Set the Step 7 gate the same way | shipped |
 | `--scan-cameras` | — | Discover the camera fleet, probe RTSP, run the one-time position binding, write the inventory, print the table, and exit; needs `sudo` for raw sockets | **planned** |
 
-**(planned)** Once the two gate flags exist, not passing one will differ from
-passing `off`: an unpassed flag leaves the value to the next tier of
-precedence — environment variable, then an interactive prompt, then `off` —
-while `--webapp-integration off` sets it explicitly. Today there is no gate
-flag at all, and a gate key absent from `installer.conf` is seeded from the
-like-named environment variable if one is set, else `off`.
+Not passing one of the two gate flags differs from passing `off` explicitly:
+an unpassed flag leaves the value to the next tier of precedence —
+environment variable, then an interactive prompt, then `off` — while
+`--webapp-integration off` sets it explicitly. A gate key already recorded
+in `installer.conf` is unaffected by the environment-variable tier and is
+only ever changed by a flag; a gate key absent from `installer.conf` is
+seeded from the like-named environment variable if one is set, else `off`.
 
 `--status` is deliberately allowed without `sudo`. It runs before the root
 check, performs no writes, and reads a world-readable `state.json`, so an
@@ -183,34 +184,30 @@ second launch is a bug, not the design.
    ([`00` §11.1](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#111-default-and-selection)).
    Blank accepts the default. Everything the installer owns lives under this
    directory, and the choice is recorded so later runs need no flag.
-2. **Remote supervision gate** (`off`, `local`, `remote`). **(planned)**
-   Prompted once with `off` prefilled. `off` skips Step 6 entirely — systemd
-   supervision and the MQTT control plane
-   ([`STEP-6`](plan/STEP-6-REMOTE-SUPERVISION.md)). Take the default unless
-   you have been told otherwise. Today this value is never prompted for; it
-   is seeded as described in [§4](#4-command-line-flags).
-3. **Web-app integration gate** (`off`, `on`). **(planned)** on the same
-   terms as prompt 2. `off` skips Step 7, the HTTP data plane
+2. **Remote supervision gate** (`off`, `local`, `remote`). Prompted once
+   with `off` prefilled if no flag or environment variable already answered
+   it. `off` skips Step 6 entirely — systemd supervision and the MQTT
+   control plane ([`STEP-6`](plan/STEP-6-REMOTE-SUPERVISION.md)). Take the
+   default unless you have been told otherwise.
+3. **Web-app integration gate** (`off`, `on`). Same terms as prompt 2. `off`
+   skips Step 7, the HTTP data plane
    ([`STEP-7`](plan/STEP-7-WEBAPP-INTEGRATION.md)).
-4. **NGC API key. (planned)** A secret prompt — nothing is echoed as you
-   type, and the key is never written to the transcript
+4. **NGC API key.** A secret prompt — nothing is echoed as you type, and the
+   key is never written to the transcript
    ([`00` §10.1](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#101-storage-contract)).
    **The key is required**: a blank answer re-prompts rather than being
    accepted, and under `--non-interactive` with no key available (no
    `NGC_API_KEY` in the environment) the run fails outright rather than
    proceeding without one
    ([`00` §10.2](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#102-capture--handoff-api-ngcpy)).
-   The capture code (`capture_key()`) and the storage code (`store_key()`,
-   which writes `NGC_API_KEY=<key>`) are both in the binary today; the
-   planned part is the onboarding call site that invokes them on launch and
-   the "already asked" check that keeps a second run from re-prompting.
-5. **Web-app credential. (planned)** Endpoint plus API key, and **only** if
-   you set the web-app gate to `on` in prompt 3. A blank endpoint writes
-   nothing and warns; Step 7 then surfaces its own USER-ACTION block on first
-   run
+   `onboarding.py` runs this on every launch; once `secrets/ngc.env` exists,
+   it is a silent no-op.
+5. **Web-app credential.** Endpoint plus API key, and **only** if you set
+   the web-app gate to `on` in prompt 3. A blank endpoint writes nothing and
+   warns; Step 7 then surfaces its own USER-ACTION block on first run
    ([`00` §14.3](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#143-capture--handoff-api-webapppy)).
-   Same status as prompt 4: the capture code is present, the call site is
-   planned.
+   Same "already asked" rule as prompt 4: once `secrets/webapp.env` exists,
+   `onboarding.py` never re-prompts.
 
 Under `--non-interactive` nothing is prompted. A gate already recorded in
 `installer.conf` keeps the value it has; a gate key absent from
@@ -287,8 +284,8 @@ directory `0700` and files `0600`
 
 | Path | Contents | Status |
 |---|---|---|
-| `<install_dir>/secrets/ngc.env` | `NGC_API_KEY=...` — the key is required, so a blank answer re-prompts rather than writing anything | **planned**: written once the [§5](#5-first-run-what-it-asks-for) capture is wired into launch |
-| `<install_dir>/secrets/webapp.env` | `API_KEY=...` and `ENDPOINT=...` | **planned**, same reason |
+| `<install_dir>/secrets/ngc.env` | `NGC_API_KEY=...` — the key is required, so a blank answer re-prompts rather than writing anything | shipped |
+| `<install_dir>/secrets/webapp.env` | `API_KEY=...` and `ENDPOINT=...`, only when the web-app gate is `on` | shipped |
 | `<install_dir>/installer.conf` | Non-secret `KEY=VALUE` config: the two gates, the resolved install directory, and the shared values later steps read | shipped |
 
 ---

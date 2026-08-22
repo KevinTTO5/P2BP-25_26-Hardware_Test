@@ -51,6 +51,26 @@ def _reset_transcript_state():
     logs._transcript_path = None
 
 
+def _bypass_onboarding(monkeypatch, tmp_path: Path) -> None:
+    """These tests exist to exercise app.py's own dispatch/config/reboot
+    logic end-to-end through `app.main()`, not onboarding's platform
+    preflight or NGC key capture (each has its own dedicated tests in
+    test_preflight.py / test_ngc.py / test_onboarding.py). Real platform
+    preflight would make these tests depend on the runner's actual OS/arch
+    and invoking user; a real NGC key prompt would hang or die under
+    `--non-interactive` with no key available. Bypass both the same way
+    `require_root` is already bypassed above.
+    """
+    monkeypatch.setattr(
+        app.onboarding,
+        "run_platform_preflight",
+        lambda: InvokingUser(
+            name="tester", home=tmp_path, uid=os.getuid(), gid=os.getgid()
+        ),
+    )
+    monkeypatch.setenv("NGC_API_KEY", "nvapi-test-key-do-not-use")
+
+
 # ---------------------------------------------------------------------------
 # Test double satisfying the `Step` protocol (doc 00 §12.1)
 # ---------------------------------------------------------------------------
@@ -280,6 +300,7 @@ def test_main_requires_root_for_non_status_flow(tmp_path):
 
 def test_reset_state_wipes_and_reinitializes(tmp_path, monkeypatch):
     monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
     monkeypatch.setattr(app, "STEP_REGISTRY", [])
 
     state_path = tmp_path / "var" / "state.json"
@@ -321,6 +342,7 @@ def test_reset_state_preserves_previously_chosen_install_dir(tmp_path, monkeypat
     is meant to clear step-completion status, not the install location.
     """
     monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
     monkeypatch.setattr(app, "STEP_REGISTRY", [])
 
     state_path = tmp_path / "var" / "state.json"
@@ -366,6 +388,7 @@ def test_reset_step_no_match_prints_message_and_exits_cleanly(
     tmp_path, monkeypatch, capsys
 ):
     monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
     monkeypatch.setattr(app, "STEP_REGISTRY", [])
 
     state_path = tmp_path / "var" / "state.json"
@@ -378,6 +401,7 @@ def test_reset_step_no_match_prints_message_and_exits_cleanly(
 
 def test_reset_step_match_clears_status(tmp_path, monkeypatch):
     monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
 
     state_path = tmp_path / "var" / "state.json"
     sm = StateMachine(path=state_path)
@@ -400,6 +424,7 @@ def test_reset_step_match_clears_status(tmp_path, monkeypatch):
 
 def test_main_config_precedence_reads_back_from_state_json(tmp_path, monkeypatch):
     monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
     monkeypatch.setattr(app, "STEP_REGISTRY", [])
 
     state_path = tmp_path / "var" / "state.json"
@@ -697,6 +722,7 @@ def _read_conf(install_dir: Path) -> dict[str, str]:
 
 def test_main_gate_flags_reach_installer_conf(tmp_path, monkeypatch):
     monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
     monkeypatch.setattr(app, "STEP_REGISTRY", [])
 
     install_dir = tmp_path / "install"
@@ -726,6 +752,7 @@ def test_main_without_gate_flags_leaves_unset_gates_off(tmp_path, monkeypatch):
     §3.4). The gate questions must never be asked, so `input` is patched to
     something that would fail loudly if they were."""
     monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
     monkeypatch.setattr(app, "STEP_REGISTRY", [])
     monkeypatch.delenv("MV3DT_REMOTE_SUPERVISION", raising=False)
     monkeypatch.delenv("MV3DT_WEBAPP_INTEGRATION", raising=False)
@@ -759,6 +786,7 @@ def test_main_gate_flag_flips_a_persisted_gate_on_a_later_run(
     persists `off`, and a later `--webapp-integration on` turns it on
     without the operator hand-editing `installer.conf`."""
     monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
     monkeypatch.setattr(app, "STEP_REGISTRY", [])
 
     install_dir = tmp_path / "install"
@@ -794,6 +822,7 @@ def test_main_gate_env_var_still_seeds_a_first_run(tmp_path, monkeypatch):
     """Tier 2 survives the loss of `bootstrap.sh`'s `exec sudo -E`: anyone
     scripting `sudo -E ./mv3dt-installer` keeps the behaviour they had."""
     monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
     monkeypatch.setattr(app, "STEP_REGISTRY", [])
     monkeypatch.setenv("MV3DT_WEBAPP_INTEGRATION", "on")
 
@@ -820,6 +849,7 @@ def test_main_gate_env_var_still_seeds_a_first_run(tmp_path, monkeypatch):
 
 def test_main_reboot_still_pending_blocks_dispatch(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
     monkeypatch.setattr(app, "STEP_REGISTRY", [])
 
     state_path = tmp_path / "state.json"
@@ -849,6 +879,7 @@ def test_main_reboot_still_pending_blocks_dispatch(tmp_path, monkeypatch, capsys
 
 def test_main_reboot_confirmed_advances_dispatch(tmp_path, monkeypatch):
     monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
     monkeypatch.setattr(app, "STEP_REGISTRY", [])
 
     state_path = tmp_path / "state.json"
