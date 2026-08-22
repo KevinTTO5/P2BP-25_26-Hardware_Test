@@ -8,9 +8,11 @@ framework contracts — those live in
 
 `mv3dt-installer` is a **single self-contained binary** that takes a bare
 Ubuntu 24.04 workstation to a working DeepStream 9.1 / AutoMagicCalib MV3DT
-setup. It is built once in CI and published as a GitHub Release asset, so the
-target machine downloads one file and runs it — it never builds anything and
-never needs a checkout of this repository.
+setup. **(planned)** It is meant to be built once in CI and published as a
+GitHub Release asset, so the target machine downloads one file and runs it —
+never building anything and never needing a checkout of this repository. See
+[§1](#1-what-this-binary-is) for how that compares to today's actual build
+model.
 
 This guide covers the operator path: where to get the binary, how to verify
 and run it, every flag it accepts, what the first run asks for, and where it
@@ -46,13 +48,19 @@ every run picks up where the last one stopped, re-runs nothing that already
 completed, and survives the reboots the driver/CUDA install requires. Running
 it a second time is always safe.
 
-> **LOCKED — you do not clone this repo on the workstation.** The Release
-> binary is the unit of delivery. There is no `git clone`, no `pip install`,
-> and no local build on the target machine; the binary carries its own assets
-> and unpacks them at runtime
-> ([`00` §4.2](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-bundled-assets-at-runtime)).
-> A checkout on a workstation is a sign something went wrong, not a
-> prerequisite.
+> **(planned) LOCKED — you do not clone this repo on the workstation.** The
+> Release binary is meant to be the unit of delivery, built once in CI, with
+> no `git clone`, no `pip install`, and no local build on the target
+> machine; the binary carries its own assets and unpacks them at runtime.
+> This is the target design, not what
+> [`00` §4](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#4-pyinstaller-packaging)
+> describes today: on `main`, §4.1 still has the binary built **during**
+> bootstrap, on the target machine, from a cloned copy of this repo, and
+> §4.2 says that clone is deliberately left in place afterward for
+> logs/debugging.
+> [`PR #31`](https://github.com/KevinTTO5/P2BP-25_26-Hardware_Test/pull/31)
+> is rewriting doc 00 to match the CI-build model this callout describes;
+> until it merges, treat this callout as forward-looking, not settled fact.
 
 ---
 
@@ -60,7 +68,7 @@ it a second time is always safe.
 
 | Requirement | Value | Why |
 |---|---|---|
-| OS | Ubuntu 24.04 LTS | The published binary is built against this release's glibc ([`00` §4.1](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#41-what-builds-the-binary)) |
+| OS | Ubuntu 24.04 LTS | **(planned)** The published binary is meant to be built once in CI against this release's glibc; on `main` today, [`00` §4.1](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#41-what-builds-the-binary) still describes the binary being built on the target machine itself during bootstrap, so pin to Ubuntu 24.04 either way |
 | Architecture | `x86_64` | The only architecture the release build targets |
 | Privilege | `sudo` from a real login user, not a bare root shell | Package installs and writes to `/etc/profile.d` and `/var/lib` ([`00` §9.1](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#91-privilege-handling)) |
 | GPU | NVIDIA, Ampere or newer | DeepStream 9.1 pins ([`laptop/docs/DEEPSTREAM-SETUP.md`](../laptop/docs/DEEPSTREAM-SETUP.md)) |
@@ -191,11 +199,16 @@ second launch is a bug, not the design.
    step needing NGC-gated content prints a USER-ACTION block with the
    sign-in-and-download instructions and re-verifies on the next launch
    ([`00` §10.3](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#103-manual-fallback)).
-   Blank is still recorded as an answer — the secret file is written either
-   way, carrying a fallback marker — so you are not asked again. The capture
-   and storage code is in the binary today; the planned part is the
-   onboarding call site that invokes it on launch and the file-existence
-   check that keeps it quiet afterwards.
+   **(planned)** Blank being treated as an already-answered question — so you
+   are not asked again on a later run — is itself part of what is still
+   unbuilt: today, a blank answer writes nothing to disk at all (there is no
+   marker or fallback variant of the secret file), so nothing yet
+   distinguishes "declined once" from "never asked." The capture code
+   (`capture_key()`) and the storage code (`store_key()`, which only ever
+   writes `NGC_API_KEY=<key>` and is never called on a blank answer) are both
+   in the binary today; the planned part is the onboarding call site that
+   invokes them on launch, and whatever mechanism it adds to keep a blank
+   answer quiet on later runs.
 5. **Web-app credential. (planned)** Endpoint plus API key, and **only** if
    you set the web-app gate to `on` in prompt 3. A blank endpoint writes
    nothing and warns; Step 7 then surfaces its own USER-ACTION block on first
@@ -204,9 +217,12 @@ second launch is a bug, not the design.
    Same status as prompt 4: the capture code is present, the call site is
    planned.
 
-Under `--non-interactive` nothing is prompted. A gate with no recorded value
-resolves to `off`; a gate already recorded in `installer.conf` keeps the
-value it has
+Under `--non-interactive` nothing is prompted. A gate already recorded in
+`installer.conf` keeps the value it has; a gate key absent from
+`installer.conf` is seeded from the like-named environment variable
+(`MV3DT_REMOTE_SUPERVISION` / `MV3DT_WEBAPP_INTEGRATION`) if one is set in
+the installer's own environment, else `off` — the same precedence
+[§4](#4-command-line-flags) describes
 ([`00` §3.4](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#34-opt-in-step-gates)). A
 required value that is missing fails the run rather than blocking on a human.
 
@@ -276,7 +292,7 @@ directory `0700` and files `0600`
 
 | Path | Contents | Status |
 |---|---|---|
-| `<install_dir>/secrets/ngc.env` | `NGC_API_KEY=...`, or the manual-fallback marker | **planned**: written once the [§5](#5-first-run-what-it-asks-for) capture is wired into launch |
+| `<install_dir>/secrets/ngc.env` | `NGC_API_KEY=...` — nothing is written on a blank/manual-fallback answer, today or as currently planned | **planned**: written once the [§5](#5-first-run-what-it-asks-for) capture is wired into launch |
 | `<install_dir>/secrets/webapp.env` | `API_KEY=...` and `ENDPOINT=...` | **planned**, same reason |
 | `<install_dir>/installer.conf` | Non-secret `KEY=VALUE` config: the two gates, the resolved install directory, and the shared values later steps read | shipped |
 
