@@ -324,6 +324,22 @@ def test_render_ingest_units_rejects_an_unquotable_install_dir():
     assert "install_dir" in str(excinfo.value)
 
 
+def test_render_ingest_units_rejects_an_unquotable_export_dir():
+    """A newline in `export_dir` would inject an extra directive line into the
+    rendered `.path`/`.service` units (e.g. a bogus `ExecStartPre=`) rather
+    than being carried as literal path text -- refuse it the same way
+    `project`, `install_dir`, and `installer_bin` are refused."""
+    with pytest.raises(ValueError) as excinfo:
+        systemd.render_ingest_units(
+            project="demo",
+            slug="demo",
+            export_dir="/exports/demo\nExecStartPre=/bin/rm -rf /",
+            install_dir="/opt/mv3dt",
+            installer_bin="/opt/mv3dt/bin/mv3dt-installer",
+        )
+    assert "export_dir" in str(excinfo.value)
+
+
 def test_render_ingest_units_accepts_path_objects():
     units = systemd.render_ingest_units(
         project="p",

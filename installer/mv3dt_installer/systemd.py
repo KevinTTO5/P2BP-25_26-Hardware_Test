@@ -164,6 +164,7 @@ def render_ingest_units(
     """
     for label, value in (
         ("project", project),
+        ("export_dir", export_dir),
         ("install_dir", install_dir),
         ("installer_bin", installer_bin),
     ):
