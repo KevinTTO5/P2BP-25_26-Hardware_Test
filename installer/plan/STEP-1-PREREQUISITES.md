@@ -196,7 +196,12 @@ script, staged as a **tree** so `source "$SCRIPT_DIR/lib/common.sh"` resolves
 ([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-bundled-assets-at-runtime)):
 
 ```python
-shellout.run_bundled_script("scripts", "10_setup_mosquitto.sh", tree=("scripts",))
+args = ["--non-interactive"] if ctx.non_interactive else []
+
+shellout.run_bundled_script(
+    "scripts", "10_setup_mosquitto.sh",
+    args=args, tree=("scripts",),
+)
 ```
 
 The script ships inside the release binary
@@ -205,44 +210,79 @@ so the operator never types a script name and no repo checkout is involved.
 Its stdout and stderr land in the transcript through the shared logger
 ([`00` §8.2](00-FRAMEWORK-AND-BOOTSTRAP.md#82-transcript-log-file)).
 
-What the script does, in order:
+**REQUIRED — `--non-interactive` must be forwarded on an unattended run.**
+The script calls `pause_for_config_review` after installing the drop-in,
+which prints the installed config and then, unless the script's own
+`NONINTERACTIVE` variable is `1`, blocks on `read -r -p "Press Enter to
+continue..." </dev/tty`. `NONINTERACTIVE` starts at `0` and is set to `1`
+only by the script's `--non-interactive` CLI flag — there is no environment
+variable it reads instead. So Step 1 must pass the flag itself, exactly the
+way `--with-firewall` is described just below (passed only when the operator
+asked for it, otherwise omitted): when `ctx.non_interactive` is set (the
+installer's own `--non-interactive`, framework §3.3), Step 1 appends
+`--non-interactive` to `args`; otherwise `args` is empty and the operator sees
+the review block and presses Enter, same as running the script by hand. A
+call that omits the flag under an unattended run would hang forever on the
+`read`, since nothing will ever answer it.
 
-1. **Packages**: `apt-get install -y --no-install-recommends mosquitto
-   mosquitto-clients libmosquitto1` when the broker is missing; a no-op when
-   it is already present.
-2. **Drop-in**: install the bundled `mv3dt.conf` to
-   `/etc/mosquitto/conf.d/mv3dt.conf` by atomic replace (write a temp file in
-   the destination directory, then `mv`), so a half-written config is never
-   visible to a restarting broker.
-3. **Service**: `systemctl enable mosquitto` then `systemctl restart
-   mosquitto`, and confirm with `systemctl is-active --quiet mosquitto`.
-4. **Firewall (optional, off by default)**: `--with-firewall` opens `1883/tcp`
+#### What the script actually does, in order
+
+Read against
+[`10_setup_mosquitto.sh`](../../laptop/scripts/10_setup_mosquitto.sh), which
+Step 1 runs unmodified — nothing about it is bundled-variant-specific.
+
+1. **Packages.** `dpkg -s mosquitto` gates the install. Missing → `apt-get
+   install -y --no-install-recommends libmosquitto1 mosquitto
+   mosquitto-clients`. Present → the apt call is skipped, and `libmosquitto1`
+   alone is installed if `dpkg -s` shows it absent.
+2. **Drop-in.** `install -d -m 0755 /etc/mosquitto/conf.d`, then `mktemp` in
+   the destination directory, `cp` the bundled `mv3dt.conf` in, `chmod 0644`,
+   `chown root:root`, and `mv -f` onto `/etc/mosquitto/conf.d/mv3dt.conf`. The
+   replace is atomic (a same-filesystem rename), so a half-written config is
+   never visible to a restarting broker. It is also **unconditional**: the
+   script never compares against the file already there, and rewrites
+   byte-identical content on every run.
+3. **Config review.** `pause_for_config_review` prints the destination path,
+   the config's purpose, its full contents, and the customisation hints, then
+   blocks on the terminal read unless suppressed as above.
+4. **Service.** `systemctl enable mosquitto`, `systemctl restart mosquitto`,
+   `sleep 1`, then `systemctl is-active --quiet mosquitto`. On failure it
+   prints `systemctl status --no-pager mosquitto` and `die`s, exiting non-zero.
+5. **Firewall (optional, off by default).** `--with-firewall` opens `1883/tcp`
    and `9001/tcp` via `ufw`. Step 1 does not pass it; the default posture
    assumes a workstation on a private segment.
 
-#### Idempotency and reporting
+#### What Step 1 adds on top of the script (REQUIRED)
 
-Re-running is safe: apt is skipped when the packages are present, the drop-in
-is compared before replacement, and `restart` is unconditional but cheap. Step
-1 reports the outcome with the §8.3 strings like any other dependency —
-`installed mosquitto version <dpkg version>` on first install,
-`already installed mosquitto version <dpkg version>` thereafter — and reports
-the drop-in itself as `installed mv3dt.conf version <sha256[:12]>` /
-`already installed mv3dt.conf version <sha256[:12]>` so config drift is
-visible in the transcript.
+The script emits **none** of the §8.3 reporting strings, and step 2 above
+makes no already-installed distinction a caller could consume — its own log
+lines are free-form and its drop-in rewrite is unconditional. Change detection
+and reporting are therefore **Step 1's** work, done in Python around the
+shell-out. Nothing here re-implements the install:
+
+| Fact Step 1 needs | How Step 1 obtains it | Reported as |
+|---|---|---|
+| broker newly installed vs already present | `dpkg -s mosquitto` **before** the shell-out; read the `Version:` field **after** it | `installed mosquitto version <ver>` / `already installed mosquitto version <ver>` |
+| drop-in changed vs unchanged | sha256 of `/etc/mosquitto/conf.d/mv3dt.conf` **before** the shell-out (absent counts as changed), compared against the sha256 of the bundled asset | `installed mv3dt.conf version <sha256[:12]>` / `already installed mv3dt.conf version <sha256[:12]>` |
+
+Both probes are taken before `run_bundled_script` is called, because after it
+runs the on-disk state is identical either way. A non-zero exit from the
+script is mapped to `FAILED` with the script's own output already in the
+transcript; Step 1 never returns `USER_ACTION_REQUIRED` for the broker, since
+there is no manual fallback to point the operator at.
+
+Re-running the step is safe: apt is skipped by the script's own `dpkg -s`
+gate, the drop-in rewrite is byte-identical, and `restart` is unconditional
+but cheap. Only the reported string differs between the first run and later
+ones.
 
 `verify()` (§7.3) treats the broker as a pass/fail check, not a pinned
 version: `systemctl is-active --quiet mosquitto` succeeds and
-`/etc/mosquitto/conf.d/mv3dt.conf` exists with the expected contents. Ubuntu
-24.04's `mosquitto` version is not pinned — nothing in the DS 9.1 docs or in
+`/etc/mosquitto/conf.d/mv3dt.conf` is byte-identical to the bundled asset.
+Ubuntu 24.04's `mosquitto` version is not pinned — nothing in the DS 9.1 docs or in
 [`mv3dt.conf`](../../laptop/mosquitto/mv3dt.conf) depends on a specific
 broker minor, so an equality pin here would create false failures with no
 corresponding benefit.
-
-Failure surface: apt failure or the broker refusing to start → `FAILED` with
-the `systemctl status mosquitto --no-pager` output in the transcript. Step 1
-never returns `USER_ACTION_REQUIRED` for the broker; there is no manual
-fallback to point the operator at.
 
 ---
 

@@ -117,8 +117,14 @@ config at that directory. It does not parse or validate individual matrices
 
 ## 3. Preflight (`preflight(ctx)`)
 
-Cheap gating checks (framework §12.1). Returns `COMPLETE` (== "ok to run"),
-`USER_ACTION_REQUIRED`, or `FAILED`.
+Cheap gating checks (framework §12.1), with one deliberate exception: step 4
+below blocks on the AMC export via the wait helper, budgeted rather than
+open-ended (see [§4.4](#44-waiting-for-the-export-in-session)). Every other
+check here is a cheap read, matching §12.1's contract; the export wait is
+called out because it is the one place `preflight` deviates from "cheap" on
+purpose, and the deviation is bounded by `AMC_EXPORT_WAIT_S` so `TIMEOUT`
+means something concrete rather than "blocks forever." Returns `COMPLETE`
+(== "ok to run"), `USER_ACTION_REQUIRED`, or `FAILED`.
 
 1. **Step 3 complete.** If `state.status("step3_amc_launcher") != COMPLETE`,
    return `FAILED` with a message pointing at Step 3 (the framework halts
@@ -193,7 +199,10 @@ Mirror `ingest_exports()` precisely:
    produced ("MV3DT ZIP AMC/VGGT"), unpack it into `<dest>` so the tracker sees
    a flat `camInfo`-style directory.
 3. If `EXPORT_DIR` is empty at this point, return `USER_ACTION_REQUIRED`
-   (§3 step 4) — nothing to ingest yet.
+   ([§4.4](#44-waiting-for-the-export-in-session)) — nothing to ingest yet.
+   This should not happen in the ordinary flow, since `preflight` already
+   waited for the export; it is a defensive re-check inside `run()`, not a
+   second, independent bailout.
 4. Append an ingest breadcrumb (`.ingest.log` with a UTC stamp), matching the
    script.
 
@@ -228,13 +237,15 @@ export directory. Instead it:
    - "Complete the 6-step workflow through **Execute** and **Results /
      Export**; on Results choose **MV3DT ZIP AMC** (or **MV3DT ZIP VGGT**)."
    - "Confirm files appear under `$AMC_ROOT/projects/$PROJECT_NAME/exports/`."
-2. **Blocks on the wait helper**, polling the export directory:
+2. **Blocks on the wait helper**, polling the export directory, budgeted by
+   **`AMC_EXPORT_WAIT_S`** (`ctx.conf` / `installer.conf`, default `3600`):
 
    ```python
    outcome = waitui.wait_until(
        waitui.dir_has_files(export_dir),
        description=f"Waiting for the AMC export for {project_name}",
        hint_actions=hints,
+       timeout_s=ctx.conf.get("AMC_EXPORT_WAIT_S", 3600),
        non_interactive=ctx.non_interactive,
    )
    ```
@@ -244,9 +255,15 @@ export directory. Instead it:
 | `WaitOutcome` | Cause | Step 4 does |
 |---|---|---|
 | `SATISFIED` | files appeared in `EXPORT_DIR` | falls straight through to `run()` — the ingest proceeds with no further operator input |
-| `TIMEOUT` | the wait budget elapsed | returns `USER_ACTION_REQUIRED` carrying the **same** hint list |
+| `TIMEOUT` | `AMC_EXPORT_WAIT_S` (default 3600s / 1h) elapsed with no export | returns `USER_ACTION_REQUIRED` carrying the **same** hint list |
 | `CANCELLED` | the operator pressed Ctrl-C — "I'll finish this later" | returns `USER_ACTION_REQUIRED` carrying the same hint list |
 | `SKIPPED` | `--non-interactive`; an unattended run must never block on a human | returns `USER_ACTION_REQUIRED` carrying the same hint list |
+
+`AMC_EXPORT_WAIT_S` is an ordinary optional `installer.conf` value, sourced the
+same way as the required inputs in §3 step 2; an operator who expects AMC to
+take longer than an hour raises it there. It is not part of the "missing a
+required value" branch in §3 step 2 — it always has a default and preflight
+never blocks on its absence.
 
 The three give-up outcomes are indistinguishable to the operator: each prints
 the identical hint list and closes with the framework's contract phrase
