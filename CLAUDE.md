@@ -33,15 +33,33 @@ P2BP Senior Design (Fall '25 – Spring '26) hardware stack for a multi-camera
   [`00` §14](installer/plan/00-FRAMEWORK-AND-BOOTSTRAP.md) (credentials,
   endpoint normalization, redaction) were ported from the deleted Jetson tree
   and are written to be implementable without it. Don't reinvent that contract.
-- `laptop/scripts/` are numbered (`00_` … `99_`) and must run in order; each is
-  idempotent. See the script table in
+- **The operator artifact is the GitHub Release binary.** A workstation
+  downloads a prebuilt `mv3dt-installer` from the repo's Releases page,
+  verifies the checksum, and runs it. **Nothing clones this repo onto a
+  workstation** — don't write a doc, script, or step that assumes a checkout
+  is present at run time.
+- `laptop/scripts/` is the **developer harness**: numbered (`00_` … `99_`),
+  run in order from a clone, each idempotent. It is how this repo is exercised
+  by hand, not how an operator installs anything. See the script table in
   [`laptop/docs/SCRIPTED-WORKFLOW.md`](laptop/docs/SCRIPTED-WORKFLOW.md).
-- Three `laptop/scripts/` entries are **not** superseded by the installer and
-  must not be deleted as part of the port —
-  `40_export_watcher.sh` (watch mode has no installer equivalent),
-  `10_setup_mosquitto.sh` (no step owns Mosquitto install), and
-  `20_verify_cameras.sh` (only its ping sweep is ported, not the `ffprobe`
-  check). See `DELETION-REVIEW.md` §6.
+- **Exactly two `laptop/scripts/` entries are meant to be bundled into the
+  binary (PLANNED):** `10_setup_mosquitto.sh` (owned by `STEP-1` §3.2) and
+  `60_record_tracking.sh` (producer of the `tracks.jsonl` / `tracks.csv` /
+  `summary.json` artifacts `STEP-7` §E.1 uploads). Their **authoritative
+  copies will live under `installer/mv3dt_installer/assets/scripts/`**, but
+  that directory currently holds only a `.gitkeep` — the real copies land
+  with the sibling unit that bundles the scripts (U12,
+  `feat/installer-bundled-scripts`), not yet merged. Once they land, the
+  `laptop/` originals stay developer-only and are not kept in sync
+  automatically. Everything else is
+  either superseded by a step or dropped from the binary —
+  `70_plot_floorplan.py` (matplotlib bloat; the web app visualizes),
+  `record_cameras_mp4.sh`, `view_cameras.sh`, and `20_verify_cameras.sh` as an
+  operator-run script (its `ffprobe`-over-RTSP check moves into `cameras.py`
+  as an RTSP probe). `40_export_watcher.sh` is superseded operationally by the
+  STEP-4 auto-ingest. All dropped scripts stay in git as developer tools;
+  the full table is
+  [`DELETION-REVIEW.md` §8](installer/plan/DELETION-REVIEW.md#8-script-disposition-under-the-binary-distribution).
 - PeopleNet is the only detector wired into the DeepStream pipeline; `yolo11n`
   is reserved for future work — don't add YOLO wiring without being asked.
 - [`laptop/config/cameras.yml`](laptop/config/cameras.yml) is the camera
@@ -52,8 +70,7 @@ P2BP Senior Design (Fall '25 – Spring '26) hardware stack for a multi-camera
 - `laptop/config/` is explicitly allowlisted in `.gitignore`; `laptop.env`
   (operator secrets) is not committed — only `laptop.env.example` is.
 - Line endings are enforced LF via `.gitattributes`; images/weights/binaries
-  are marked binary there — don't hand-edit or re-encode those. `*.exe` is
-  **not** currently marked binary; add that rule before committing any.
+  are marked binary there — don't hand-edit or re-encode those.
 
 ## Documentation
 
@@ -72,7 +89,7 @@ and [`laptop/docs/SCRIPTED-WORKFLOW.md`](laptop/docs/SCRIPTED-WORKFLOW.md).
 - [`installer/plan/DELETION-REVIEW.md`](installer/plan/DELETION-REVIEW.md) —
   what was removed from this fork and why.
 - [`laptop/docs/SCRIPTED-WORKFLOW.md`](laptop/docs/SCRIPTED-WORKFLOW.md) —
-  operator guide + script run order + flow diagram.
+  developer harness guide + script run order + flow diagram.
 - [`laptop/docs/DEEPSTREAM-SETUP.md`](laptop/docs/DEEPSTREAM-SETUP.md) — DS 9.1
   package/OS setup and AMC workflow; source of truth for version pins.
 - [`laptop/docs/SCRIPTS-AND-CONFIG-REFERENCE.md`](laptop/docs/SCRIPTS-AND-CONFIG-REFERENCE.md)

@@ -12,6 +12,7 @@ does **not** restate those contracts — it links back.
 | [§2](#2-immediate-deletions-no-harvest-required) immediate deletions | **EXECUTED** — approved and removed |
 | [§4](#4-explicit-calls-resolved--both-deleted) the two judgment calls | **EXECUTED** — both resolved to delete; camera facts harvested first ([§4.1](#41-camera-facts-harvested-before-deletion)) |
 | [§3](#3-deletions-gated-on-the-harvest-the-jetson-tree) the Jetson tree | **EXECUTED** — gate verified against the sources immediately before removal ([§3.2](#32-what-must-be-captured-before-these-files-go)); `CLAUDE.md` rewritten per [§3.3](#33-documentation-that-must-change-in-the-same-commit) |
+| [§8](#8-script-disposition-under-the-binary-distribution) script disposition | **LOCKED** — which `laptop/scripts/` entries ship inside the release binary, and which copy of a bundled script is authoritative |
 
 The triage is complete: **14,692 files removed**, working tree down from ~1 GB
 to ~23 MB. What remains is `laptop/` (the DeepStream harness), `installer/`
@@ -212,40 +213,83 @@ whose `cameras.yml` *is* a static list. Flagged, not solved.
 
 | File(s) | Reason for retention |
 |---|---|
-| `laptop/deepstream/*`, `laptop/config/*`, `laptop/mosquitto/mv3dt.conf` | Bundled as PyInstaller **data assets** by [`00` §4.1](00-FRAMEWORK-AND-BOOTSTRAP.md#41-what-builds-the-binary). Permanent. |
+| `laptop/deepstream/config_tracker_NvMOT.yml`, `config_infer_primary.txt`, `deepstream_app_config.txt`, `msgconv_config.txt` | Bundled as PyInstaller **data assets** to `assets/deepstream/` by [`00` §4.1](00-FRAMEWORK-AND-BOOTSTRAP.md#41-what-builds-the-binary). Named one by one in [`installer.spec`](../installer.spec), not collected by glob — nothing else under `laptop/deepstream/` ships. Permanent. |
+| `laptop/mosquitto/mv3dt.conf` | Bundled to `assets/mosquitto/`. Consumed by the bundled `10_setup_mosquitto.sh` ([§8](#8-script-disposition-under-the-binary-distribution)). Permanent. |
+| `laptop/config/cameras.yml` | Bundled to `assets/cameras/` by the [`installer.spec`](../installer.spec) entry that lands with `cameras.py`. Its header block (fleet MAC inventory, sensor resolution, volatility caveat, manual pre-flight — [§4.1](#41-camera-facts-harvested-before-deletion)) is copied into every generated `<install_dir>/cameras.yml`, and its pinned IPs seed the ARP-cache fallback. Stays exactly where it is in git. |
+| `laptop/config/laptop.env.example` | **Not bundled.** Operator state moves to `installer.conf` ([`00` §11.2](00-FRAMEWORK-AND-BOOTSTRAP.md#112-persistence--sharing-with-later-steps)); the example file is retained for the developer harness only. |
 | `laptop/docs/*`, `laptop/README.md` | Cited 22+ times across the plans; `DEEPSTREAM-SETUP.md` is the source of truth for the version pins in [`STEP-1` §2](STEP-1-PREREQUISITES.md#2-the-ds-90-dgpu-prerequisite-pins-equality). |
-| `laptop/scripts/00_bootstrap.sh`, `lib/common.sh`, `30_start_amc.sh`, `50_start_pipeline.sh`, `99_stop_all.sh` | Ported by Steps 1, 2, 3, 5, and 6. Deletable on the same gate as [§3](#3-deletions-gated-on-the-harvest-the-jetson-tree), but the gate there is the *installer implementation*, not this documentation work — **out of scope for this triage**. |
-| `laptop/scripts/40_export_watcher.sh` | **Never deletable.** [`STEP-4` §4.4](STEP-4-CALIB-OUTPUT-WIRING.md#44-one-shot-vs-watcher) retains the long-running `inotifywait` watch mode as a standalone script; only the one-shot path is ported. |
-| `laptop/scripts/10_setup_mosquitto.sh`, `20_verify_cameras.sh` | Retained because of the coverage gaps in [§6](#6-coverage-gaps-this-triage-exposed). |
-| `laptop/scripts/60_record_tracking.sh`, `70_plot_floorplan.py`, `record_cameras_mp4.sh`, `view_cameras.sh` | Sponsor-demo and validation tooling with no plan coverage — and the **producers of the artifacts** [`STEP-7` §E](STEP-7-WEBAPP-INTEGRATION.md#e-artifact-upload-daemon) uploads. |
+| `laptop/scripts/00_bootstrap.sh`, `lib/common.sh`, `30_start_amc.sh`, `50_start_pipeline.sh`, `99_stop_all.sh` | Ported by Steps 1, 2, 3, 5, and 6. Retained as the **developer harness** ([§8](#8-script-disposition-under-the-binary-distribution)); no operator procedure runs them. |
+| `laptop/scripts/40_export_watcher.sh` | **Superseded operationally (pending)** — the [`STEP-4` §4.4](STEP-4-CALIB-OUTPUT-WIRING.md#44-one-shot-vs-watcher) rewrite (U7, PR #28, not yet merged) adds in-session blocking on the export directory plus a systemd path unit for later recalibrations, so no operator types a watcher command once it lands. As §4.4 reads today the installer stays one-shot and the script is NOT superseded. Retained in git as a developer tool. |
+| `laptop/scripts/10_setup_mosquitto.sh` | **Bundled** into the binary as `assets/scripts/10_setup_mosquitto.sh` and owned by [`STEP-1` §3.2](STEP-1-PREREQUISITES.md#32-mosquitto-broker). The `laptop/` copy is the developer-harness original. |
+| `laptop/scripts/20_verify_cameras.sh` | **Not bundled.** Its `ffprobe`-over-RTSP check becomes the RTSP probe in `cameras.py` ([§6](#6-coverage-gaps-this-triage-exposed) gap 2); the ping sweep is [`STEP-5` §3.3](STEP-5-PER-PROJECT-EXES.md#33-what-the-exe-does-at-runtime-pipeline-subcommand)'s. Retained in git as a developer tool. |
+| `laptop/scripts/60_record_tracking.sh` | **Bundled** as `assets/scripts/60_record_tracking.sh` — it is the **producer of the artifacts** [`STEP-7` §E.1](STEP-7-WEBAPP-INTEGRATION.md#e1-what-gets-uploaded) uploads (`tracks.jsonl`, `tracks.csv`, `summary.json`). The `laptop/` copy is the developer-harness original. |
+| `laptop/scripts/70_plot_floorplan.py`, `record_cameras_mp4.sh`, `view_cameras.sh` | **Not bundled** — `70_plot_floorplan.py` would drag matplotlib into a self-contained binary for work the web app already does, and the two capture helpers have no plan coverage. Retained in git as developer tools. |
+
+> **RESOLVED — the bundling claim above was wrong.** This table previously
+> asserted that `laptop/deepstream/*`, `laptop/config/*`, and
+> `laptop/mosquitto/mv3dt.conf` were all bundled. Reading
+> [`installer.spec`](../installer.spec) shows it bundles everything under
+> `installer/mv3dt_installer/assets/`, **four named files** from
+> `laptop/deepstream/`, and `laptop/mosquitto/mv3dt.conf` — nothing from
+> `laptop/config/` at all. The rows above are corrected to what the spec
+> actually does, and `cameras.yml` is additionally bundled to
+> `assets/cameras/` by a new spec entry so the camera facts travel with the
+> binary. `laptop.env.example` is deliberately still not bundled.
 
 ---
 
 ## 6. Coverage gaps this triage exposed
 
-Surfaced by checking which `laptop/scripts/` entries no step doc claims. Each
-is a spec gap, not a deletion candidate — recorded here so the retention above
-has a stated reason and the gap is not lost.
+Surfaced by checking which `laptop/scripts/` entries no step doc claims. All
+three gaps below are now **RESOLVED** with a named owner; the original gap
+text is retained in each item so the reason the script was kept is not lost.
 
-1. **Mosquitto install is unowned.**
-   [`STEP-4` §1](STEP-4-CALIB-OUTPUT-WIRING.md#1-scope) defers it to "Step 1/2
-   bootstrap", but neither [`STEP-1`](STEP-1-PREREQUISITES.md) nor
-   [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) mentions it. Meanwhile
+1. **Mosquitto install — RESOLVED, owned by
+   [`STEP-1` §3.2](STEP-1-PREREQUISITES.md#32-mosquitto-broker).**
+   The gap was real: [`STEP-4` §1](STEP-4-CALIB-OUTPUT-WIRING.md#1-scope)
+   deferred broker install to "Step 1/2 bootstrap", neither
+   [`STEP-1`](STEP-1-PREREQUISITES.md) nor
+   [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) mentioned it, and
    [`STEP-6` §E.1](STEP-6-REMOTE-SUPERVISION.md#e1-lifecycle) `preflight`
-   **requires** a reachable broker and
+   **requires** a reachable broker while
    [`STEP-6` §D](STEP-6-REMOTE-SUPERVISION.md#d-security-remote-control-must-be-authenticated)
-   **rewrites** its configuration. Until a step adopts
-   `10_setup_mosquitto.sh`, it is load-bearing.
+   **rewrites** its configuration. Step 1 now installs `mosquitto` and
+   `mosquitto-clients` and drives the **bundled** `10_setup_mosquitto.sh`
+   ([§8](#8-script-disposition-under-the-binary-distribution)), so the broker
+   has one owner and the operator types nothing.
 
-2. **Camera verification is only partly ported.**
-   [`STEP-5` §3.3](STEP-5-PER-PROJECT-EXES.md#33-what-the-exe-does-at-runtime-pipeline-subcommand)
-   ports the ping sweep from `20_verify_cameras.sh`; the `ffprobe`-over-RTSP
-   check and the pass/fail table are not ported anywhere.
+2. **Camera verification — RESOLVED, owned jointly by `cameras.py` and
+   [`STEP-5` §3.3](STEP-5-PER-PROJECT-EXES.md#33-what-the-exe-does-at-runtime-pipeline-subcommand).**
+   The gap was that Step 5 ported only the ping sweep from
+   `20_verify_cameras.sh`. **The `ffprobe`-over-RTSP check and its pass/fail
+   table are not lost — they move into `cameras.py`**, which discovers cameras
+   by MAC OUI and then probes each one with
+   `ffprobe -rtsp_transport tcp rtsp://<user>:<pass>@<ip>:554<rtsp_path>`,
+   recording the result as `stream_ok` in `<install_dir>/cameras.yml` and
+   rendering the same pass/fail table. A ping proves the host answers; the
+   probe proves it serves a decodable stream — the distinction the original
+   script existed to make. `20_verify_cameras.sh` itself is therefore dropped
+   as an operator-run script: the capability survives with no command to type.
+   The cited `STEP-5` §3.3 still carries its "Partial port (flagged)"
+   blockquote on this branch, saying the script "stays load-bearing for
+   genuine pre-flight camera verification" — that text has not yet been
+   updated to reflect the `cameras.py` port recorded here; it is a pending
+   `STEP-5` edit, not a disagreement with this row.
 
-3. **The export watcher is not superseded.** Recorded in
-   [§5](#5-retained-files-and-why) and made explicit in
-   [`STEP-4` §4.4](STEP-4-CALIB-OUTPUT-WIRING.md#44-one-shot-vs-watcher) so the
-   script is not removed on the assumption that Step 4 replaced it.
+3. **The export watcher — RESOLVED, superseded operationally, pending the
+   [`STEP-4` §4.4](STEP-4-CALIB-OUTPUT-WIRING.md#44-one-shot-vs-watcher)
+   auto-ingest rewrite.**
+   The earlier reading — "not superseded, do not delete" — was written before
+   auto-ingest was designed. As `STEP-4` §4.4 reads on this branch today, the
+   installer still does a one-shot copy+render pass and must not block on a
+   long-running `inotifywait` loop, and that section explicitly says
+   `40_export_watcher.sh` is **NOT superseded** and must not be deleted. The
+   in-session blocking + systemd path-unit auto-ingest that supersedes the
+   watcher operationally is real, but lands with the sibling `STEP-4` rewrite
+   (U7, PR #28), not yet merged — this row records the intended decision, not
+   the current state of §4.4. Until that rewrite lands,
+   [`40_export_watcher.sh`](../../laptop/scripts/40_export_watcher.sh) stays
+   retained in git as a developer tool and load-bearing per §4.4 as written.
 
 ---
 
@@ -285,6 +329,69 @@ deletion in this document is destructive to the object store.
 
 ---
 
+## 8. Script disposition under the binary distribution
+
+**LOCKED.** The operator artifact is a **prebuilt binary downloaded from the
+repo's GitHub Releases page** ([`00` §5](00-FRAMEWORK-AND-BOOTSTRAP.md#5-distribution-the-github-release-binary)).
+Nothing clones this repo onto a workstation, so no numbered script under
+[`laptop/scripts/`](../../laptop/scripts/) is reachable by an operator unless
+it is **bundled into the binary**. Exactly two are meant to be, but this is
+still **PLANNED**: `installer/mv3dt_installer/assets/scripts/` currently holds
+only a `.gitkeep`, and the real copies land in the sibling unit that bundles
+the scripts (U12, `feat/installer-bundled-scripts`), not yet merged.
+
+Everything else stays in git — deleting a script that no longer ships is not
+the same decision as deleting one nothing needs, and the developer harness is
+still how this repo is exercised from a clone.
+
+| Script | Disposition | Bundled as | Owner | Retained in git? |
+|---|---|---|---|---|
+| `00_bootstrap.sh` | Superseded — ported to Python | — | [`STEP-1`](STEP-1-PREREQUISITES.md), [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) | Yes, developer-only |
+| `10_setup_mosquitto.sh` | **Bundled** | `assets/scripts/10_setup_mosquitto.sh` | [`STEP-1` §3.2](STEP-1-PREREQUISITES.md#32-mosquitto-broker) | Yes, developer-only original |
+| `20_verify_cameras.sh` | **Dropped** as an operator script; the `ffprobe` check is ported | — | `cameras.py` RTSP probe + [`STEP-5` §3.3](STEP-5-PER-PROJECT-EXES.md#33-what-the-exe-does-at-runtime-pipeline-subcommand) ping sweep | Yes, developer-only |
+| `30_start_amc.sh` | Superseded — ported to Python | — | [`STEP-3`](STEP-3-AMC-LAUNCHER.md) | Yes, developer-only |
+| `40_export_watcher.sh` | Superseded operationally by auto-ingest (pending U7, PR #28) | — | [`STEP-4` §4.4](STEP-4-CALIB-OUTPUT-WIRING.md#44-one-shot-vs-watcher) | Yes, developer-only |
+| `50_start_pipeline.sh` | Superseded — ported into the per-project exe | — | [`STEP-5` §3.3](STEP-5-PER-PROJECT-EXES.md#33-what-the-exe-does-at-runtime-pipeline-subcommand) | Yes, developer-only |
+| `60_record_tracking.sh` | **Bundled** | `assets/scripts/60_record_tracking.sh` | [`STEP-5`](STEP-5-PER-PROJECT-EXES.md); its artifacts feed [`STEP-7` §E.1](STEP-7-WEBAPP-INTEGRATION.md#e1-what-gets-uploaded) | Yes, developer-only original |
+| `70_plot_floorplan.py` | **Dropped** — matplotlib bloat; the web app visualizes | — | None (web app) | Yes, developer tool |
+| `99_stop_all.sh` | Superseded — ported into the per-project exe | — | [`STEP-5` §3.4](STEP-5-PER-PROJECT-EXES.md#34-stopping-the-pipeline) | Yes, developer-only |
+| `record_cameras_mp4.sh` | **Dropped** — no plan coverage | — | None | Yes, developer tool |
+| `view_cameras.sh` | **Dropped** — no plan coverage | — | None | Yes, developer tool |
+| `lib/common.sh` | Not bundled; a purpose-written sibling is | `assets/scripts/lib/common.sh` (sibling, **not** a copy) | [`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-bundled-assets-at-runtime) | Yes, developer-only |
+
+### 8.1 Which copy do I edit?
+
+**REQUIRED (PLANNED).** Two of these scripts are meant to exist in two
+places, and the answer is not "whichever one you opened" — but the second
+place does not exist yet. `installer/mv3dt_installer/assets/scripts/`
+currently holds only a `.gitkeep`; the real `assets/scripts/` copies land
+with U12 (`feat/installer-bundled-scripts`), not yet merged. This section
+records the rule those copies must follow once they land.
+
+| You are changing… | Edit | Do **not** edit |
+|---|---|---|
+| Behavior the shipped binary must have | `installer/mv3dt_installer/assets/scripts/<script>` | The `laptop/` original |
+| Behavior only a developer clone needs | `laptop/scripts/<script>` | The `assets/scripts/` copy |
+
+The `assets/scripts/` copies are **authoritative for the binary**; the
+`laptop/` originals are **developer-only** and are not kept in sync
+automatically. They are deliberately derived rather than copied, so the
+difference is reviewable as a diff: `lib/common.sh`'s `repo_root()` and
+`load_env()` cannot exist inside a binary with no repo root, and are replaced
+by `asset_root()` and `load_installer_conf()` driven by the environment the
+staging runner sets ([`00` §11.2](00-FRAMEWORK-AND-BOOTSTRAP.md#112-persistence--sharing-with-later-steps)).
+
+> **Why not one copy?** Bundling the originals verbatim does not work: the
+> runner stages assets into a temporary directory, so
+> `source "$SCRIPT_DIR/lib/common.sh"` only resolves if the whole tree is
+> staged, and `repo_root()`'s `cd ../../..` has nothing to land on. Making one
+> file serve both worlds requires either a fake `laptop/`-shaped tree inside
+> the bundle or patching the script at stage time — at which point it is not
+> verbatim anyway. Two reviewable files with a written rule beats one file
+> with a hidden lie.
+
+---
+
 ## References
 
 Authority for this document is the repo itself: the verdicts rest on reference
@@ -296,17 +403,30 @@ Repo files referenced:
 
 - [`00-FRAMEWORK-AND-BOOTSTRAP.md`](00-FRAMEWORK-AND-BOOTSTRAP.md) — §4.1 asset
   bundling, §5.1 target platform, §13 out-of-scope scope calls, and §14 the
-  web-app credential contract that gates [§3](#3-deletions-gated-on-the-harvest-the-jetson-tree).
+  web-app credential contract that gates
+  [§3](#3-deletions-gated-on-the-harvest-the-jetson-tree).
 - [`STEP-4-CALIB-OUTPUT-WIRING.md`](STEP-4-CALIB-OUTPUT-WIRING.md) — §2 treats
-  the AMC export as run-time-produced (basis for deleting `amc/`); §4.4 retains
-  the export watcher permanently.
-- [`STEP-5-PER-PROJECT-EXES.md`](STEP-5-PER-PROJECT-EXES.md) — §3.3 the partial
-  camera-verification port; §9 the per-camera-config scope call.
+  the AMC export as run-time-produced (basis for deleting `amc/`); §4.4 is the
+  auto-ingest that supersedes the export watcher operationally
+  ([§6](#6-coverage-gaps-this-triage-exposed) gap 3).
+- [`STEP-5-PER-PROJECT-EXES.md`](STEP-5-PER-PROJECT-EXES.md) — §3.3 the ping
+  sweep half of camera verification, the other half being `cameras.py`'s RTSP
+  probe ([§6](#6-coverage-gaps-this-triage-exposed) gap 2); §3.4 the stop path;
+  §9 the per-camera-config scope call.
 - [`STEP-6-REMOTE-SUPERVISION.md`](STEP-6-REMOTE-SUPERVISION.md) — §A.4 and
   §B.1 consume `install.sh` and the `services/` unit conventions before those
   files are removed; §D and §E.1 are why Mosquitto setup is load-bearing.
 - [`STEP-7-WEBAPP-INTEGRATION.md`](STEP-7-WEBAPP-INTEGRATION.md) — the harvest
   target for every web-app pattern in the Jetson tree; the gate on
-  [§3](#3-deletions-gated-on-the-harvest-the-jetson-tree).
+  [§3](#3-deletions-gated-on-the-harvest-the-jetson-tree); §E.1 names the
+  artifacts `60_record_tracking.sh` produces, which is why that script is
+  bundled ([§8](#8-script-disposition-under-the-binary-distribution)).
+- [`STEP-1-PREREQUISITES.md`](STEP-1-PREREQUISITES.md) — §2 the version pins
+  backing the `laptop/docs/` retention; §3.2 the named owner that closes
+  [§6](#6-coverage-gaps-this-triage-exposed) gap 1.
+- [`installer.spec`](../installer.spec) — the authority for every bundling
+  claim in [§5](#5-retained-files-and-why) and
+  [§8](#8-script-disposition-under-the-binary-distribution); read it, do not
+  infer, before asserting that a file ships inside the binary.
 - [`CLAUDE.md`](../../CLAUDE.md) — the "two independent subsystems" framing that
   must be rewritten atomically with the Jetson-tree deletion ([§3.3](#33-documentation-that-must-change-in-the-same-commit)).

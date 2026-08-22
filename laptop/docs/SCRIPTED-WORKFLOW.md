@@ -1,6 +1,16 @@
-# Laptop DS 9.1 Scripted Testing — Operator Guide
+# Laptop DS 9.1 Scripted Testing — Developer Harness Guide
 
-This document is the **operator-facing** guide for the DS 9.1 laptop
+> **Developer harness — this is not the operator path.** The numbered scripts
+> under [`laptop/scripts/`](../scripts/) are the **developer harness**: they
+> run from a clone of this repo and are how the DS 9.1 stack is exercised by
+> hand. The **operator** path is a prebuilt `mv3dt-installer` binary
+> downloaded from the repo's GitHub Releases page — nothing clones this repo
+> onto a workstation. Each script's disposition under that distribution
+> (bundled / dropped / developer-only) is annotated in the run-order table
+> below; the full record is
+> [`installer/plan/DELETION-REVIEW.md` §8](../../installer/plan/DELETION-REVIEW.md#8-script-disposition-under-the-binary-distribution).
+
+This document is the run-order guide for the DS 9.1 laptop
 scripted testing harness. It covers:
 
 - the prerequisites that must already be done **outside this repo**,
@@ -60,18 +70,25 @@ See [`DEEPSTREAM-SETUP.md`](DEEPSTREAM-SETUP.md) §4–§5.
 Run each script after the previous one has completed successfully. Everything
 below is idempotent — re-runs are safe.
 
-| # | Script | Notion § | What it does | sudo? |
-|---|--------|----------|--------------|-------|
-| 00 | [`00_bootstrap.sh`](../scripts/00_bootstrap.sh) | §4–§5 + §6 + §8.2 + §9.3 | Phased install (NVIDIA stack from local `.debs`, DS 9.0 via NGC, GStreamer, Mosquitto, Docker, NCT), version audit, `laptop.env`, PeopleNet ONNX. | yes |
-| 10 | [`10_setup_mosquitto.sh`](../scripts/10_setup_mosquitto.sh) | §6 | Install [`laptop/mosquitto/mv3dt.conf`](../mosquitto/mv3dt.conf) into `/etc/mosquitto/conf.d/`, enable/restart the service. `--with-firewall` opens 1883/9001 via ufw. | yes |
-| 20 | [`20_verify_cameras.sh`](../scripts/20_verify_cameras.sh) | §7.5 | Ping + `ffprobe` each enabled row in [`laptop/config/cameras.yml`](../config/cameras.yml); pass/fail table. `--allow-partial` to exit 0 on misses. | no |
-| 30 | [`30_start_amc.sh`](../scripts/30_start_amc.sh) | §8.3–8.5 | Clone `NVIDIA-AI-IOT/auto-magic-calib` into `$HOME/auto-magic-calib/` (never under this repo), template `compose/.env`, `docker compose up -d`, open `http://localhost:5000`. | no (docker group) |
-| — | _human_ | §8.6 | Complete the AMC 6-step workflow in the browser: Project Setup → Video Upload → Parameters → Manual Align → Execute → Results / Export. | — |
-| 40 | [`40_export_watcher.sh`](../scripts/40_export_watcher.sh) | §8.7 | Watch `$HOME/auto-magic-calib/projects/$PROJECT_NAME/exports/`, try upstream `scripts/export_mv3dt.py` (fall back to raw copy), land artefacts in `laptop/deepstream/calibration/$LOCATION_ID/`, render `deepstream_app_config.rendered.txt`. `--oneshot` for single pass. | no |
-| 50 | [`50_start_pipeline.sh`](../scripts/50_start_pipeline.sh) | §10.1–10.2 | Ensure `mosquitto` is up, ping-sweep C1..C8, source `/etc/profile.d/deepstream.sh`, `exec deepstream-app -c ...` from `laptop/deepstream/`; prints §10.2 validation helpers. Use `--preview` for sponsor-visible on-screen DeepStream output while keeping MQTT publish enabled. | no (sudo for mosquitto only if not already active) |
-| 60 | [`60_record_tracking.sh`](../scripts/60_record_tracking.sh) | §10.2 extension | Subscribe to `mv3dt/#` and persist local exports under `laptop/tracking_exports/<run_id>/`: `tracks.jsonl`, `tracks.csv`, `summary.json`. | no |
-| 70 | [`70_plot_floorplan.py`](../scripts/70_plot_floorplan.py) | sponsor artifact | Plot trajectories from `tracks.csv`/`tracks.jsonl` into `artifacts/floorplan_paths_*.png` (optional background image for floor plan). | no |
-| 99 | [`99_stop_all.sh`](../scripts/99_stop_all.sh) | — | Stop `deepstream-app` (SIGTERM → SIGKILL), `docker compose down` AMC, `systemctl stop mosquitto`. Per-step skip flags. | partial |
+| # | Script | Notion § | What it does | sudo? | Disposition |
+|---|--------|----------|--------------|-------|-------------|
+| 00 | [`00_bootstrap.sh`](../scripts/00_bootstrap.sh) | §4–§5 + §6 + §8.2 + §9.3 | Phased install (NVIDIA stack from local `.debs`, DS 9.0 via NGC, GStreamer, Mosquitto, Docker, NCT), version audit, `laptop.env`, PeopleNet ONNX. | yes | developer-only — superseded by STEP-1 / STEP-2 |
+| 10 | [`10_setup_mosquitto.sh`](../scripts/10_setup_mosquitto.sh) | §6 | Install [`laptop/mosquitto/mv3dt.conf`](../mosquitto/mv3dt.conf) into `/etc/mosquitto/conf.d/`, enable/restart the service. `--with-firewall` opens 1883/9001 via ufw. | yes | **bundled** — edit `assets/scripts/` for the binary |
+| 20 | [`20_verify_cameras.sh`](../scripts/20_verify_cameras.sh) | §7.5 | Ping + `ffprobe` each enabled row in [`laptop/config/cameras.yml`](../config/cameras.yml); pass/fail table. `--allow-partial` to exit 0 on misses. | no | **dropped** — `ffprobe` check ported to `cameras.py` |
+| 30 | [`30_start_amc.sh`](../scripts/30_start_amc.sh) | §8.3–8.5 | Clone `NVIDIA-AI-IOT/auto-magic-calib` into `$HOME/auto-magic-calib/` (never under this repo), template `compose/.env`, `docker compose up -d`, open `http://localhost:5000`. | no (docker group) | developer-only — superseded by STEP-3 |
+| — | _human_ | §8.6 | Complete the AMC 6-step workflow in the browser: Project Setup → Video Upload → Parameters → Manual Align → Execute → Results / Export. | — | unchanged — still manual under the binary |
+| 40 | [`40_export_watcher.sh`](../scripts/40_export_watcher.sh) | §8.7 | Watch `$HOME/auto-magic-calib/projects/$PROJECT_NAME/exports/`, try upstream `scripts/export_mv3dt.py` (fall back to raw copy), land artefacts in `laptop/deepstream/calibration/$LOCATION_ID/`, render `deepstream_app_config.rendered.txt`. `--oneshot` for single pass. | no | developer-only — superseded by the STEP-4 auto-ingest |
+| 50 | [`50_start_pipeline.sh`](../scripts/50_start_pipeline.sh) | §10.1–10.2 | Ensure `mosquitto` is up, ping-sweep C1..C8, source `/etc/profile.d/deepstream.sh`, `exec deepstream-app -c ...` from `laptop/deepstream/`; prints §10.2 validation helpers. Use `--preview` for sponsor-visible on-screen DeepStream output while keeping MQTT publish enabled. | no (sudo for mosquitto only if not already active) | developer-only — superseded by the STEP-5 per-project exe |
+| 60 | [`60_record_tracking.sh`](../scripts/60_record_tracking.sh) | §10.2 extension | Subscribe to `mv3dt/#` and persist local exports under `laptop/tracking_exports/<run_id>/`: `tracks.jsonl`, `tracks.csv`, `summary.json`. | no | **bundled** — edit `assets/scripts/` for the binary |
+| 70 | [`70_plot_floorplan.py`](../scripts/70_plot_floorplan.py) | sponsor artifact | Plot trajectories from `tracks.csv`/`tracks.jsonl` into `artifacts/floorplan_paths_*.png` (optional background image for floor plan). | no | **dropped** — the web app visualizes |
+| 99 | [`99_stop_all.sh`](../scripts/99_stop_all.sh) | — | Stop `deepstream-app` (SIGTERM → SIGKILL), `docker compose down` AMC, `systemctl stop mosquitto`. Per-step skip flags. | partial | developer-only — superseded by the STEP-5 per-project exe |
+
+Two scripts above are **bundled** into the release binary. Their authoritative
+copies live under `installer/mv3dt_installer/assets/scripts/`, and the
+`laptop/` files here are the developer-harness originals — see
+[`DELETION-REVIEW.md` §8.1](../../installer/plan/DELETION-REVIEW.md#81-which-copy-do-i-edit)
+before editing either one. `record_cameras_mp4.sh` and `view_cameras.sh` are
+unnumbered developer capture helpers and are likewise not bundled.
 
 ## End-to-end flow
 

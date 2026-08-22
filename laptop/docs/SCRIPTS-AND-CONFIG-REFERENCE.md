@@ -1,12 +1,21 @@
 # Laptop Scripts & Config Reference (DS 9.1 + AMC + MV3DT)
 
+> **Developer harness — this is not the operator path.** Everything mapped
+> below runs from a clone of this repo. The **operator** path is a prebuilt
+> `mv3dt-installer` binary downloaded from the repo's GitHub Releases page;
+> nothing clones this repo onto a workstation. The `Disposition` column in
+> [§2](#2-script-by-script-table-cross-referenced-to-ds-91-docs) records
+> whether each script is bundled into that binary, dropped from it, or
+> developer-only. Full record:
+> [`installer/plan/DELETION-REVIEW.md` §8](../../installer/plan/DELETION-REVIEW.md#8-script-disposition-under-the-binary-distribution).
+
 Concise map of what every script under [`laptop/scripts/`](../scripts/) does,
 which DS 9.1 doc section it implements, and exactly which config files you
 must customize for your own cameras / site / MV3DT output. Read this before
 running anything.
 
 Companion docs:
-[`SCRIPTED-WORKFLOW.md`](SCRIPTED-WORKFLOW.md) (operator run order) and
+[`SCRIPTED-WORKFLOW.md`](SCRIPTED-WORKFLOW.md) (harness run order) and
 [`DEEPSTREAM-SETUP.md`](DEEPSTREAM-SETUP.md) (manual §1–4 prereqs).
 
 > **Known drift:** this reference targets DS 9.1. The scripts referenced below
@@ -37,17 +46,27 @@ the UI.
 
 ## 2. Script-by-script table (cross-referenced to DS 9.1 docs)
 
-| # | Script | DS 9.1 doc section | What it installs / does | sudo? | Idempotent |
-|---|--------|--------------------|-------------------------|-------|-----------|
-| — | **Manual prereq** | [DS_Installation → dGPU Setup for Ubuntu → Prerequisites](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html) | Ubuntu 24.04, NVIDIA driver **595.58.03**, CUDA **13.2**, TensorRT **10.16.0.72-1+cuda13.2**, cuDNN **9.20.0.48**, GStreamer **1.24.2**. | yes | n/a |
-| 00 | [`00_bootstrap.sh`](../scripts/00_bootstrap.sh) | [DS_Installation](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html); [DS_docker_containers](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_docker_containers.html) | **Phased install**: pre-downloaded NVIDIA local-repo + cuda-keyring debs; driver `590.48.01` + CUDA 13.1 + cuDNN 9.18 + TRT 10.14.1.48-1; `/etc/profile.d/cuda.sh`; GStreamer 1.24 + DS apt prerequisites; Mosquitto; Docker + `nvidia-container-toolkit`; NGC `ngc registry resource download-version` of `deepstream-9.0_9.0.0-1_amd64.deb` + `apt install`; `update_rtpmanager.sh` + `/etc/profile.d/deepstream.sh`; version audit; `laptop/config/laptop.env`; PeopleNet ONNX → `laptop/deepstream/models/peoplenet/`. | yes | yes |
-| 10 | [`10_setup_mosquitto.sh`](../scripts/10_setup_mosquitto.sh) | [DS_IoT](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_IoT.html); [Gst-nvmsgbroker](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvmsgbroker.html) | Installs [`laptop/mosquitto/mv3dt.conf`](../mosquitto/mv3dt.conf) → `/etc/mosquitto/conf.d/mv3dt.conf`; `systemctl enable --now mosquitto`. `--with-firewall` opens `ufw` 1883/9001. | yes | yes |
-| 20 | [`20_verify_cameras.sh`](../scripts/20_verify_cameras.sh) | [DS_Quickstart](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Quickstart.html) (RTSP input sanity) | For each enabled row in [`cameras.yml`](../config/cameras.yml): `ping` then `ffprobe -rtsp_transport tcp` against `rtsp://$CAM_USER:$CAM_PASSWORD@$ip:554$rtsp_path`. Emits a PASS/FAIL/SKIP table. | no | yes |
-| 30 | [`30_start_amc.sh`](../scripts/30_start_amc.sh) | [DS_AutoMagicCalib](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_AutoMagicCalib.html); [NVIDIA-AI-IOT/auto-magic-calib](https://github.com/NVIDIA-AI-IOT/auto-magic-calib) README | `git clone https://github.com/NVIDIA-AI-IOT/auto-magic-calib.git $AMC_ROOT` (default `$HOME/auto-magic-calib`, **must live outside this repo**). `chown 1000:1000` on `projects/` and `models/`. `docker login nvcr.io` (if `NGC_API_KEY` set). Writes `$AMC_ROOT/compose/.env` from your `laptop.env`. `docker compose pull && up -d`. Opens `http://localhost:$AUTO_MAGIC_CALIB_UI_PORT` (default 5000). | no (docker group) | yes |
-| — | _human_ | [DS_AutoMagicCalib §6-step workflow](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_AutoMagicCalib.html) | In the AMC web UI: **(1) Project Setup → (2) Video Upload → (3) Parameters → (4) Manual Align → (5) Execute → (6) Results / Export**. | — | n/a |
-| 40 | [`40_export_watcher.sh`](../scripts/40_export_watcher.sh) | [DS_AutoMagicCalib §Export](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_AutoMagicCalib.html); [DS_MV3DT §Calibration input](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html) | Watches `$AMC_ROOT/projects/$PROJECT_NAME/exports/` (inotify; 5 s polling fallback). Prefers `$AMC_ROOT/scripts/export_mv3dt.py`; falls back to raw copy. Lands artifacts in `laptop/deepstream/calibration/$LOCATION_ID/`. **Renders** `laptop/deepstream/deepstream_app_config.rendered.txt` by substituting `${CAM_USER}`, `${CAM_PASSWORD}`, `${LOCATION_ID}` and rewriting each `[sourceN]` `uri=` from `cameras.yml`. `--oneshot` for a single pass. | no | yes |
-| 50 | [`50_start_pipeline.sh`](../scripts/50_start_pipeline.sh) | [DS_ref_app_deepstream](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_ref_app_deepstream.html); [DS_MV3DT §Pipeline](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html); [Gst-nvmsgbroker](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvmsgbroker.html) | Ensures `mosquitto` is active, ping-sweeps C1..C8, sources `/etc/profile.d/deepstream.sh`, then `exec deepstream-app -c laptop/deepstream/deepstream_app_config.rendered.txt`. Prints §10.2 validation helpers (`mosquitto_sub`, `nvidia-smi`). `--force-template`, `--config`, `--skip-ping`, `--dry-run` flags. | sudo only if mosquitto not yet active | yes |
-| 99 | [`99_stop_all.sh`](../scripts/99_stop_all.sh) | — | `pkill deepstream-app` → `docker compose down` in `$AMC_ROOT/compose` → `systemctl stop mosquitto`. Per-component skip flags. Does **not** remove packages, calibration, or the AMC clone. | partial | yes |
+| # | Script | DS 9.1 doc section | What it installs / does | sudo? | Idempotent | Disposition |
+|---|--------|--------------------|-------------------------|-------|-----------|-------------|
+| — | **Manual prereq** | [DS_Installation → dGPU Setup for Ubuntu → Prerequisites](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html) | Ubuntu 24.04, NVIDIA driver **595.58.03**, CUDA **13.2**, TensorRT **10.16.0.72-1+cuda13.2**, cuDNN **9.20.0.48**, GStreamer **1.24.2**. | yes | n/a | n/a — outside this repo either way |
+| 00 | [`00_bootstrap.sh`](../scripts/00_bootstrap.sh) | [DS_Installation](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html); [DS_docker_containers](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_docker_containers.html) | **Phased install**: pre-downloaded NVIDIA local-repo + cuda-keyring debs; driver `590.48.01` + CUDA 13.1 + cuDNN 9.18 + TRT 10.14.1.48-1; `/etc/profile.d/cuda.sh`; GStreamer 1.24 + DS apt prerequisites; Mosquitto; Docker + `nvidia-container-toolkit`; NGC `ngc registry resource download-version` of `deepstream-9.0_9.0.0-1_amd64.deb` + `apt install`; `update_rtpmanager.sh` + `/etc/profile.d/deepstream.sh`; version audit; `laptop/config/laptop.env`; PeopleNet ONNX → `laptop/deepstream/models/peoplenet/`. | yes | yes | developer-only — superseded by STEP-1 / STEP-2 |
+| 10 | [`10_setup_mosquitto.sh`](../scripts/10_setup_mosquitto.sh) | [DS_IoT](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_IoT.html); [Gst-nvmsgbroker](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvmsgbroker.html) | Installs [`laptop/mosquitto/mv3dt.conf`](../mosquitto/mv3dt.conf) → `/etc/mosquitto/conf.d/mv3dt.conf`; `systemctl enable --now mosquitto`. `--with-firewall` opens `ufw` 1883/9001. | yes | yes | **bundled** — `assets/scripts/` copy is authoritative |
+| 20 | [`20_verify_cameras.sh`](../scripts/20_verify_cameras.sh) | [DS_Quickstart](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Quickstart.html) (RTSP input sanity) | For each enabled row in [`cameras.yml`](../config/cameras.yml): `ping` then `ffprobe -rtsp_transport tcp` against `rtsp://$CAM_USER:$CAM_PASSWORD@$ip:554$rtsp_path`. Emits a PASS/FAIL/SKIP table. | no | yes | **dropped** — `ffprobe` check ported to `cameras.py` |
+| 30 | [`30_start_amc.sh`](../scripts/30_start_amc.sh) | [DS_AutoMagicCalib](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_AutoMagicCalib.html); [NVIDIA-AI-IOT/auto-magic-calib](https://github.com/NVIDIA-AI-IOT/auto-magic-calib) README | `git clone https://github.com/NVIDIA-AI-IOT/auto-magic-calib.git $AMC_ROOT` (default `$HOME/auto-magic-calib`, **must live outside this repo**). `chown 1000:1000` on `projects/` and `models/`. `docker login nvcr.io` (if `NGC_API_KEY` set). Writes `$AMC_ROOT/compose/.env` from your `laptop.env`. `docker compose pull && up -d`. Opens `http://localhost:$AUTO_MAGIC_CALIB_UI_PORT` (default 5000). | no (docker group) | yes | developer-only — superseded by STEP-3 |
+| — | _human_ | [DS_AutoMagicCalib §6-step workflow](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_AutoMagicCalib.html) | In the AMC web UI: **(1) Project Setup → (2) Video Upload → (3) Parameters → (4) Manual Align → (5) Execute → (6) Results / Export**. | — | n/a | unchanged — still manual under the binary |
+| 40 | [`40_export_watcher.sh`](../scripts/40_export_watcher.sh) | [DS_AutoMagicCalib §Export](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_AutoMagicCalib.html); [DS_MV3DT §Calibration input](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html) | Watches `$AMC_ROOT/projects/$PROJECT_NAME/exports/` (inotify; 5 s polling fallback). Prefers `$AMC_ROOT/scripts/export_mv3dt.py`; falls back to raw copy. Lands artifacts in `laptop/deepstream/calibration/$LOCATION_ID/`. **Renders** `laptop/deepstream/deepstream_app_config.rendered.txt` by substituting `${CAM_USER}`, `${CAM_PASSWORD}`, `${LOCATION_ID}` and rewriting each `[sourceN]` `uri=` from `cameras.yml`. `--oneshot` for a single pass. | no | yes | developer-only — superseded by the STEP-4 auto-ingest |
+| 50 | [`50_start_pipeline.sh`](../scripts/50_start_pipeline.sh) | [DS_ref_app_deepstream](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_ref_app_deepstream.html); [DS_MV3DT §Pipeline](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html); [Gst-nvmsgbroker](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvmsgbroker.html) | Ensures `mosquitto` is active, ping-sweeps C1..C8, sources `/etc/profile.d/deepstream.sh`, then `exec deepstream-app -c laptop/deepstream/deepstream_app_config.rendered.txt`. Prints §10.2 validation helpers (`mosquitto_sub`, `nvidia-smi`). `--force-template`, `--config`, `--skip-ping`, `--dry-run` flags. | sudo only if mosquitto not yet active | yes | developer-only — superseded by the STEP-5 per-project exe |
+| 99 | [`99_stop_all.sh`](../scripts/99_stop_all.sh) | — | `pkill deepstream-app` → `docker compose down` in `$AMC_ROOT/compose` → `systemctl stop mosquitto`. Per-component skip flags. Does **not** remove packages, calibration, or the AMC clone. | partial | yes | developer-only — superseded by the STEP-5 per-project exe |
+
+Not mapped above, and not part of the numbered run order: `60_record_tracking.sh`
+(**bundled** — it produces the `tracks.jsonl` / `tracks.csv` / `summary.json`
+artifacts the web app consumes), `70_plot_floorplan.py` (**dropped** — the web
+app visualizes), and the `record_cameras_mp4.sh` / `view_cameras.sh` capture
+helpers (**dropped**). All four remain in git as developer tools. For a
+bundled script, the copy under `installer/mv3dt_installer/assets/scripts/` is
+authoritative and the `laptop/` file here is the developer-harness original —
+[`DELETION-REVIEW.md` §8.1](../../installer/plan/DELETION-REVIEW.md#81-which-copy-do-i-edit)
+says which one to edit.
 
 ### 2.1 Shared lib
 
@@ -55,6 +74,14 @@ the UI.
 executed. Provides `log_info/warn/error`, `die`, `require_root`,
 `require_tool`, `repo_root`, `load_env` (sources
 `laptop/config/laptop.env` with `set -a`).
+
+**Disposition: developer-only, not bundled.** The release binary ships a
+purpose-written sibling at `installer/mv3dt_installer/assets/scripts/lib/common.sh`
+with the same logging block, because the two path-resolving functions here
+cannot exist inside a binary with no repo root: `repo_root()` becomes
+`asset_root()` and `load_env()` becomes `load_installer_conf()`. Edit the
+sibling for anything the binary must do — see
+[`DELETION-REVIEW.md` §8.1](../../installer/plan/DELETION-REVIEW.md#81-which-copy-do-i-edit).
 
 ---
 
