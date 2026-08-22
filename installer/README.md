@@ -287,7 +287,7 @@ directory `0700` and files `0600`
 
 | Path | Contents | Status |
 |---|---|---|
-| `<install_dir>/secrets/ngc.env` | `NGC_API_KEY=...` — nothing is written on a blank/manual-fallback answer, today or as currently planned | **planned**: written once the [§5](#5-first-run-what-it-asks-for) capture is wired into launch |
+| `<install_dir>/secrets/ngc.env` | `NGC_API_KEY=...` — the key is required, so a blank answer re-prompts rather than writing anything | **planned**: written once the [§5](#5-first-run-what-it-asks-for) capture is wired into launch |
 | `<install_dir>/secrets/webapp.env` | `API_KEY=...` and `ENDPOINT=...` | **planned**, same reason |
 | `<install_dir>/installer.conf` | Non-secret `KEY=VALUE` config: the two gates, the resolved install directory, and the shared values later steps read | shipped |
 

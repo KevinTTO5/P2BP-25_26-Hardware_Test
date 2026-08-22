@@ -471,7 +471,8 @@ later steps, not Step 2.
 | Situation | Status |
 |-----------|--------|
 | Step 1 pins missing/mismatched | `FAILED` (re-run Step 1) |
-| Artifact/image not yet placed (download failure or no NGC key) | `USER_ACTION_REQUIRED` (guided manual download/login, §5.1/§5.2) |
+| deb/tar download failure (no internet / GitHub unreachable) | `USER_ACTION_REQUIRED` (manual download + placement, §5.1) |
+| NGC key missing at preflight, or `docker login` fails with a stored key | `FAILED` (§2 step 5, §5.2) — a key is guaranteed present after onboarding, so either is an internal ordering bug or a real auth/network error, not an operator-recoverable state |
 | Ambiguous method, interactive | prompt inline; proceeds — no special status |
 | Ambiguous method, `--non-interactive` | proceed with **deb** default |
 | deb/tar/docker install + post-install + smoke all pass | `COMPLETE` |

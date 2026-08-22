@@ -396,8 +396,8 @@ and inside the transcript (§3.2 gives the exact ordering):
 3. **Opt-in gates** — asks once for remote supervision and web-app
    integration, `off` prefilled, unless a flag or environment variable
    already answered (**§3.4**).
-4. **NGC API key** — secret prompt, no echo, stored `chmod 600`; a blank
-   answer is valid and records the manual-download fallback (**§10**).
+4. **NGC API key** — secret prompt, no echo, stored `chmod 600`; the key is
+   required, so a blank answer re-prompts (**§10**).
 5. **Web-app credential** — only when its gate is `on`: API key plus
    endpoint, normalized and stored beside the NGC key (**§14**).
 6. **Dispatch** — the step loop takes over (§3.2).
