@@ -65,8 +65,6 @@ existing harness is untouched during the port):
 
 ```
 installer/
-├── bootstrap/
-│   └── bootstrap.sh                # bare-metal bootstrap (curl|bash + USB)
 ├── plan/                           # these spec docs (this file is 00-*)
 ├── installer.spec                  # PyInstaller build recipe
 ├── pyproject.toml                  # deps + console-script entrypoint
@@ -78,33 +76,73 @@ installer/
     ├── report.py                   # verify_pinned / report_* helpers (§8.3)
     ├── reboot.py                   # boot-id reboot detection (§7)
     ├── privilege.py                # root + $SUDO_USER resolution (§9)
+    ├── preflight.py                # OS/arch + invoking-user gates (§3.2)
+    ├── onboarding.py               # first-run credential capture (§10, §14)
     ├── ngc.py                      # NGC key capture + secure store (§10)
+    ├── webapp.py                   # web-app credential store (§14)
+    ├── cameras.py                  # MAC-OUI camera discovery (§15)
+    ├── waitui.py                   # blocking wait/poll screen (§3.2)
+    ├── systemd.py                  # unit render + idempotent install
     ├── config.py                   # install-location config (§11)
     ├── shellout.py                 # bundled-asset locator + subprocess runner
-    └── steps/
-        ├── __init__.py             # Step protocol, StepResult, STEP_REGISTRY
-        ├── step1_prerequisites.py       # DevA
-        ├── step2_deepstream_sdk.py       # DevB
-        ├── step3_amc_launcher.py         # DevC
-        ├── step4_calib_output_wiring.py  # DevD
-        └── step5_per_project_exes.py     # DevD
-    └── assets/                     # bundled bash/config ported from laptop/
-        ├── scripts/                # ported bash fragments (idempotent)
+    ├── steps/
+    │   ├── __init__.py             # Step protocol, StepResult, STEP_REGISTRY
+    │   ├── step1_prerequisites.py       # DevA
+    │   ├── step2_deepstream_sdk.py       # DevB
+    │   ├── step3_amc_launcher.py         # DevC
+    │   ├── step4_calib_output_wiring.py  # DevD
+    │   └── step5_per_project_exes.py     # DevD
+    └── assets/                     # bundled bash/config, staged at runtime
+        ├── scripts/                # installer-side bash (idempotent)
+        │   ├── lib/
+        │   │   └── common.sh       # installer-side sibling of laptop's common.sh
+        │   ├── 10_setup_mosquitto.sh
+        │   └── 60_record_tracking.sh
+        ├── systemd/                # @PLACEHOLDER@ unit templates
+        │   ├── mv3dt-ingest.path.in
+        │   └── mv3dt-ingest.service.in
+        ├── cameras/
+        │   └── cameras.yml         # seed inventory + fleet header (§15)
         ├── deepstream/             # config templates (tracker/infer/app)
         └── mosquitto/              # mv3dt.conf drop-in
 ```
 
+There is no `bootstrap/` directory: nothing clones this repo onto a
+workstation and nothing builds the binary there (§4.1, §5).
+
 ### 3.2 Entrypoint and dispatch
 
-- `__main__.py` → `app.main()`. `app.main()`:
-  1. Parses CLI flags (see §3.3).
-  2. Resolves privilege + invoking user (`privilege.resolve()`, §9).
-  3. Loads/creates the install-location config (`config.load()`, §11).
-  4. Opens the transcript logger (`logs.open_transcript()`, §8).
-  5. Loads the state file (`state.load()`, §6) and runs
-     `reboot.reconcile()` to clear any satisfied reboot-pending marker (§7).
-  6. Enters the **dispatch loop** over `STEP_REGISTRY` (steps 1→7 in order).
-     Steps 6 and 7 are opt-in and auto-skip when their gate is `off` (§3.4).
+- `__main__.py` → `app.main()`. `app.main()` runs, in this exact order:
+  1. **Parse CLI flags** (§3.3).
+  2. **Load the state file** into the `StateMachine` (`state.py`, §6).
+  3. **`--status`** prints the state table and exits — deliberately still
+     **pre-root**, so an operator can read install progress without `sudo`.
+  4. **`privilege.require_root()`** (§9.1).
+  5. **`onboarding.run_platform_preflight()`** — the Ubuntu 24.04 / `x86_64`
+     gate plus the real-`$SUDO_USER` gate, delegating to `preflight.py`. It
+     replaces the bare `privilege.resolve()` call and returns the same
+     `InvokingUser` (§9.2).
+  6. **Apply the reset flags** (`--reset-state`, `--reset-step N`).
+  7. **Load the install-location config**
+     (`config.load(gate_overrides=...)`, §11) — also where the opt-in gates
+     are seeded from flag, environment, or prompt (§3.4).
+  8. **Open the transcript logger** (`logs.open_transcript()`, §8).
+  9. **`onboarding.onboard()`** — first-run credential capture: the NGC key
+     (§10) and, when its gate is `on`, the web-app credential (§14).
+  10. **`reboot.reconcile()`** to clear any satisfied reboot-pending marker
+      (§7).
+  11. Enter the **dispatch loop** over `STEP_REGISTRY` (steps 1→7 in order).
+      Steps 6 and 7 are opt-in and auto-skip when their gate is `off` (§3.4).
+
+- **Onboarding runs after the transcript opens, deliberately.** Every prompt
+  and its redacted outcome is then part of the auditable record §8.2
+  requires; capturing credentials before `open_transcript()` would leave the
+  one interactive moment of the whole install unlogged. Onboarding is a
+  no-op on every launch after the first (§10.2, §14.3), so the ordering
+  costs a resumed run nothing.
+
+- `--scan-cameras` (§15) is a standalone mode shaped like `--status`, but it
+  runs **after** `require_root()` because ARP scanning needs raw sockets.
 
 - **Dispatch loop** (the core of the state machine, §6):
   For each step in order, if `state.status(step) == COMPLETE`, skip and emit
@@ -134,25 +172,69 @@ Steps may add their own, but the framework owns these:
   value is missing (mirrors `00_bootstrap.sh --non-interactive`).
 - `--no-pause` — skip "press Enter" confirmations.
 - `--log-dir PATH` — override the transcript directory (§8).
-- `-h/--help`, `--version`.
+- `--remote-supervision {off,local,remote}` — set the Step 6 gate (§3.4).
+- `--webapp-integration {off,on}` — set the Step 7 gate (§3.4). Both gate
+  flags default to `None` rather than `off`, so "not passed" stays
+  distinguishable from "passed `off`" — the distinction the precedence in
+  §3.4 depends on.
+- `--scan-cameras` — run camera discovery, write the inventory, and exit
+  (§15).
+- `--camera-scan-cidr CIDR` — override the discovery sweep range (default
+  `169.254.0.0/16`); persisted as `CAMERA_SCAN_CIDR` (§11.2).
+- `--camera-scan-iface IFACE` — restrict discovery to one interface;
+  persisted as `CAMERA_SCAN_IFACE` (§11.2).
+- `-h/--help`, `--version`. `--version` carries **build provenance** in a
+  release build — the tag, the short commit, and the UTC build time stamped
+  in by CI (§4.1):
+
+  ```
+  mv3dt-installer 0.2.0 (v0.2.0, commit a1b2c3d, built 2026-08-19T14:02:11Z)
+  ```
+
+  In a source checkout the stamp is absent and it degrades to
+  `mv3dt-installer 0.2.0`, which is how an operator tells a downloaded
+  release binary from a developer build.
 
 ### 3.4 Opt-in step gates
 
 Steps 1–5 always run. Steps 6 and 7 are **opt-in**: a workstation used only for
 local calibration and ad-hoc pipeline runs needs neither 24/7 supervision nor a
 web-app connection. Each is gated by an `installer.conf` key (§11.2) with a
-matching CLI flag:
+matching CLI flag (§3.3):
 
-| Gate key | Values (default first) | Owning step |
-|---|---|---|
-| `MV3DT_REMOTE_SUPERVISION` | `off` \| `local` \| `remote` | [`STEP-6` §E.2](STEP-6-REMOTE-SUPERVISION.md#e2-gating-opt-in) |
-| `MV3DT_WEBAPP_INTEGRATION` | `off` \| `on` | [`STEP-7` §H.2](STEP-7-WEBAPP-INTEGRATION.md#h2-gating-opt-in) |
+| Gate key | Values (default first) | CLI flag | Owning step |
+|---|---|---|---|
+| `MV3DT_REMOTE_SUPERVISION` | `off` \| `local` \| `remote` | `--remote-supervision` | [`STEP-6` §E.2](STEP-6-REMOTE-SUPERVISION.md#e2-gating-opt-in) |
+| `MV3DT_WEBAPP_INTEGRATION` | `off` \| `on` | `--webapp-integration` | [`STEP-7` §H.2](STEP-7-WEBAPP-INTEGRATION.md#h2-gating-opt-in) |
 
 When a gate is `off` the dispatch loop treats that step as auto-`COMPLETE`
 (skipped) with a one-line log, using the same skip discipline as a genuinely
-completed step (§3.2). Under `--non-interactive` an unset gate stays `off`, so
-an unattended run never enables long-running services or outbound network
-connections the operator did not ask for.
+completed step (§3.2).
+
+**RESOLVED — how a gate value is chosen.** `config.load(gate_overrides=...)`
+seeds each gate key on first write only, preserving the "capture once, then
+read back" discipline: a key already present in `installer.conf` is never
+re-seeded. Four tiers, highest first:
+
+| Tier | Source | Notes |
+|---|---|---|
+| 1 | CLI flag (`--remote-supervision`, `--webapp-integration`) | The supported path. `default=None` is what distinguishes "not passed" from "passed `off`" |
+| 2 | Environment (`MV3DT_REMOTE_SUPERVISION`, `MV3DT_WEBAPP_INTEGRATION`) | Compatibility affordance so `sudo -E ./mv3dt-installer` keeps working for scripted runs |
+| 3 | Interactive prompt with `off` prefilled | Skipped entirely under `--non-interactive` |
+| 4 | `off` | The default, and what `--non-interactive` leaves behind |
+
+This **replaces the `exec sudo -E` hand-off in
+`installer/bootstrap/bootstrap.sh`**, which was the only mechanism carrying
+`MV3DT_WEBAPP_INTEGRATION` from the operator's shell into the process where
+`config.load()` seeded it. With the bootstrap deleted (§5.3), tier 2 alone
+would never reach the installer at all — hence tier 1. A flag passed on a run
+where the key is **already persisted** overwrites the stored value and logs
+the change, so a gate can be turned on later without hand-editing
+`installer.conf`.
+
+Under `--non-interactive` an unset gate stays `off`, so an unattended run
+never enables long-running services or outbound network connections the
+operator did not ask for.
 
 ---
 
@@ -160,29 +242,68 @@ connections the operator did not ask for.
 
 ### 4.1 What builds the binary
 
-The binary is built **during the bootstrap stage** (§5), on the target
-machine, from the cloned public repo. Bootstrap installs Python + build deps
-and runs:
+**GitHub Actions builds the binary; the target machine never builds anything**
+(LOCKED). The build lives in
+[`.github/workflows/release.yml`](../../.github/workflows/release.yml); the
+operator's only artifact is the file attached to a GitHub Release (§5).
 
-```bash
-python3 -m pip install --user pyinstaller
-pyinstaller installer/installer.spec --distpath installer/dist --workpath /tmp/mv3dt-build
-```
+| Aspect | Contract |
+|---|---|
+| Publish trigger | `push` on tags matching `v*` |
+| Dry-run triggers | `pull_request` touching `installer/**` (builds, uploads a 7-day artifact, never publishes); `workflow_dispatch` with a `draft` input |
+| Runner | **`ubuntu-24.04`, pinned — never `ubuntu-latest`** |
+| Version gate | Fails the build unless `"v" + mv3dt_installer.__version__` equals `$GITHUB_REF_NAME` |
+| Build command | `pyinstaller installer/installer.spec --distpath dist --workpath /tmp/mv3dt-build --clean --noconfirm` |
+| Smoke test | As the unprivileged runner user: `--version` contains the tag's version and `--status` exits 0 |
+| Release assets | `mv3dt-installer` and `mv3dt-installer.sha256` |
+| Publish command | `gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag dist/mv3dt-installer dist/mv3dt-installer.sha256` |
+
+**Why the runner is pinned (LOCKED).** PyInstaller `--onefile` links its
+bootloader against the **build host's glibc**. A binary built on a newer
+runner image will not start on the Ubuntu 24.04 target, and `ubuntu-latest`
+floats — it would one day silently produce an unusable release. The pin is
+the only thing preventing that, so the workflow line carries a comment saying
+so.
+
+`--status` is the right smoke probe precisely because `app.main()` runs it
+**before** `privilege.require_root()` (§3.2): it exercises argparse,
+`state.py`'s forgiving reader, and `sys._MEIPASS` unpacking without root,
+apt, or a GPU.
+
+**Versioning and stamping.** `mv3dt_installer/__init__.py::__version__` is the
+single source of truth; `pyproject.toml` reads it dynamically so the two
+cannot drift. Bumping the version is an ordinary source commit — tagging is
+what publishes. CI writes an **untracked** `mv3dt_installer/_buildinfo.py`
+(`TAG`, `COMMIT`, `BUILT_UTC`) which `__init__.py` imports inside a
+`try/except ImportError` with a source-mode fallback; that is what `--version`
+renders (§3.3). No workflow ever writes a tracked file.
 
 `installer.spec` (data-only summary; DevA owns the exact spec):
 
 - `Analysis(['installer/mv3dt_installer/__main__.py'], ...)`.
 - `datas` bundles the runtime assets so they ship inside the binary:
-  - `installer/mv3dt_installer/assets/**` → `assets/`
+  - `installer/mv3dt_installer/assets/**` → `assets/` (the whole tree, §3.1)
   - the DeepStream config templates from
     [`laptop/deepstream/`](../../laptop/deepstream/) (tracker/infer/app/msgconv)
   - [`laptop/mosquitto/mv3dt.conf`](../../laptop/mosquitto/mv3dt.conf)
-- `--onefile` → one executable at `installer/dist/mv3dt-installer`.
-- No hidden GUI toolkits; only stdlib + a small TUI dep (e.g. `rich` or
-  `questionary`) and `pyyaml`. Keep the dep list minimal so the binary is
-  small and boots fast on a bare TTY.
+  - [`laptop/config/cameras.yml`](../../laptop/config/cameras.yml) →
+    `assets/cameras/cameras.yml`, the seed inventory §15 reads
+- `--onefile` → one executable at `dist/mv3dt-installer`. The build step
+  passes `--distpath dist` with no `working-directory` override, so the
+  output directory is `dist` at the **repo root**, not under `installer/`.
+  (`installer.spec`'s own build-header comment still says `installer/dist`;
+  that comment is stale against the actual workflow and is not fixed here —
+  it lives in a different plan unit's file.) The repo-root `dist/` is not
+  covered by any `.gitignore` rule today: `installer/.gitignore`'s `dist/`
+  line is scoped to the `installer/` subtree and only ignores
+  `installer/dist/`. A developer running the build command locally from the
+  repo root gets the same `dist/mv3dt-installer` the workflow does.
+- No hidden GUI toolkits and no third-party parsers on the hot path: the
+  camera inventory reader in `cameras.py` is hand-rolled rather than pulling
+  in PyYAML, so the frozen binary gains no hidden-import surface. Keep the dep
+  list minimal so the binary is small and boots fast on a bare TTY.
 
-### 4.2 Locating bundled assets at runtime
+### 4.2 Locating and staging bundled assets at runtime
 
 PyInstaller `--onefile` unpacks datas into a temp dir exposed as
 `sys._MEIPASS`. `shellout.py` MUST resolve asset paths through a single
@@ -196,89 +317,109 @@ def asset_path(*parts: str) -> pathlib.Path:
     return pathlib.Path(__file__).parent / "assets" / *parts   # dev mode
 ```
 
-- Bundled bash fragments are extracted to a run-scoped temp dir, `chmod +x`,
-  and executed via `subprocess` with the environment prepared by
-  `privilege.py` (§9). Never execute directly from `sys._MEIPASS` if the
-  fragment writes next to itself — copy out first.
+- **`stage_assets(*parts, prefix=...) -> Path` (REQUIRED for bash).** Copies a
+  bundled asset **directory** out of `sys._MEIPASS` into a fresh temp dir,
+  preserving structure, `chmod 0755` on `*.sh` and `0644` otherwise. Staging
+  the whole tree is what makes `source "$SCRIPT_DIR/lib/common.sh"` resolve —
+  copying a single file leaves its `lib/` sibling behind in the bundle, and
+  the staged script dies on its first line.
+- **`run_bundled_script(..., tree=None, inherit_env=True, cleanup=True)`.**
+  `tree=("scripts",)` stages the tree and runs from inside it. The staged bash
+  is pointed at its own root with `MV3DT_ASSET_ROOT` and at the shared config
+  with `MV3DT_INSTALLER_CONF=<install_dir>/installer.conf` (§11.2) — the two
+  variables that replace the repo-root and `laptop.env` lookups the original
+  `laptop/scripts/lib/common.sh` did.
+- **`inherit_env=True` merges `env` over `os.environ`** instead of replacing
+  it. Replacement semantics strip `PATH`, which breaks every `command -v` in
+  the staged bash; `inherit_env=False` is the explicit opt-out for a
+  deliberately sterile environment.
+- **Transcript capture (REQUIRED).** The command line and both output streams
+  are logged through `logs.log`, satisfying §8.2's requirement that
+  shelled-out stdout/stderr reach the transcript. Redaction is applied to any
+  `KEY=value` occurrence of `NGC_API_KEY`, `API_KEY`, `CAM_PASSWORD`, or
+  `MQTT_PASSWORD`, which print as `<redacted>` (§10.1, §14.4).
+- **`cleanup=True` removes the staging dir in a `finally`.** `cleanup=False`
+  preserves it for debugging and is what tests use. Never execute directly
+  from `sys._MEIPASS` — stage first, always.
 - The binary is the unit of delivery; the operator does **not** need the repo
-  checkout at runtime. (The bootstrap still leaves the clone in place for
-  logs/debugging.)
+  checkout at runtime, and there is no checkout to fall back on. Nothing
+  clones this repo onto a workstation (§5.3), so a staged tree plus
+  `installer.conf` is the entire world a bundled script sees.
 
 ---
 
-## 5. Bare-metal bootstrap script
+## 5. Distribution: the GitHub Release binary
 
-Path: [`installer/bootstrap/bootstrap.sh`](../bootstrap/bootstrap.sh).
-Delivered two ways with identical behavior:
+One artifact, downloaded from this repo's **Releases** page onto a bare
+Ubuntu 24.04 workstation that has `git` and nothing else. This section
+supersedes the deleted `installer/bootstrap/bootstrap.sh`; §5.3 records what
+that script did and where each responsibility went.
 
-- **`curl | bash` one-liner** (network install):
+### 5.1 Operator procedure
 
-  ```bash
-  curl -fsSL https://raw.githubusercontent.com/KevinTTO5/P2BP-25_26-Hardware_Test/main/installer/bootstrap/bootstrap.sh | sudo -E bash
-  ```
-
-- **USB-file variant** (offline/lab install): copy `bootstrap.sh` from the
-  USB stick and run it directly:
-
-  ```bash
-  sudo -E bash /media/usb/bootstrap.sh
-  ```
-
-  It behaves identically; if it detects it is already running from inside a
-  clone (`installer/bootstrap/bootstrap.sh` present alongside a `.git`), it
-  skips the clone step and builds from the local tree.
-
-### 5.1 Exact responsibilities (in order)
-
-1. **Preflight**: confirm Ubuntu 24.04 + `x86_64` (mirror the checks in
-   [`00_bootstrap.sh` Phase 0](../../laptop/scripts/00_bootstrap.sh)); confirm
-   run as root via `sudo` and that `$SUDO_USER` is a real non-root login
-   (§9).
-2. **Install `git` + build deps** (single apt transaction):
-   `git`, `python3`, `python3-venv`, `python3-pip`, `ca-certificates`,
-   `curl`, `build-essential`. (These are the minimum to clone and to build
-   the PyInstaller binary; the full stack is installed later by Step 1.)
-3. **Clone the PUBLIC repo — no GitHub auth.** The repo lives in a public
-   GitHub org, so cloning uses an anonymous HTTPS URL with **no token, no SSH
-   key, no credential prompt**:
+1. **Open the Releases page** in a browser on the target workstation:
+   <https://github.com/KevinTTO5/P2BP-25_26-Hardware_Test/releases/latest>.
+2. **Download both assets** attached to the release: the executable
+   `mv3dt-installer` and its checksum `mv3dt-installer.sha256`.
+3. **Verify, mark executable, run** — from the download directory:
 
    ```bash
-   git clone --depth 1 https://github.com/KevinTTO5/P2BP-25_26-Hardware_Test.git "$CLONE_DIR"
+   sha256sum -c mv3dt-installer.sha256
+   chmod +x mv3dt-installer
+   sudo ./mv3dt-installer
    ```
 
-   `GIT_TERMINAL_PROMPT=0` is exported so a mis-set private repo fails fast
-   instead of hanging on a credential prompt. Default `CLONE_DIR` is the
-   invoking user's home: `"$SUDO_USER_HOME/P2BP-25_26-Hardware_Test"`.
-4. **Capture the NGC API key (bootstrap stage).** Prompt the operator (secret
-   input, no echo). Store it ONLY locally per §10 (gitignored env file,
-   `chmod 600`). If the operator leaves it blank, record "manual download
-   fallback" so Step 2 knows to use the guided manual placement path. The key
-   is NEVER written to the transcript log, NEVER committed, NEVER passed on a
-   command line that lands in shell history.
-5. **Capture the web-app credential (optional, bootstrap stage).** Only when
-   `MV3DT_WEBAPP_INTEGRATION` is on (§3.4). Prompt for `API_KEY` (secret input,
-   no echo) and `ENDPOINT` (plain), normalize the endpoint, and store both per
-   §14. Blank input leaves the gate effectively inert and Step 7 surfaces a
-   USER-ACTION block on its first run. Same secrecy rules as the NGC key: never
-   logged, never committed, never on a command line.
-6. **Build the single binary** with PyInstaller (§4.1), building as the
-   invoking user where possible (only the final launch needs root).
-7. **Launch the installer**:
+   `sha256sum -c` must print `mv3dt-installer: OK`. If it does not, the
+   download is corrupt or tampered with — re-download; do not run it.
 
-   ```bash
-   sudo -E installer/dist/mv3dt-installer
-   ```
+That is the whole delivery mechanism. There is **no `curl | bash` one-liner**
+— a piped shell script cannot be checksum-verified before it executes, which
+is exactly the property the release asset buys — and **no separate USB
+variant**: an offline lab install moves the same two files by whatever means,
+then verifies and runs them identically. No step of this procedure clones a
+repository, installs a compiler, or builds anything (§5.3).
 
-   From here the binary owns the flow (state machine + dispatch, §3.2). On
-   subsequent runs the operator re-launches the binary directly; bootstrap is
-   only needed once (or after `git pull` + rebuild).
+### 5.2 What the binary does on first launch
 
-### 5.2 Idempotency
+Everything the bootstrap used to do before handing off, now inside the exe
+and inside the transcript (§3.2 gives the exact ordering):
 
-Re-running `bootstrap.sh` is safe: apt installs are no-ops when satisfied
-(reported per §8.3), the clone is refreshed with `git pull` if the directory
-already exists, and the binary is rebuilt only if missing or `--rebuild` is
-passed.
+1. **Platform preflight** — Ubuntu 24.04 + `x86_64`, running as root via
+   `sudo`, and `$SUDO_USER` resolving to a real non-root login (§9.2).
+   `MV3DT_SKIP_PLATFORM_CHECK=1` is the **planned** developer escape hatch
+   that downgrades the platform half to a warning; it arrives with
+   `preflight.py` and exists nowhere in the tree today. The `$SUDO_USER`
+   gate gets no escape hatch at all, because without it every secret and
+   every per-user artifact lands in `/root`.
+2. **Install location** — prompts with `/opt/mv3dt` prefilled (§11.1) and
+   writes `installer.conf` (§11.2).
+3. **Opt-in gates** — asks once for remote supervision and web-app
+   integration, `off` prefilled, unless a flag or environment variable
+   already answered (**§3.4**).
+4. **NGC API key** — secret prompt, no echo, stored `chmod 600`; a blank
+   answer is valid and records the manual-download fallback (**§10**).
+5. **Web-app credential** — only when its gate is `on`: API key plus
+   endpoint, normalized and stored beside the NGC key (**§14**).
+6. **Dispatch** — the step loop takes over (§3.2).
+
+On every launch after the first, preflight re-checks the platform and
+onboarding is a **no-op**: "have we already asked?" is answered by the
+existence of the secret file, not by parsing its contents (§10.2, §14.3), so
+nothing re-prompts and the run resumes at the first non-`COMPLETE` step.
+
+### 5.3 What the bootstrap did, and where it went (LOCKED)
+
+| Bootstrap responsibility | Disposition |
+|---|---|
+| `git clone` of this repo onto the target | **Removed.** The binary is self-contained and the assets ship inside it (§4.2). Nothing clones this repo onto a workstation. |
+| apt-installing build deps (`python3-venv`, `python3-pip`, `build-essential`, `curl`, `ca-certificates`) | **Removed.** A frozen PyInstaller binary needs no Python, venv, or toolchain at runtime, and the one real apt transaction belongs to [`STEP-1` §3](STEP-1-PREREQUISITES.md#3-ds-91-41-apt-prerequisite-package-list). |
+| Building the binary with PyInstaller on the target | **Removed.** CI builds it once on the pinned runner (§4.1). |
+| Ubuntu / arch preflight | **Kept**, in `preflight.py`, reading `/etc/os-release` rather than shelling to `lsb_release` (not installed on minimal Ubuntu 24.04). |
+| `$SUDO_USER` validation | **Kept**, in `preflight.py`. Not cosmetic: `privilege.resolve()` falls back to `getpass.getuser()`, which under a bare root shell returns `root` and would put `secrets/`, `~/.ngc/config`, and the AMC clone in `/root`. |
+| NGC key capture | **Kept**, in `onboarding.py` (§10.2). |
+| Web-app credential capture | **Kept**, in `onboarding.py` (§14.3). |
+| `exec sudo -E` to carry gate environment variables into the installer | **Replaced** by real CLI flags with a four-tier precedence (§3.4). |
+| `--rebuild` / re-clone idempotency | **Not applicable.** Re-running means re-running one downloaded file; upgrading means downloading a newer release. |
 
 ---
 
@@ -492,9 +633,13 @@ the driver and `libnvinfer*`; see [References](#references)).
   `/etc/profile.d/*`, `/var/lib/*`). `privilege.require_root()` mirrors
   `require_root` in [`lib/common.sh`](../../laptop/scripts/lib/common.sh):
   exit with a clear message if `os.geteuid() != 0`.
-- The operator launches it via `sudo -E mv3dt-installer` (the `-E` preserves
-  a pre-set `NGC_API_KEY` in the environment if the operator prefers env over
-  the prompt; see §10).
+- The operator launches it via `sudo ./mv3dt-installer`. `-E` is **no longer
+  required for the opt-in gates** — `--remote-supervision` and
+  `--webapp-integration` are real flags (§3.4), and there is no longer a
+  bootstrap `exec sudo -E` to carry the environment across. Use `sudo -E`
+  only to pass a pre-set `NGC_API_KEY` through the environment instead of
+  answering the prompt; `onboarding.py` is what honors it, before prompting
+  (§10.2).
 
 ### 9.2 Resolving the invoking user / home
 
@@ -561,8 +706,8 @@ already in [`00_bootstrap.sh`](../../laptop/scripts/00_bootstrap.sh)
 
 ## 10. NGC API key capture + local secure storage
 
-The key is captured in the **bootstrap stage** (§5.1 step 4) and consumed by
-**Step 2** for the PeopleNet model fetch and for the Docker install method
+The key is captured on first launch by `onboarding.py` (§5.2) and consumed
+by **Step 2** for the PeopleNet model fetch and for the Docker install method
 (both are NGC-gated), and by later steps that pull gated NGC content. The DS
 SDK deb/tar artifacts themselves are **public GitHub Release assets** and do
 not need this key — see [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md#1-locked-facts-and-pins-from-ds-91-docs)
@@ -594,6 +739,18 @@ for the acquisition split.
   `~/.ngc/config` (`chmod 600`) as the invoking user, mirroring Phase 10 of
   [`00_bootstrap.sh`](../../laptop/scripts/00_bootstrap.sh).
 
+**The caller is `onboarding.ensure_ngc_key()`** (§3.2, §5.2), which runs on
+every launch and must be silent after the first. Two rules make that true:
+
+- **"Have we already asked?" is the existence of
+  `<install_dir>/secrets/ngc.env`, not the result of `load_key()`.**
+  `load_key()` returns `None` both for "never captured" and for "the operator
+  chose the manual fallback", so keying off it would re-prompt on every
+  launch. A blank answer therefore still writes the file, carrying the
+  fallback marker.
+- **A pre-set `NGC_API_KEY` in the environment is honored before prompting**
+  (`sudo -E`, §9.1), then stored through `store_key` like any other value.
+
 ### 10.3 Manual fallback
 
 If `load_key()` is `None`, steps that need NGC-gated content (the Docker
@@ -622,24 +779,48 @@ URLs and placement paths.
   single source of truth — and mirrored into a small
   `<install_dir>/installer.conf` (KEY=VALUE) for human inspection and for
   bundled bash fragments (`set -a; . installer.conf`), same shape as
-  [`laptop/config/laptop.env`](../../laptop/config/laptop.env.example).
+  [`laptop/config/laptop.env`](../../laptop/config/laptop.env.example). It is
+  the file `MV3DT_INSTALLER_CONF` points staged bash at (§4.2).
 - `config.load()` resolves precedence: `--install-dir` > `state.json` >
-  `installer.conf` default > `/opt/mv3dt`.
+  `installer.conf` default > `/opt/mv3dt`. Every consumer of a path under the
+  install root MUST take it from `config.load()`; a module-level default read
+  unconditionally silently ignores `--install-dir` (§14.3 records one such
+  bug).
 - Layout under the install dir (created by the framework, consumed by steps):
 
   ```
   <install_dir>/
-  ├── installer.conf        # chosen path + shared vars
+  ├── installer.conf        # chosen path + shared vars (table below)
+  ├── cameras.yml           # runtime camera inventory, MAC-keyed (§15)
+  ├── cameras.scan.json     # raw scan record: MACs, ifaces, unmatched (§15)
+  ├── cameras/              # still frames captured for position binding (§15)
   ├── secrets/
   │   ├── ngc.env           # NGC key, chmod 600 (§10)
   │   └── webapp.env        # API_KEY + ENDPOINT, chmod 600 (§14)
-  ├── bin/                  # per-project exes dropped here (Steps 3 & 5)
+  ├── bin/
+  │   ├── mv3dt-installer   # the installed copy of the release binary
+  │   └── ...               # per-project exes dropped here (Steps 3 & 5)
   ├── deepstream/           # rendered DS configs + calibration (Step 4)
   ├── projects/             # per-project registry entries (Step 5)
   ├── agent/                # MQTT control agent env/config (Step 6)
   ├── webapp/               # upload queue + run-state files (Step 7)
   └── run/                  # worker state files, fan-in source (Step 7 §F.2)
   ```
+
+- `<install_dir>/bin/mv3dt-installer` is the stable, absolute path a systemd
+  unit's `ExecStart` can name — the operator's downloaded copy may live
+  anywhere, or be deleted.
+- Shared variables written into `installer.conf`:
+
+  | Key | Meaning |
+  |---|---|
+  | `MV3DT_INSTALL_DIR` | The resolved install root; every other path is relative to it |
+  | `MV3DT_REMOTE_SUPERVISION` | Step 6 gate (§3.4) |
+  | `MV3DT_WEBAPP_INTEGRATION` | Step 7 gate (§3.4) |
+  | `CAMERAS_FILE` | Absolute path to the runtime camera inventory, normally `<install_dir>/cameras.yml` (§15) |
+  | `CAMERA_SCAN_CIDR` | Sweep range for discovery; default `169.254.0.0/16` (§15.2) |
+  | `CAMERA_SCAN_IFACE` | Restrict discovery to one interface; empty means every candidate interface (§15.2) |
+  | `CAM_USER` / `CAM_PASSWORD` | Camera RTSP credentials used by the §15.3 probe; redacted in every log line (§4.2) |
 
 - **Steps 3 and 5** drop per-project executables into `<install_dir>/bin/`;
   **Step 4** writes rendered DeepStream config + calibration under
@@ -763,8 +944,15 @@ Each step doc defines its own internals but consumes only the contracts above:
   §1–3: hardware selection, BIOS (Secure Boot, virtualization, discrete-GPU
   primary), and the Ubuntu 24.04 dual-boot install itself. The installer
   assumes it is already booted into Ubuntu 24.04.
-- Per-camera IP / stream-profile configuration via each camera's web UI
-  (Notion §7.1–7.4). The pipeline only consumes the resulting RTSP URLs.
+- **Per-camera setup through each camera's web UI stays manual** (Notion
+  §7.1–7.4): activation (the fleet ships un-activated and refuses RTSP until
+  an admin password is set), disabling OSD text, and stream-profile
+  selection. **Camera IP discovery is NOT out of scope** — it is owned by
+  §15. There is no IP to configure by hand: the fleet self-assigns
+  `169.254.*` link-local addresses that are neither DHCP-reserved nor
+  derivable from the MAC, so the installer discovers cameras by MAC OUI
+  instead of trusting a pinned list. The pipeline consumes the resulting
+  RTSP URLs.
 - Secure Boot MOK enrollment and any BIOS interaction — surfaced as
   `USER_ACTION_REQUIRED` by Step 1, performed by the operator.
 - `ufw`, Tailscale/NoMachine, and dashboards — see the "Out of scope" /
@@ -854,25 +1042,55 @@ component.
 
 ### 14.3 Capture + handoff API (`webapp.py`)
 
-Mirrors the §10.2 shape so the two credential handles behave identically:
+Mirrors the §10.2 shape so the two credential handles behave identically. The
+caller is `onboarding.ensure_webapp_credentials()` (§3.2, §5.2), and only when
+the §3.4 gate is `on`:
 
-- `capture_credentials(non_interactive: bool) -> Credentials` — the prompt
-  flow. **When a value already exists, ask before replacing it** rather than
-  forcing re-entry: print that a credential was found and offer to keep it,
-  defaulting to keep. The key prompt suppresses echo; the endpoint prompt does
-  not. Under `--non-interactive`, existing values are kept silently and missing
-  ones are left unset.
+- `capture_credentials(non_interactive: bool, install_dir=...) -> Credentials`
+  — the prompt flow. **When a value already exists, ask before replacing it**
+  rather than forcing re-entry: print that a credential was found and offer to
+  keep it, defaulting to keep. The key prompt suppresses echo; the endpoint
+  prompt does not. Under `--non-interactive`, existing values are kept
+  silently and missing ones are left unset. A blank endpoint writes nothing
+  and warns — `store_credentials` requires both fields — and
+  [`STEP-7`](STEP-7-WEBAPP-INTEGRATION.md) surfaces its USER-ACTION block on
+  first run.
 - `store_credentials(creds, install_dir) -> Path` — writes `secrets/webapp.env`
   via the §6.3 atomic-write discipline, then `chmod 600` and `chown` to the
   invoking user. Write-then-permission ordering matters: create the file with a
   restrictive mode from the start (`os.open` with `0o600`) so the key is never
   briefly world-readable.
-- `load_credentials() -> Credentials | None` — reads back, re-normalizes the
-  endpoint (§14.2), and returns `None` when either value is missing. Steps
-  treat `None` as "not configured" and surface a USER-ACTION block (§9.3), not
-  a crash.
-- `enabled() -> bool` — the §3.4 gate combined with a successful
-  `load_credentials()`. This is what a step's `preflight` checks.
+- `load_credentials(install_dir=...) -> Credentials | None` — reads back,
+  re-normalizes the endpoint (§14.2), and returns `None` when either value is
+  missing. Steps treat `None` as "not configured" and surface a USER-ACTION
+  block (§9.3), not a crash. This one **already** takes `install_dir` and
+  honors it.
+- `enabled(gate_value: str, install_dir=...) -> bool` — the §3.4 gate combined
+  with a successful `load_credentials()`. This is what a step's `preflight`
+  checks. `gate_value` is **mandatory and stays first**; see the callout.
+
+> **`install_dir` parameter (REQUIRED — fixes a real bug).** The defect is
+> confined to `capture_credentials` and `enabled`: each calls a **bare
+> `load_credentials()`** internally, so both read the module-level
+> `DEFAULT_INSTALL_DIR` and **ignore `--install-dir`** (§3.3).
+> `load_credentials` itself is already correct. With a non-default install
+> root, `capture_credentials` compares against — and `enabled` reads — a
+> `secrets/webapp.env` under `/opt/mv3dt` while every other component uses the
+> chosen root, so a captured credential appears to vanish between capture and
+> use. Both gain the same **optional** `install_dir`, defaulting to
+> `DEFAULT_INSTALL_DIR` so the zero-argument call sites documented above keep
+> working, and both pass it through to `load_credentials`. Framework callers
+> MUST pass the path resolved by `config.load()` (§11.2).
+
+> **`gate_value` is not replaced (REQUIRED).** `enabled` keeps
+> `gate_value: str` as its first parameter and gains `install_dir` alongside
+> it. `webapp.py` must not import `config.py`, so the gate cannot be resolved
+> inside this module: the caller (`app.py`, which has both) resolves
+> `MV3DT_WEBAPP_INTEGRATION` and passes the string in. A signature that
+> dropped `gate_value` in favor of `install_dir` would force exactly the
+> import the module is designed to avoid. `app.WebappHandle.enabled()`'s
+> existing install-dir-bound workaround stays as it is — it is correct and
+> documented (§12.3) — the underlying function simply becomes bindable too.
 
 ### 14.4 Redaction (REQUIRED)
 
@@ -898,6 +1116,161 @@ output, so redaction is a contract, not a nicety. Two distinct rules:
   This applies to failure paths too — an exception message containing a raw
   signed URL is the most likely way one leaks, so the redaction happens in the
   logging helper, not at each call site.
+
+---
+
+## 15. Camera discovery
+
+Owner: framework (`cameras.py`). Consumed by
+[`STEP-4`](STEP-4-CALIB-OUTPUT-WIRING.md) when rendering source URIs and by
+[`STEP-5` §3.3](STEP-5-PER-PROJECT-EXES.md#33-what-the-exe-does-at-runtime-pipeline-subcommand)
+for its pre-flight reachability check. `--scan-cameras` (§3.3) runs it
+standalone: discover, probe, bind, write both artifacts, print the table, exit.
+
+**LOCKED — the MAC is the camera's identity.** Every merge, every lookup, and
+every persisted binding keys on the MAC address, never on the IP.
+[`laptop/config/cameras.yml`](../../laptop/config/cameras.yml) says so in its
+own header ("MACs are the STABLE identifier"), and everything in this section
+follows from it.
+
+### 15.1 Why discovery, not a pinned list
+
+The fleet is eight ANNKE cameras on Hikvision-OEM firmware, OUI **`d0:3b:f4`**,
+on a LAN with no DHCP server. They self-assign `169.254.0.0/16` link-local
+addresses that are neither reserved nor derivable from the MAC, and a camera
+can land on a different address after a power cycle. `cameras.yml`'s own
+caveat records a prior snapshot of four of these cameras whose IP set was
+**completely disjoint** from the eight pinned addresses beside it. A static
+list is therefore a starting hint, not a source of truth — which is why §13
+keeps per-camera web-UI setup manual but puts IP discovery in scope.
+
+> **No MAC-to-position mapping survived the Jetson deletion.** The removed
+> `config.json` keyed cameras by MAC; `cameras.yml` keys them by IP and
+> position; the two files shared no common field. See
+> [`DELETION-REVIEW` §4.1](DELETION-REVIEW.md#41-camera-facts-harvested-before-deletion).
+> This is the entire reason the binding in §15.4 must be established once by a
+> human rather than derived — there is nothing to derive it from.
+
+### 15.2 Discovery mechanism
+
+1. **Candidate interfaces.** `candidate_interfaces()` enumerates
+   `/sys/class/net` and drops `lo`, `docker*`, `veth*`, `br-*`, `virbr*`, and
+   anything without an IPv4 address. `CAMERA_SCAN_IFACE` (§11.2) narrows this
+   to one.
+2. **Primary: `arp-scan`.** `arp-scan --interface <if> --localnet` per
+   candidate, plus an explicit `<cidr>` sweep when the interface's own address
+   is not link-local. This needs raw sockets — the installer is already root
+   (§9.1). `arp-scan` joins the apt list in
+   [`STEP-1` §3](STEP-1-PREREQUISITES.md#3-ds-91-41-apt-prerequisite-package-list).
+   A full `/16` sweep takes roughly two minutes, so the range is
+   configurable via `CAMERA_SCAN_CIDR` and step-driven calls wrap it in the
+   blocking wait screen (`waitui.py`, §3.1).
+3. **Fallback: the kernel ARP cache.** When `arp-scan` is absent, prime the
+   cache by pinging `prime_ips` — the last-known IPs from the previous
+   inventory, or the bundled seed (§4.1) on first run — then read `ip -4 neigh
+   show`. This **cannot** find a camera that moved to an address nobody has
+   seen; `ScanResult.tool` records which mechanism ran so the limitation is
+   visible rather than implied.
+4. **Filter by OUI**, case- and separator-insensitively (`d0:3b:f4`,
+   `D0-3B-F4`, and `d03b.f401.5279` are the same prefix). Non-matching hosts
+   are retained in `ScanResult.unmatched`, so an operator can tell "the scan
+   found nothing" apart from "the scan did not run".
+
+### 15.3 RTSP probe
+
+Discovery proves a host answers ARP; it does not prove the camera serves
+video. Each discovered camera is probed with
+`ffprobe -rtsp_transport tcp` against
+`rtsp://<user>:<pass>@<ip>:554<rtsp_path>`, and the result is recorded as
+`stream_ok` in the inventory. This is the check ported out of
+`laptop/scripts/20_verify_cameras.sh`, and it is the distinction
+[`STEP-5` §3.3](STEP-5-PER-PROJECT-EXES.md#33-what-the-exe-does-at-runtime-pipeline-subcommand)
+flags between a ping sweep and a usable stream. Credentials come from
+`CAM_USER` / `CAM_PASSWORD` in `installer.conf` (§11.2) and the password is
+redacted in every log line (§4.2). `ffmpeg` joins the same apt list
+([`STEP-1` §3](STEP-1-PREREQUISITES.md#3-ds-91-41-apt-prerequisite-package-list)).
+
+A failing probe on an activated camera is usually the manual pre-flight in
+§13 not having been done — the camera ships un-activated and refuses RTSP
+until an admin password is set.
+
+### 15.4 Guided position binding (one time)
+
+For each newly discovered MAC with no persisted position:
+
+1. `grab_still()` captures a single frame (`ffmpeg -frames:v 1`) to
+   `<install_dir>/cameras/still-<mac>.jpg`.
+2. `bind_positions()` prints that path and asks the operator which position
+   the camera occupies — one of the known positions from the seed inventory
+   (`top-left`, `top-right`, `middle-top-left`, and so on) or a newly typed
+   one. One camera at a time; eight prompts, once, ever.
+3. The resulting `mac → id → position` binding persists to
+   `<install_dir>/cameras.yml`.
+
+**Later scans match on MAC and refresh only the IP.** An existing entry keeps
+its `id`, `position`, `enabled`, and `rtsp_path`; a camera that has gone
+missing is **retained and flagged, never deleted**, because a powered-off
+camera is not a decommissioned one.
+
+Under `--non-interactive`, binding is skipped rather than blocked on: ids are
+assigned `c<N>` in MAC-sorted order and `position` is left empty with an
+inline comment telling the operator to re-run `--scan-cameras` interactively
+to label them. An unattended run must never wait for a human.
+
+### 15.5 Outputs
+
+| Artifact | Path |
+|---|---|
+| Runtime inventory (MAC-keyed, hand-editable positions) | `<install_dir>/cameras.yml` |
+| Raw scan record — MACs, interfaces, unmatched hosts, timestamps | `<install_dir>/cameras.scan.json`, written with the §6.3 `write_json_atomic` helper |
+| Still frames captured for binding | `<install_dir>/cameras/still-<mac>.jpg` |
+| Pointer consumed by steps and bundled bash | `CAMERAS_FILE` in `installer.conf` (§11.2) |
+| Scan tuning | `CAMERA_SCAN_CIDR`, `CAMERA_SCAN_IFACE` in `installer.conf` (§11.2) |
+
+The generated `<install_dir>/cameras.yml` carries a
+`# Generated by mv3dt-installer --scan-cameras at <utc>; do not hand-edit IPs`
+banner above the header block inherited from the seed inventory — the fleet
+MAC list, the 3072x1728 sensor note, the volatility caveat, and the manual
+activation / OSD pre-flight, all of which
+[`CLAUDE.md`](../../CLAUDE.md) treats as load-bearing documentation rather
+than commentary.
+
+[`laptop/config/cameras.yml`](../../laptop/config/cameras.yml) itself **stays
+exactly where it is**, unmoved and undeleted; it is additionally bundled into
+the binary as `assets/cameras/cameras.yml` (§4.1) and used for exactly two
+things: that header block, and its eight pinned IPs as `prime_ips` for the
+§15.2 fallback.
+
+### 15.6 API surface (`cameras.py`)
+
+```python
+CAMERA_OUI = "d0:3b:f4"
+DEFAULT_SCAN_CIDR = "169.254.0.0/16"
+KNOWN_POSITIONS = ("top-left", "top-right", "middle-top-left", ...)   # seed inventory
+
+@dataclass(frozen=True)
+class Camera:
+    id: str; mac: str; ip: str; position: str
+    rtsp_path: str = "/Streaming/Channels/101"
+    enabled: bool = True
+    stream_ok: bool | None = None          # §15.3 probe result
+
+def normalize_mac(raw) -> str
+def matches_oui(mac, oui=CAMERA_OUI) -> bool
+def parse_inventory(text) -> list[Camera]
+def render_inventory(cameras, *, header) -> str
+def candidate_interfaces(*, runner=subprocess.run) -> list[str]
+def discover(*, oui, cidr, interfaces=None, prime_ips=(), runner=...) -> ScanResult
+def probe_rtsp(camera, *, user, password, timeout_us=5_000_000, runner=...) -> bool
+def grab_still(camera, *, user, password, dest, runner=...) -> Path | None
+def bind_positions(cameras, *, prompt, non_interactive, runner=...) -> list[Camera]
+def merge(previous, discovered) -> list[Camera]
+def refresh(install_dir, *, seed_header=None, prompt=input, runner=...) -> ScanResult
+```
+
+Every subprocess goes through an injected `runner` (production callers pass
+`ctx.run_root`, §12.3) and the inventory parser is hand-rolled rather than
+PyYAML-backed, for the packaging reason in §4.1.
 
 ---
 
@@ -943,6 +1316,12 @@ Repo files referenced:
   — source workflow the installer unifies.
 - [`laptop/.gitignore`](../../laptop/.gitignore) — precedent for gitignoring
   local secrets/env (`config/laptop.env`).
+- [`.github/workflows/release.yml`](../../.github/workflows/release.yml) —
+  the CI build that produces and publishes the release binary (§4.1); the
+  only place the binary is ever built.
+- [`laptop/config/cameras.yml`](../../laptop/config/cameras.yml) — retained
+  fleet inventory: the `d0:3b:f4` OUI, the MAC-as-identity rule, and the
+  link-local volatility caveat that §15 exists to survive.
 - [`STEP-6-REMOTE-SUPERVISION.md`](STEP-6-REMOTE-SUPERVISION.md) — the opt-in
   control plane (§3.4 gate, §12.4 map).
 - [`STEP-7-WEBAPP-INTEGRATION.md`](STEP-7-WEBAPP-INTEGRATION.md) — the opt-in
