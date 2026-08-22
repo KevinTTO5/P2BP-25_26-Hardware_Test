@@ -35,6 +35,22 @@ from mv3dt_installer.steps import (  # noqa: E402
 )
 
 
+@pytest.fixture(autouse=True)
+def _force_no_colour(monkeypatch):
+    """Match test_logs.py / test_privilege.py's convention, so the stderr
+    assertions below see plain, un-escaped lines."""
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_transcript_state():
+    from mv3dt_installer import logs
+
+    logs._transcript_path = None
+    yield
+    logs._transcript_path = None
+
+
 # ---------------------------------------------------------------------------
 # Test double satisfying the `Step` protocol (doc 00 §12.1)
 # ---------------------------------------------------------------------------
@@ -110,6 +126,10 @@ def test_parse_args_defaults():
     assert args.non_interactive is False
     assert args.no_pause is False
     assert args.log_dir is None
+    # Both gate flags default to None, not to "off": config.load() has to
+    # tell "not passed" from "explicitly passed off" (doc 00 §3.4).
+    assert args.remote_supervision is None
+    assert args.webapp_integration is None
 
 
 def test_parse_args_install_dir():
@@ -143,6 +163,53 @@ def test_parse_args_no_pause():
 
 def test_parse_args_log_dir():
     assert app.parse_args(["--log-dir", "/tmp/mv3dt-logs"]).log_dir == "/tmp/mv3dt-logs"
+
+
+@pytest.mark.parametrize("value", ["off", "local", "remote"])
+def test_parse_args_remote_supervision_accepts_every_gate_value(value):
+    args = app.parse_args(["--remote-supervision", value])
+    assert args.remote_supervision == value
+
+
+@pytest.mark.parametrize("value", ["off", "on"])
+def test_parse_args_webapp_integration_accepts_every_gate_value(value):
+    args = app.parse_args(["--webapp-integration", value])
+    assert args.webapp_integration == value
+
+
+def test_parse_args_gate_flags_reject_a_value_outside_their_choices(capsys):
+    """argparse's `choices=` is fed straight from `config.GATE_CHOICES`, so
+    a value the dispatch loop could not interpret never reaches
+    `installer.conf`. `on` is deliberately not a remote-supervision value:
+    that gate is three-valued (off/local/remote)."""
+    with pytest.raises(SystemExit) as exc_info:
+        app.parse_args(["--remote-supervision", "on"])
+    assert exc_info.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+
+def test_gate_overrides_from_args_omits_flags_that_were_not_passed():
+    overrides = app._gate_overrides_from_args(app.parse_args([]))
+    assert overrides == {}
+
+
+def test_gate_overrides_from_args_maps_flags_to_installer_conf_keys():
+    args = app.parse_args(
+        ["--remote-supervision", "local", "--webapp-integration", "on"]
+    )
+    assert app._gate_overrides_from_args(args) == {
+        config_mod.GATE_REMOTE_SUPERVISION: "local",
+        config_mod.GATE_WEBAPP_INTEGRATION: "on",
+    }
+
+
+def test_gate_overrides_from_args_keeps_an_explicit_off():
+    """An explicit `off` is an instruction (overwrite whatever is
+    persisted), not the absence of one, so it must survive the mapping."""
+    args = app.parse_args(["--webapp-integration", "off"])
+    assert app._gate_overrides_from_args(args) == {
+        config_mod.GATE_WEBAPP_INTEGRATION: "off"
+    }
 
 
 def test_parse_args_version_prints_and_exits_zero(capsys):
@@ -613,6 +680,138 @@ def test_dispatch_gate_off_skips_step6_explicitly(tmp_path, monkeypatch):
     assert rc == 0
     assert step.report_calls == 0
     assert sm.status("step6_remote_supervision") is StepStatus.COMPLETE
+
+
+# ---------------------------------------------------------------------------
+# doc 00 §3.4 -- gate flags wired through main() into installer.conf
+# ---------------------------------------------------------------------------
+
+
+def _read_conf(install_dir: Path) -> dict[str, str]:
+    text = (install_dir / config_mod.CONF_FILENAME).read_text(encoding="utf-8")
+    return dict(
+        line.partition("=")[::2]
+        for line in text.splitlines()
+        if line and not line.startswith("#")
+    )
+
+
+def test_main_gate_flags_reach_installer_conf(tmp_path, monkeypatch):
+    monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    monkeypatch.setattr(app, "STEP_REGISTRY", [])
+
+    install_dir = tmp_path / "install"
+    rc = app.main(
+        [
+            "--non-interactive",
+            "--install-dir",
+            str(install_dir),
+            "--log-dir",
+            str(tmp_path / "logs"),
+            "--remote-supervision",
+            "local",
+            "--webapp-integration",
+            "on",
+        ],
+        state_path=tmp_path / "var" / "state.json",
+    )
+
+    assert rc == 0
+    values = _read_conf(install_dir)
+    assert values[config_mod.GATE_REMOTE_SUPERVISION] == "local"
+    assert values[config_mod.GATE_WEBAPP_INTEGRATION] == "on"
+
+
+def test_main_without_gate_flags_leaves_unset_gates_off(tmp_path, monkeypatch):
+    """`--non-interactive` with no flag and no env var: tier 4 (doc 00
+    §3.4). The gate questions must never be asked, so `input` is patched to
+    something that would fail loudly if they were."""
+    monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    monkeypatch.setattr(app, "STEP_REGISTRY", [])
+    monkeypatch.delenv("MV3DT_REMOTE_SUPERVISION", raising=False)
+    monkeypatch.delenv("MV3DT_WEBAPP_INTEGRATION", raising=False)
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda *_a, **_kw: pytest.fail("main() prompted under --non-interactive"),
+    )
+
+    install_dir = tmp_path / "install"
+    rc = app.main(
+        [
+            "--non-interactive",
+            "--install-dir",
+            str(install_dir),
+            "--log-dir",
+            str(tmp_path / "logs"),
+        ],
+        state_path=tmp_path / "var" / "state.json",
+    )
+
+    assert rc == 0
+    values = _read_conf(install_dir)
+    assert values[config_mod.GATE_REMOTE_SUPERVISION] == "off"
+    assert values[config_mod.GATE_WEBAPP_INTEGRATION] == "off"
+
+
+def test_main_gate_flag_flips_a_persisted_gate_on_a_later_run(
+    tmp_path, monkeypatch, capsys
+):
+    """The end-to-end shape of the regression this unit fixes: a first run
+    persists `off`, and a later `--webapp-integration on` turns it on
+    without the operator hand-editing `installer.conf`."""
+    monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    monkeypatch.setattr(app, "STEP_REGISTRY", [])
+
+    install_dir = tmp_path / "install"
+    state_path = tmp_path / "var" / "state.json"
+    base_argv = [
+        "--non-interactive",
+        "--install-dir",
+        str(install_dir),
+        "--log-dir",
+        str(tmp_path / "logs"),
+    ]
+
+    assert app.main(base_argv, state_path=state_path) == 0
+    assert _read_conf(install_dir)[config_mod.GATE_WEBAPP_INTEGRATION] == "off"
+    capsys.readouterr()
+
+    assert (
+        app.main(
+            base_argv + ["--webapp-integration", "on"], state_path=state_path
+        )
+        == 0
+    )
+
+    assert _read_conf(install_dir)[config_mod.GATE_WEBAPP_INTEGRATION] == "on"
+    assert "off -> on" in capsys.readouterr().err
+
+    # And it stays on for the next flagless run.
+    assert app.main(base_argv, state_path=state_path) == 0
+    assert _read_conf(install_dir)[config_mod.GATE_WEBAPP_INTEGRATION] == "on"
+
+
+def test_main_gate_env_var_still_seeds_a_first_run(tmp_path, monkeypatch):
+    """Tier 2 survives the loss of `bootstrap.sh`'s `exec sudo -E`: anyone
+    scripting `sudo -E ./mv3dt-installer` keeps the behaviour they had."""
+    monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    monkeypatch.setattr(app, "STEP_REGISTRY", [])
+    monkeypatch.setenv("MV3DT_WEBAPP_INTEGRATION", "on")
+
+    install_dir = tmp_path / "install"
+    rc = app.main(
+        [
+            "--non-interactive",
+            "--install-dir",
+            str(install_dir),
+            "--log-dir",
+            str(tmp_path / "logs"),
+        ],
+        state_path=tmp_path / "var" / "state.json",
+    )
+
+    assert rc == 0
+    assert _read_conf(install_dir)[config_mod.GATE_WEBAPP_INTEGRATION] == "on"
 
 
 # ---------------------------------------------------------------------------
