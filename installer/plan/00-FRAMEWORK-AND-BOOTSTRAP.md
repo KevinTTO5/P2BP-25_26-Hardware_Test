@@ -729,12 +729,19 @@ for the acquisition split.
 
 ### 10.2 Capture + handoff API (`ngc.py`)
 
-- `capture_key(non_interactive: bool) -> KeyState` — secret prompt; blank
-  input is allowed and recorded as `manual_fallback = True`.
+The key is **REQUIRED** — there is no manual fallback. `capture_key()` never
+returns without one:
+
+- `capture_key(non_interactive: bool) -> str` — secret prompt; a blank
+  answer re-prompts rather than being accepted. Under `--non-interactive`
+  there is no human to re-prompt, so this dies immediately (§4: "fail if a
+  required value is missing") unless the caller has already resolved a key
+  some other way (see below).
 - `store_key(key: str, install_dir) -> Path` — writes `secrets/ngc.env`
   (`chmod 600`), chowned to the invoking user.
-- `load_key() -> str | None` — read back for a step; returns `None` when the
-  operator chose the manual fallback.
+- `load_key() -> str | None` — read back for a step; `None` only means
+  onboarding has not run yet. Every step that runs after onboarding can
+  treat a present key as guaranteed.
 - `configure_ngc_cli()` — for steps that call `ngc`, writes
   `~/.ngc/config` (`chmod 600`) as the invoking user, mirroring Phase 10 of
   [`00_bootstrap.sh`](../../laptop/scripts/00_bootstrap.sh).
@@ -743,24 +750,14 @@ for the acquisition split.
 every launch and must be silent after the first. Two rules make that true:
 
 - **"Have we already asked?" is the existence of
-  `<install_dir>/secrets/ngc.env`, not the result of `load_key()`.**
-  `load_key()` returns `None` both for "never captured" and for "the operator
-  chose the manual fallback", so keying off it would re-prompt on every
-  launch. A blank answer therefore still writes the file, carrying the
-  fallback marker.
+  `<install_dir>/secrets/ngc.env`, not the result of `load_key()`** —
+  though since a key is mandatory, the file now only ever exists holding a
+  real key, so the two checks agree in practice; the distinction only
+  matters mid-run, before `store_key()` has been called.
 - **A pre-set `NGC_API_KEY` in the environment is honored before prompting**
-  (`sudo -E`, §9.1), then stored through `store_key` like any other value.
-
-### 10.3 Manual fallback
-
-If `load_key()` is `None`, steps that need NGC-gated content (the Docker
-install method, the PeopleNet model) MUST surface a `USER_ACTION_REQUIRED`
-block (§9.3) with the guided manual download-and-placement instructions
-(sign in at NGC, download the model / accept the container EULA, drop it in
-the expected dir), then re-verify on next launch. The DS SDK deb/tar
-artifacts need no such fallback — they are anonymously downloadable GitHub
-Release assets regardless of NGC key state. Step 2 owns the exact download
-URLs and placement paths.
+  (`sudo -E`, §9.1), then stored through `store_key` like any other value —
+  this is also what makes a non-interactive first run succeed without
+  `capture_key()` ever being reached.
 
 ---
 
@@ -896,7 +893,8 @@ class StepResult:
 - `user: InvokingUser` (§9.2) and `run_as_user(...)`, `run_root(...)`.
 - `log` (§8.1), `report_installed`, `report_already_installed`,
   `verify_pinned` (§8.3–8.4).
-- `ngc` handle (`load_key`, `configure_ngc_cli`, `manual_fallback`, §10).
+- `ngc` handle (`load_key`, `configure_ngc_cli`, §10 — the key is required,
+  so a present key is guaranteed by the time any step runs).
 - `webapp` handle (`load_credentials`, `enabled`, §14) — the web-app API key
   and normalized endpoint, for steps that talk to the backend.
 - `asset_path(...)` (§4.2) to locate bundled bash/config.
@@ -913,9 +911,9 @@ Each step doc defines its own internals but consumes only the contracts above:
   verification via `verify_pinned`; uses the **reboot gate** (§7).
 - **Step 2 — DeepStream SDK (DevB):** DS 9.1 install via deb / tar / docker
   (auto-detect or prompt) — deb/tar are public GitHub Release downloads, the
-  docker image is NGC-gated using the key from §10 (manual fallback if
-  none) — install-path, post-install (`update_rtpmanager.sh`, `ldconfig`,
-  `/etc/profile.d/deepstream.sh`), smoke test.
+  docker image is NGC-gated using the key from §10 (always present after
+  onboarding) — install-path, post-install (`update_rtpmanager.sh`,
+  `ldconfig`, `/etc/profile.d/deepstream.sh`), smoke test.
 - **Step 3 — AMC launcher (DevC):** docker compose AMC bring-up, open the
   localhost UI, keep the service up until the browser closes; standalone AMC
   exe dropped in `<install_dir>/bin/` (§11).

@@ -12,8 +12,9 @@ Step 2 module: `installer/mv3dt_installer/steps/step2_deepstream_sdk.py`
 Scope: install the **DeepStream 9.1 SDK** on Ubuntu 24.04 / x86_64 (RTX PRO
 4500 Blackwell), by one of the three official methods (deb / tar / docker) —
 deb/tar are public GitHub Release downloads, docker is NGC-gated using the
-operator's key captured at bootstrap (with a guided manual fallback) — then
-run post-install wiring and a smoke test. This step assumes Step 1 already
+operator's key captured at onboarding (required, always present — doc 00
+§10) — then run post-install wiring and a smoke test. This step assumes
+Step 1 already
 installed and verified the driver / CUDA / cuDNN / TensorRT / GStreamer stack
 and that its reboot is confirmed.
 
@@ -68,12 +69,11 @@ runtime facts because a step must not trust prior state blindly.
 3. **OS/arch** — Ubuntu 24.04, `x86_64` (mirror doc 00 / `00_bootstrap.sh`
    Phase 0). Wrong OS/arch → `FAILED`.
 4. **Root** — `ctx.run_root` available (`privilege.require_root`, doc 00 §9).
-5. **NGC key availability** — call `ctx.ngc.load_key()`:
-   - key present → OK for automatic NGC acquisition.
-   - `None` (operator chose the manual fallback at bootstrap, doc 00 §10) →
-     do **not** fail preflight; record `manual_fallback = True`. The actual
-     `USER_ACTION_REQUIRED` is raised in `run()` at the point the artifact is
-     needed, with method-specific download+placement instructions.
+5. **NGC key availability** — call `ctx.ngc.load_key()`. The key is
+   required (doc 00 §10), so a present value is the only expected outcome
+   here; `None` means onboarding did not run before dispatch reached this
+   step, which is an internal ordering bug, not an operator-recoverable
+   state — treat it as `FAILED` rather than a fallback path.
 6. **Method decidability inputs** — probe the auto-detect inputs
    ([§4](#4-auto-detection-vs-prompt)) so a choice can be made without extra
    privilege escalation later. This is read-only; it never installs anything.
@@ -181,7 +181,6 @@ method (see decision table) rather than prompting.
 | Host pipeline intent | default `True` for this installer (MV3DT host pipeline is the product) unless overridden | Bare-metal DS wanted |
 | Existing DS install | `dpkg -s deepstream-9.1` == `9.1.0-1` (deb) or `/opt/nvidia/deepstream/deepstream-9.1/version` present (tar) or local image tag present (`docker image inspect`) | Already installed via a specific method |
 | Relocatable / non-root / multi-version need | `--ds-method tar` or `installer.conf` `ds_relocatable=true` | Force the tarball path |
-| NGC key state | `ctx.ngc.load_key()` (present vs `None`) | Automatic acquisition vs manual fallback (does not change *method*, only *acquisition*) |
 
 ### 4.2 Decision logic (precedence, first match wins)
 
@@ -239,11 +238,11 @@ otherwise orthogonal to method — each method needs its own artifact fetched
   then re-run. This replaces the old NGC-sign-in fallback entirely for these
   two methods.
 
-### 5.2 docker — NGC-gated (unchanged acquisition model)
+### 5.2 docker — NGC-gated (fully automatic; key is required)
 
 - `ctx.ngc.configure_ngc_cli()` writes the invoking user's `~/.ngc/config`
-  (`chmod 600`) from the bootstrap-stored key (doc 00 §10) only when the
-  Docker method is chosen; deb/tar never touch the NGC CLI.
+  (`chmod 600`) from the onboarding-stored key (doc 00 §10, required) only
+  when the Docker method is chosen; deb/tar never touch the NGC CLI.
 - Authenticate then pull, run as the invoking user:
 
   ```bash
@@ -252,11 +251,11 @@ otherwise orthogonal to method — each method needs its own artifact fetched
   ```
 
   The key is never echoed to the transcript (doc 00 §8.2/§10 redaction).
-- **Guided manual fallback (`ctx.ngc.load_key() is None`):** `run()` returns
-  `USER_ACTION_REQUIRED` with: sign in / accept the DeepStream container EULA
-  on NGC, run `docker login nvcr.io` manually (username `$oauthtoken`), then
-  re-run. On the next launch Step 2 re-checks for a successful login and
-  proceeds automatically.
+  Since the key is guaranteed present by the time Step 2 runs, there is no
+  fallback path here: a `docker login` failure with a valid key indicates a
+  real error (revoked/expired key, network issue) and `run()` returns
+  `FAILED` with the login command's own error output, not a guided manual
+  sign-in.
 
 ### 5.3 Known artifact directory
 

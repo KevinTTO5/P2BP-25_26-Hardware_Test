@@ -195,20 +195,15 @@ second launch is a bug, not the design.
 4. **NGC API key. (planned)** A secret prompt — nothing is echoed as you
    type, and the key is never written to the transcript
    ([`00` §10.1](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#101-storage-contract)).
-   **Blank is a valid answer**: it selects the guided manual fallback, so any
-   step needing NGC-gated content prints a USER-ACTION block with the
-   sign-in-and-download instructions and re-verifies on the next launch
-   ([`00` §10.3](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#103-manual-fallback)).
-   **(planned)** Blank being treated as an already-answered question — so you
-   are not asked again on a later run — is itself part of what is still
-   unbuilt: today, a blank answer writes nothing to disk at all (there is no
-   marker or fallback variant of the secret file), so nothing yet
-   distinguishes "declined once" from "never asked." The capture code
-   (`capture_key()`) and the storage code (`store_key()`, which only ever
-   writes `NGC_API_KEY=<key>` and is never called on a blank answer) are both
-   in the binary today; the planned part is the onboarding call site that
-   invokes them on launch, and whatever mechanism it adds to keep a blank
-   answer quiet on later runs.
+   **The key is required**: a blank answer re-prompts rather than being
+   accepted, and under `--non-interactive` with no key available (no
+   `NGC_API_KEY` in the environment) the run fails outright rather than
+   proceeding without one
+   ([`00` §10.2](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#102-capture--handoff-api-ngcpy)).
+   The capture code (`capture_key()`) and the storage code (`store_key()`,
+   which writes `NGC_API_KEY=<key>`) are both in the binary today; the
+   planned part is the onboarding call site that invokes them on launch and
+   the "already asked" check that keeps a second run from re-prompting.
 5. **Web-app credential. (planned)** Endpoint plus API key, and **only** if
    you set the web-app gate to `on` in prompt 3. A blank endpoint writes
    nothing and warns; Step 7 then surfaces its own USER-ACTION block on first
