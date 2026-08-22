@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mv3dt_installer import __version__  # noqa: E402
 from mv3dt_installer import app  # noqa: E402
+from mv3dt_installer import cameras as cameras_mod  # noqa: E402
 from mv3dt_installer import config as config_mod  # noqa: E402
 from mv3dt_installer.privilege import InvokingUser  # noqa: E402
 from mv3dt_installer.state import STEP_IDS, StateMachine  # noqa: E402
@@ -183,6 +184,22 @@ def test_parse_args_no_pause():
 
 def test_parse_args_log_dir():
     assert app.parse_args(["--log-dir", "/tmp/mv3dt-logs"]).log_dir == "/tmp/mv3dt-logs"
+
+
+def test_parse_args_scan_cameras_defaults():
+    args = app.parse_args([])
+    assert args.scan_cameras is False
+    assert args.camera_scan_cidr is None
+    assert args.camera_scan_iface is None
+
+
+def test_parse_args_scan_cameras_flags():
+    args = app.parse_args(
+        ["--scan-cameras", "--camera-scan-cidr", "10.0.0.0/24", "--camera-scan-iface", "eth1"]
+    )
+    assert args.scan_cameras is True
+    assert args.camera_scan_cidr == "10.0.0.0/24"
+    assert args.camera_scan_iface == "eth1"
 
 
 @pytest.mark.parametrize("value", ["off", "local", "remote"])
@@ -904,3 +921,108 @@ def test_main_reboot_confirmed_advances_dispatch(tmp_path, monkeypatch):
     after = sm.load()
     assert after.reboot_pending is None
     assert after.steps["step1_prerequisites"].status is StepStatus.COMPLETE
+
+
+# ---------------------------------------------------------------------------
+# --scan-cameras (doc 00 §3.3, §15.5)
+# ---------------------------------------------------------------------------
+
+
+def test_scan_cameras_calls_refresh_and_never_dispatches(tmp_path, monkeypatch):
+    monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
+
+    def _boom_dispatch(sm, ctx, cfg):
+        raise AssertionError("--scan-cameras must exit before dispatch")
+
+    monkeypatch.setattr(app, "_dispatch", _boom_dispatch)
+
+    captured = {}
+
+    def _fake_refresh(install_dir, **kwargs):
+        captured["install_dir"] = install_dir
+        captured["kwargs"] = kwargs
+        return cameras_mod.ScanResult(cameras=[], unmatched=[], tool="arp-scan", interfaces=[])
+
+    monkeypatch.setattr(app.cameras_mod, "refresh", _fake_refresh)
+
+    install_dir = tmp_path / "install"
+    state_path = tmp_path / "state.json"
+    rc = app.main(
+        [
+            "--scan-cameras",
+            "--non-interactive",
+            "--install-dir",
+            str(install_dir),
+            "--log-dir",
+            str(tmp_path / "logs"),
+        ],
+        state_path=state_path,
+    )
+
+    assert rc == 0
+    assert captured["install_dir"] == install_dir
+    assert captured["kwargs"]["non_interactive"] is True
+
+
+def test_scan_cameras_persists_cidr_and_iface_flags(tmp_path, monkeypatch):
+    monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        app.cameras_mod,
+        "refresh",
+        lambda install_dir, **kw: cameras_mod.ScanResult(
+            cameras=[], unmatched=[], tool="arp-scan", interfaces=[]
+        ),
+    )
+
+    install_dir = tmp_path / "install"
+    rc = app.main(
+        [
+            "--scan-cameras",
+            "--non-interactive",
+            "--install-dir",
+            str(install_dir),
+            "--log-dir",
+            str(tmp_path / "logs"),
+            "--camera-scan-cidr",
+            "10.0.0.0/24",
+            "--camera-scan-iface",
+            "eth1",
+        ],
+        state_path=tmp_path / "state.json",
+    )
+
+    assert rc == 0
+    conf_text = (install_dir / "installer.conf").read_text(encoding="utf-8")
+    assert "CAMERA_SCAN_CIDR=10.0.0.0/24" in conf_text
+    assert "CAMERA_SCAN_IFACE=eth1" in conf_text
+
+
+def test_scan_cameras_persists_cameras_file_pointer(tmp_path, monkeypatch):
+    monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        app.cameras_mod,
+        "refresh",
+        lambda install_dir, **kw: cameras_mod.ScanResult(
+            cameras=[], unmatched=[], tool="arp-scan", interfaces=[]
+        ),
+    )
+
+    install_dir = tmp_path / "install"
+    rc = app.main(
+        [
+            "--scan-cameras",
+            "--non-interactive",
+            "--install-dir",
+            str(install_dir),
+            "--log-dir",
+            str(tmp_path / "logs"),
+        ],
+        state_path=tmp_path / "state.json",
+    )
+
+    assert rc == 0
+    conf_text = (install_dir / "installer.conf").read_text(encoding="utf-8")
+    assert f"CAMERAS_FILE={install_dir / 'cameras.yml'}" in conf_text

@@ -1,0 +1,673 @@
+"""MAC-based camera discovery, RTSP probing, and one-time guided position
+binding for mv3dt-installer (doc 00 §15).
+
+LOCKED: the MAC is the camera's identity. Every merge, every lookup, and
+every persisted binding keys on the MAC address, never on the IP -- the
+fleet self-assigns volatile 169.254.0.0/16 link-local addresses with no
+DHCP server, so a camera can (and does) land on a different address after a
+power cycle. See laptop/config/cameras.yml's own header for the fleet
+facts this module exists to survive.
+
+Public API (doc 00 §15.6):
+    normalize_mac(raw) -> str -- lowercase colon-separated form, accepting
+        colon/dash/Cisco-dot input.
+    matches_oui(mac, oui=CAMERA_OUI) -> bool
+    parse_inventory(text) -> list[Camera] -- hand-rolled parser (not
+        PyYAML-backed, matching the packaging reason doc 00 §4.1 gives for
+        avoiding new PyInstaller hidden-import surface); tolerant of the
+        committed laptop/config/cameras.yml seed, which has no `mac:` field.
+    render_inventory(cameras, *, header) -> str -- round-trips with
+        parse_inventory.
+    candidate_interfaces(*, runner=..., net_dir=...) -> list[str]
+    discover(*, oui, cidr, interfaces=None, prime_ips=(), runner=...) -> ScanResult
+    probe_rtsp(camera, *, user, password, timeout_us=..., runner=...) -> bool
+    grab_still(camera, *, user, password, dest, runner=...) -> Path | None
+    bind_positions(cameras, *, prompt, non_interactive, stills_dir=None,
+        runner=...) -> list[Camera]
+    merge(previous, discovered) -> list[Camera]
+    refresh(install_dir, *, seed_header=None, cam_user="", cam_password="",
+        oui=CAMERA_OUI, cidr=DEFAULT_SCAN_CIDR, interfaces=None,
+        prime_ips=(), non_interactive=False, prompt=input,
+        runner=subprocess.run) -> ScanResult
+
+Every subprocess goes through an injected `runner` (production callers pass
+`ctx.run_root`, doc 00 §12.3) so no test here ever opens a socket or spawns
+a real `arp-scan`/`ffmpeg`/`ffprobe`.
+
+Note on `bind_positions`'s `stills_dir` parameter: doc 00 §15.4 describes
+`grab_still()` capturing a still and `bind_positions()` printing its path,
+but the doc's illustrative API sketch does not thread a stills location
+into `bind_positions()` itself. `refresh()` (this module's actual
+orchestrator, added below the doc's minimal sketch for the same reason)
+calls `grab_still()` for each camera needing binding before calling
+`bind_positions()`, and passes the same `<install_dir>/cameras` directory
+through as `stills_dir` so the prompt can name the file `grab_still()` just
+wrote, by recomputing its path from the camera's MAC -- `bind_positions()`
+itself never calls `grab_still()`.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import ipaddress
+import os
+import pathlib
+import re
+import subprocess
+from dataclasses import dataclass, replace
+from typing import Callable, Optional, Sequence, Union
+
+from . import state
+from .logs import log
+
+__all__ = [
+    "CAMERA_OUI",
+    "DEFAULT_SCAN_CIDR",
+    "KNOWN_POSITIONS",
+    "Camera",
+    "ScanResult",
+    "normalize_mac",
+    "matches_oui",
+    "parse_inventory",
+    "render_inventory",
+    "candidate_interfaces",
+    "discover",
+    "probe_rtsp",
+    "grab_still",
+    "bind_positions",
+    "merge",
+    "refresh",
+]
+
+StrPath = Union[str, "os.PathLike[str]"]
+Runner = Callable[..., "subprocess.CompletedProcess"]
+
+# doc 00 §15.1: ANNKE / Hikvision-OEM firmware, OUI prefix.
+CAMERA_OUI = "d0:3b:f4"
+# doc 00 §15.2: the fleet's self-assigned link-local range.
+DEFAULT_SCAN_CIDR = "169.254.0.0/16"
+# Seed inventory positions (laptop/config/cameras.yml), doc 00 §15.4.
+KNOWN_POSITIONS = (
+    "top-left",
+    "top-right",
+    "middle-top-left",
+    "middle-top-right",
+    "middle-bottom-left",
+    "middle-bottom-right",
+    "bottom-left",
+    "bottom-right",
+)
+
+_DEFAULT_RTSP_PATH = "/Streaming/Channels/101"
+_SCAN_JSON_FILENAME = "cameras.scan.json"
+_INVENTORY_FILENAME = "cameras.yml"
+_STILLS_DIRNAME = "cameras"
+
+_EXCLUDED_IFACE_PATTERNS = ("lo", "docker*", "veth*", "br-*", "virbr*")
+_INET_RE = re.compile(r"inet (\d+\.\d+\.\d+\.\d+)")
+_ARP_SCAN_LINE_RE = re.compile(r"^(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:]{17})\b")
+
+
+@dataclass(frozen=True)
+class Camera:
+    """One camera in the runtime inventory (doc 00 §15.6). `mac` is `""`
+    for an entry parsed from the seed inventory, which predates MAC
+    tracking entirely (doc 00 §15.1's "no MAC-to-position mapping
+    survived")."""
+
+    id: str
+    mac: str
+    ip: str
+    position: str
+    rtsp_path: str = _DEFAULT_RTSP_PATH
+    enabled: bool = True
+    stream_ok: Optional[bool] = None
+
+
+@dataclass
+class ScanResult:
+    """Raw scan record (doc 00 §15.5), written verbatim to
+    `cameras.scan.json` via `state.write_json_atomic`."""
+
+    cameras: list
+    unmatched: list
+    tool: str
+    interfaces: list
+
+
+# ---------------------------------------------------------------------------
+# §15.6 -- MAC helpers
+# ---------------------------------------------------------------------------
+
+
+def normalize_mac(raw: str) -> str:
+    """Lowercase, colon-separated MAC, accepting colon-, dash-, and
+    Cisco-dot-separated input (`d0:3b:f4:01:52:79`, `D0-3B-F4-01-52-79`,
+    `d03b.f401.5279` are all the same address)."""
+    hex_only = re.sub(r"[^0-9a-fA-F]", "", raw).lower()
+    if len(hex_only) != 12:
+        raise ValueError(f"not a MAC address: {raw!r}")
+    return ":".join(hex_only[i : i + 2] for i in range(0, 12, 2))
+
+
+def matches_oui(mac: str, oui: str = CAMERA_OUI) -> bool:
+    """Case- and separator-insensitive OUI prefix match (doc 00 §15.2 step
+    4). Returns False for anything that isn't a well-formed MAC, rather
+    than raising -- a scan result can legitimately contain garbage."""
+    try:
+        normalized = normalize_mac(mac)
+    except ValueError:
+        return False
+    oui_hex = re.sub(r"[^0-9a-fA-F]", "", oui).lower()
+    if len(oui_hex) != 6:
+        raise ValueError(f"not a 3-octet MAC OUI: {oui!r}")
+    normalized_oui = ":".join(oui_hex[i : i + 2] for i in range(0, 6, 2))
+    return normalized.startswith(normalized_oui)
+
+
+# ---------------------------------------------------------------------------
+# §15.6 -- inventory parse/render (hand-rolled, not PyYAML-backed)
+# ---------------------------------------------------------------------------
+
+_ENTRY_START_RE = re.compile(r"^\s*-\s+(\w+):\s*(.*)$")
+_ENTRY_CONT_RE = re.compile(r"^\s+(\w+):\s*(.*)$")
+
+
+_TRAILING_COMMENT_RE = re.compile(r"\s+#.*$")
+
+
+def _strip_comment(value: str) -> str:
+    """Strip a trailing `  # comment` (e.g. the `bind_positions()`/
+    `render_inventory()` "not yet labeled" note) that isn't inside quotes.
+    None of this module's fields legitimately contain a literal `#`."""
+    return _TRAILING_COMMENT_RE.sub("", value)
+
+
+def _strip_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _parse_bool(value: str) -> bool:
+    return value.strip().lower() in ("true", "yes", "1")
+
+
+def _camera_from_fields(fields: dict) -> Camera:
+    stream_ok_raw = fields.get("stream_ok")
+    return Camera(
+        id=_strip_quotes(fields.get("id", "")),
+        mac=_strip_quotes(fields.get("mac", "")),
+        ip=_strip_quotes(fields.get("ip", "")),
+        position=_strip_quotes(fields.get("position", "")),
+        rtsp_path=_strip_quotes(fields.get("rtsp_path", "")) or _DEFAULT_RTSP_PATH,
+        enabled=_parse_bool(fields.get("enabled", "true")),
+        stream_ok=_parse_bool(stream_ok_raw) if stream_ok_raw is not None else None,
+    )
+
+
+def parse_inventory(text: str) -> list:
+    """Parse a `cameras.yml` (generated or the committed seed) into
+    `Camera` objects. Only understands the subset this module itself
+    writes: a top-level `cameras:` key holding a list of flat `key: value`
+    mappings; `#`-prefixed comment lines (the fleet header block) and blank
+    lines are ignored wherever they appear."""
+    cameras: list = []
+    current: Optional[dict] = None
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        start = _ENTRY_START_RE.match(line)
+        if start:
+            if current is not None:
+                cameras.append(_camera_from_fields(current))
+            current = {start.group(1): _strip_comment(start.group(2))}
+            continue
+
+        if current is not None:
+            cont = _ENTRY_CONT_RE.match(line)
+            if cont:
+                current[cont.group(1)] = _strip_comment(cont.group(2))
+                continue
+            cameras.append(_camera_from_fields(current))
+            current = None
+
+    if current is not None:
+        cameras.append(_camera_from_fields(current))
+
+    return cameras
+
+
+def render_inventory(cameras: Sequence, *, header: str) -> str:
+    """Render `cameras` back to the same textual shape `parse_inventory`
+    reads. A camera with no bound position yet gets an inline comment
+    pointing the operator at `--scan-cameras` (doc 00 §15.4's
+    non-interactive fallback)."""
+    lines = [header.rstrip("\n"), "", "cameras:"]
+    for cam in cameras:
+        lines.append(f"  - id: {cam.id}")
+        if cam.mac:
+            lines.append(f"    mac: {cam.mac}")
+        lines.append(f"    ip: {cam.ip}")
+        if cam.position:
+            lines.append(f'    position: "{cam.position}"')
+        else:
+            lines.append(
+                '    position: ""  # not yet labeled; run --scan-cameras interactively'
+            )
+        lines.append(f"    rtsp_path: {cam.rtsp_path}")
+        lines.append(f"    enabled: {'true' if cam.enabled else 'false'}")
+        if cam.stream_ok is not None:
+            lines.append(f"    stream_ok: {'true' if cam.stream_ok else 'false'}")
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# §15.2 -- discovery
+# ---------------------------------------------------------------------------
+
+
+def candidate_interfaces(
+    *,
+    runner: Runner = subprocess.run,
+    net_dir: StrPath = pathlib.Path("/sys/class/net"),
+) -> list:
+    """doc 00 §15.2 step 1: enumerate `/sys/class/net`, drop `lo`,
+    `docker*`, `veth*`, `br-*`, `virbr*`, and anything without an IPv4
+    address."""
+    try:
+        names = sorted(p.name for p in pathlib.Path(net_dir).iterdir())
+    except OSError:
+        return []
+
+    result = []
+    for name in names:
+        if any(fnmatch.fnmatch(name, pattern) for pattern in _EXCLUDED_IFACE_PATTERNS):
+            continue
+        if _interface_ipv4(name, runner) is not None:
+            result.append(name)
+    return result
+
+
+def _interface_ipv4(iface: str, runner: Runner) -> Optional[str]:
+    result = runner(
+        ["ip", "-4", "-o", "addr", "show", "dev", iface],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    match = _INET_RE.search(result.stdout)
+    return match.group(1) if match else None
+
+
+def _is_link_local(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(DEFAULT_SCAN_CIDR)
+    except ValueError:
+        return False
+
+
+def _parse_arp_scan_output(text: str) -> list:
+    """Each matching `arp-scan` data line is `<ip>\\t<mac>\\t<vendor>`."""
+    entries = []
+    for line in text.splitlines():
+        match = _ARP_SCAN_LINE_RE.match(line.strip())
+        if match:
+            entries.append((match.group(2), match.group(1)))  # (mac, ip)
+    return entries
+
+
+def _scan_arp_scan(interfaces: Sequence, cidr: str, *, runner: Runner):
+    """doc 00 §15.2 step 2. Raises `FileNotFoundError` (propagated from a
+    `runner` that raises it, mirroring `subprocess.run` on a missing
+    binary) when `arp-scan` is not installed -- callers fall back to
+    `_scan_ip_neigh`."""
+    entries = []
+    for iface in interfaces:
+        result = runner(
+            ["arp-scan", "--interface", iface, "--localnet"],
+            capture_output=True,
+            text=True,
+        )
+        entries.extend(_parse_arp_scan_output(result.stdout))
+
+        own_ip = _interface_ipv4(iface, runner)
+        if own_ip is not None and not _is_link_local(own_ip):
+            result = runner(
+                ["arp-scan", "--interface", iface, cidr],
+                capture_output=True,
+                text=True,
+            )
+            entries.extend(_parse_arp_scan_output(result.stdout))
+    return entries, "arp-scan"
+
+
+def _scan_ip_neigh(prime_ips: Sequence, *, runner: Runner):
+    """doc 00 §15.2 step 3 fallback: prime the kernel ARP cache by pinging
+    every last-known/seed IP, then read it back. Cannot find a camera that
+    moved to an address nobody has seen."""
+    for ip in prime_ips:
+        runner(["ping", "-c", "1", "-W", "1", ip], capture_output=True, text=True)
+
+    result = runner(["ip", "-4", "neigh", "show"], capture_output=True, text=True)
+    entries = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if "lladdr" in parts:
+            ip = parts[0]
+            mac = parts[parts.index("lladdr") + 1]
+            entries.append((mac, ip))
+    return entries, "ip-neigh"
+
+
+def discover(
+    *,
+    oui: str = CAMERA_OUI,
+    cidr: str = DEFAULT_SCAN_CIDR,
+    interfaces: Optional[Sequence] = None,
+    prime_ips: Sequence = (),
+    runner: Runner = subprocess.run,
+) -> ScanResult:
+    """doc 00 §15.2: discover cameras by MAC OUI, `arp-scan` first, the
+    kernel ARP cache as a fallback."""
+    ifaces = list(interfaces) if interfaces is not None else candidate_interfaces(runner=runner)
+
+    try:
+        raw_entries, tool = _scan_arp_scan(ifaces, cidr, runner=runner)
+    except FileNotFoundError:
+        raw_entries, tool = _scan_ip_neigh(prime_ips, runner=runner)
+
+    cameras = []
+    unmatched = []
+    seen_macs = set()
+    for mac, ip in raw_entries:
+        if matches_oui(mac, oui):
+            normalized = normalize_mac(mac)
+            if normalized in seen_macs:
+                continue
+            seen_macs.add(normalized)
+            cameras.append(Camera(id="", mac=normalized, ip=ip, position=""))
+        else:
+            try:
+                unmatched.append(normalize_mac(mac))
+            except ValueError:
+                continue
+
+    return ScanResult(cameras=cameras, unmatched=unmatched, tool=tool, interfaces=ifaces)
+
+
+# ---------------------------------------------------------------------------
+# §15.3 -- RTSP probe + still capture
+# ---------------------------------------------------------------------------
+
+
+def _rtsp_url(camera: Camera, *, user: str, password: str) -> str:
+    return f"rtsp://{user}:{password}@{camera.ip}:554{camera.rtsp_path}"
+
+
+def probe_rtsp(
+    camera: Camera,
+    *,
+    user: str,
+    password: str,
+    timeout_us: int = 5_000_000,
+    runner: Runner = subprocess.run,
+) -> bool:
+    """doc 00 §15.3: does the camera serve a decodable RTSP stream, not
+    just answer ARP. Ported from laptop/scripts/20_verify_cameras.sh's
+    ffprobe check. The password is never logged -- it only ever appears
+    inside the argv list handed to `runner`, never in a `log.*()` call."""
+    url = _rtsp_url(camera, user=user, password=password)
+    result = runner(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-timeout",
+            str(timeout_us),
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+            url,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def grab_still(
+    camera: Camera,
+    *,
+    user: str,
+    password: str,
+    dest: StrPath,
+    runner: Runner = subprocess.run,
+) -> Optional[pathlib.Path]:
+    """doc 00 §15.4 step 1: a single frame for the guided binding prompt."""
+    url = _rtsp_url(camera, user=user, password=password)
+    dest_path = pathlib.Path(dest)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    result = runner(
+        [
+            "ffmpeg",
+            "-y",
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+            url,
+            "-frames:v",
+            "1",
+            str(dest_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not dest_path.is_file():
+        return None
+    return dest_path
+
+
+def _still_path(stills_dir: StrPath, mac: str) -> pathlib.Path:
+    return pathlib.Path(stills_dir) / f"still-{mac.replace(':', '')}.jpg"
+
+
+# ---------------------------------------------------------------------------
+# §15.4 -- guided position binding
+# ---------------------------------------------------------------------------
+
+
+def bind_positions(
+    cameras: Sequence,
+    *,
+    prompt: Callable[[str], str] = input,
+    non_interactive: bool,
+    stills_dir: Optional[StrPath] = None,
+    runner: Runner = subprocess.run,
+) -> list:
+    """doc 00 §15.4: for each camera with no persisted position, assign it
+    one -- interactively (one prompt per camera, a still frame shown first
+    if `stills_dir` is given) or, under `--non-interactive`, `c<N>` ids in
+    MAC-sorted order with position left blank so an unattended run never
+    blocks on a human (doc 00 §4's non-interactive contract)."""
+    del runner  # accepted for signature symmetry (doc 00 §15.6); unused here
+
+    needing = [cam for cam in cameras if not cam.position]
+    if not needing:
+        return list(cameras)
+
+    ordered = sorted(needing, key=lambda cam: cam.mac)
+    assigned_ids = {cam.mac: (cam.id or f"c{i + 1}") for i, cam in enumerate(ordered)}
+
+    result = []
+    for cam in cameras:
+        if cam.position:
+            result.append(cam)
+            continue
+
+        new_id = assigned_ids[cam.mac]
+        if non_interactive:
+            result.append(replace(cam, id=new_id, position=""))
+            continue
+
+        if stills_dir is not None:
+            log.info(f"Still frame for {cam.mac} ({cam.ip}): {_still_path(stills_dir, cam.mac)}")
+        options = ", ".join(KNOWN_POSITIONS)
+        answer = prompt(
+            f"Position for camera {cam.mac} ({cam.ip}) [{options}] "
+            "or type a new one: "
+        ).strip()
+        result.append(replace(cam, id=new_id, position=answer))
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# §15.4 -- merge across scans
+# ---------------------------------------------------------------------------
+
+
+def merge(previous: Sequence, discovered: Sequence) -> list:
+    """doc 00 §15.4: match on MAC, refresh only the IP. A camera missing
+    from `discovered` is retained and flagged (`stream_ok` reset to
+    `None`, since it was not probed this scan) rather than deleted -- a
+    powered-off camera is not a decommissioned one."""
+    by_mac = {cam.mac: cam for cam in discovered if cam.mac}
+    seen = set()
+    result = []
+
+    for cam in previous:
+        seen.add(cam.mac)
+        found = by_mac.get(cam.mac)
+        if found is not None:
+            result.append(replace(cam, ip=found.ip))
+        else:
+            result.append(replace(cam, stream_ok=None))
+
+    for cam in discovered:
+        if cam.mac not in seen:
+            result.append(cam)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# §15.5 -- top-level orchestrator
+# ---------------------------------------------------------------------------
+
+
+def refresh(
+    install_dir: StrPath,
+    *,
+    seed_header: Optional[str] = None,
+    cam_user: str = "",
+    cam_password: str = "",
+    oui: str = CAMERA_OUI,
+    cidr: str = DEFAULT_SCAN_CIDR,
+    interfaces: Optional[Sequence] = None,
+    prime_ips: Sequence = (),
+    non_interactive: bool = False,
+    prompt: Callable[[str], str] = input,
+    runner: Runner = subprocess.run,
+) -> ScanResult:
+    """doc 00 §15.5's orchestrator: discover, probe, bind, merge, write
+    both artifacts. `--scan-cameras` (§3.3) is a thin CLI wrapper around
+    this.
+
+    `seed_header` and `prime_ips` should come from the bundled
+    `assets/cameras/cameras.yml` (doc 00 §4.1) on a genuinely first run --
+    its header block and pinned IPs are what doc 00 §15.5 says this
+    function is for. Once `<install_dir>/cameras.yml` exists, its own
+    header and cameras' IPs are used instead and `seed_header`/`prime_ips`
+    are ignored for anything already on record.
+    """
+    install_dir = pathlib.Path(install_dir)
+    inventory_path = install_dir / _INVENTORY_FILENAME
+    stills_dir = install_dir / _STILLS_DIRNAME
+
+    if inventory_path.is_file():
+        previous_text = inventory_path.read_text(encoding="utf-8")
+        previous = parse_inventory(previous_text)
+        header = previous_text.split("\n\ncameras:", 1)[0]
+        effective_prime_ips = [cam.ip for cam in previous if cam.ip] or list(prime_ips)
+    else:
+        previous = []
+        header = seed_header or ""
+        effective_prime_ips = list(prime_ips)
+
+    scan = discover(
+        oui=oui,
+        cidr=cidr,
+        interfaces=interfaces,
+        prime_ips=effective_prime_ips,
+        runner=runner,
+    )
+
+    probed = []
+    for cam in scan.cameras:
+        stream_ok = None
+        if cam_user and cam_password:
+            stream_ok = probe_rtsp(cam, user=cam_user, password=cam_password, runner=runner)
+        probed.append(replace(cam, stream_ok=stream_ok))
+
+    merged = merge(previous, probed) if previous else probed
+
+    for cam in merged:
+        if not cam.position and cam_user and cam_password:
+            grab_still(
+                cam,
+                user=cam_user,
+                password=cam_password,
+                dest=_still_path(stills_dir, cam.mac),
+                runner=runner,
+            )
+
+    bound = bind_positions(
+        merged,
+        prompt=prompt,
+        non_interactive=non_interactive,
+        stills_dir=stills_dir,
+        runner=runner,
+    )
+
+    generated_banner = (
+        f"# Generated by mv3dt-installer --scan-cameras; do not hand-edit IPs\n"
+    )
+    inventory_path.write_text(
+        render_inventory(bound, header=generated_banner + header), encoding="utf-8"
+    )
+
+    scan_record = {
+        "tool": scan.tool,
+        "interfaces": scan.interfaces,
+        "unmatched": scan.unmatched,
+        "cameras": [
+            {
+                "id": cam.id,
+                "mac": cam.mac,
+                "ip": cam.ip,
+                "position": cam.position,
+                "stream_ok": cam.stream_ok,
+            }
+            for cam in bound
+        ],
+    }
+    state.write_json_atomic(install_dir / _SCAN_JSON_FILENAME, scan_record)
+
+    log.info(
+        f"Camera scan complete via {scan.tool}: {len(bound)} camera(s), "
+        f"{len(scan.unmatched)} unmatched host(s)."
+    )
+
+    return ScanResult(cameras=bound, unmatched=scan.unmatched, tool=scan.tool, interfaces=scan.interfaces)

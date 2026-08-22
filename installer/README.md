@@ -154,7 +154,9 @@ have.
 | `--version` | — | Print the version and exit | shipped; the stamped form carrying tag, commit, and build timestamp is **planned**, arriving with the release job |
 | `--remote-supervision` | `off`, `local`, `remote` | Set the Step 6 gate ([`00` §3.4](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#34-opt-in-step-gates)) without being prompted; overrides an already-persisted value and logs the change | shipped |
 | `--webapp-integration` | `off`, `on` | Set the Step 7 gate the same way | shipped |
-| `--scan-cameras` | — | Discover the camera fleet, probe RTSP, run the one-time position binding, write the inventory, print the table, and exit; needs `sudo` for raw sockets | **planned** |
+| `--scan-cameras` | — | Discover the camera fleet, probe RTSP, run the one-time position binding, write the inventory, print the table, and exit; needs `sudo` for raw sockets | shipped |
+| `--camera-scan-cidr` | `CIDR` | Override the discovery sweep range (default `169.254.0.0/16`); persisted as `CAMERA_SCAN_CIDR` | shipped |
+| `--camera-scan-iface` | `IFACE` | Restrict discovery to one interface; persisted as `CAMERA_SCAN_IFACE` | shipped |
 
 Not passing one of the two gate flags differs from passing `off` explicitly:
 an unpassed flag leaves the value to the next tier of precedence —

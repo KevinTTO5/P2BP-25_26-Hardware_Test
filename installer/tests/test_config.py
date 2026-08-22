@@ -719,3 +719,29 @@ def test_write_conf_sorts_keys_and_preserves_keys_config_does_not_own(tmp_path):
     assert "AAA_FIRST_ALPHABETICALLY" in keys
     assert "ZZZ_LAST_ALPHABETICALLY" in keys
     assert "MV3DT_WEBAPP_INTEGRATION=on" in conf_text
+
+
+# ---------------------------------------------------------------------------
+# persist_value (doc 00 §11.2, §15.5's CAMERA_SCAN_CIDR/CAMERA_SCAN_IFACE)
+# ---------------------------------------------------------------------------
+
+
+def test_persist_value_writes_a_fresh_conf_file(tmp_path):
+    config.persist_value(tmp_path, "CAMERA_SCAN_CIDR", "10.0.0.0/24")
+
+    text = (tmp_path / config.CONF_FILENAME).read_text(encoding="utf-8")
+    assert "CAMERA_SCAN_CIDR=10.0.0.0/24" in text
+
+
+def test_persist_value_preserves_existing_keys_and_overwrites_its_own(tmp_path):
+    conf_path = tmp_path / config.CONF_FILENAME
+    conf_path.write_text(
+        "INSTALL_DIR=" + str(tmp_path) + "\nCAMERA_SCAN_CIDR=old\n", encoding="utf-8"
+    )
+
+    config.persist_value(tmp_path, "CAMERA_SCAN_CIDR", "new")
+
+    text = conf_path.read_text(encoding="utf-8")
+    assert "CAMERA_SCAN_CIDR=new" in text
+    assert "old" not in text
+    assert f"INSTALL_DIR={tmp_path}" in text
