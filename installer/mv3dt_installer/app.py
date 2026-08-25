@@ -15,34 +15,41 @@ other framework module (`state`, `config`, `reboot`, `privilege`, `ngc`,
 `webapp`, `report`, `shellout`, `logs`) -- all wave 1-3 work, already merged
 in before this file was written.
 
-Ordering note (doc 00 §3.2 vs. the actual `config.load()` signature)
+Ordering note (doc 00 §3.2's 11-step list vs. `state.json`'s fixed path)
 ----------------------------------------------------------------------
-Doc 00 §3.2 lists `app.main()`'s steps as: (1) parse flags, (2) resolve
-privilege, (3) load config, (4) open transcript, (5) load state + reconcile
-reboot, (6) dispatch. But `config.load()` as actually built (`config.py`,
-a sibling wave-3 PR) takes a `state: StateMachine` parameter -- it needs to
-check `state.json`'s `install_dir` field for precedence (doc 00 §11.2:
-`--install-dir` > `state.json` > `installer.conf` default > `/opt/mv3dt`).
-So a `StateMachine` must exist BEFORE step 3, apparently contradicting the
-doc's step-5 placement of "loads the state file".
+Doc 00 §3.2's numbered list reads naturally as top-to-bottom prose, but one
+detail only becomes clear from `config.load()`'s actual signature: it takes
+a `state: StateMachine` parameter, because it needs to check `state.json`'s
+`install_dir` field for precedence (doc 00 §11.2: `--install-dir` >
+`state.json` > `installer.conf` default > `/opt/mv3dt`). So a
+`StateMachine` must exist before config is loaded, even though the doc's
+prose lists "load the state file" and "load config" as separate, ordered
+steps.
 
 This is resolved cleanly, not accidentally: doc 00 §6.1 says the state file
 "stays at the canonical `/var/lib/mv3dt-installer/state.json` path" even
 when `--install-dir` moves the install root -- `state.json`'s path is fixed
 and entirely independent of `install_dir`. There is therefore no real
-ordering conflict, just a narrative simplification in the doc's five-line
-summary. This module implements the *intent* precisely:
+ordering conflict, just an ambiguity in exactly which of two adjacent list
+items happens first. This module implements the doc's full ordering
+precisely:
 
     1. parse flags
-    2. resolve privilege (`privilege.require_root()` + `privilege.resolve()`)
-    3. construct/load the `StateMachine` at its fixed canonical path
+    2. construct/load the `StateMachine` at its fixed canonical path
        (honoring `--reset-state` / `--reset-step` here, before anything
        else touches it)
-    4. call `config.load(..., state=<that StateMachine>)`
-    5. open the transcript (`logs.open_transcript()`)
-    6. call `reboot.reconcile(state)` using that same already-loaded
-       `StateMachine`
-    7. enter the dispatch loop
+    3. `--status` early exit (pre-root; reads state.json only)
+    4. `privilege.require_root()`
+    5. `onboarding.run_platform_preflight()` (replaces the bare
+       `privilege.resolve()` this module used before `preflight.py`
+       existed)
+    6. apply the reset flags
+    7. `config.load(..., state=<that StateMachine>, gate_overrides=...)`
+    8. open the transcript (`logs.open_transcript()`)
+    9. `onboarding.onboard(...)` -- first-run credential capture
+    10. `reboot.reconcile(state)` using that same already-loaded
+        `StateMachine`
+    11. enter the dispatch loop
 
 `--status` is a deliberate exception to this order -- see `main()`'s
 docstring.
@@ -60,6 +67,7 @@ from typing import Any, Callable, Optional
 from mv3dt_installer import __version__, build_stamp
 from mv3dt_installer import config as config_mod
 from mv3dt_installer import ngc as ngc_mod
+from mv3dt_installer import onboarding
 from mv3dt_installer import privilege
 from mv3dt_installer import reboot as reboot_mod
 from mv3dt_installer import report
@@ -580,7 +588,7 @@ def main(
         return _print_status(sm)
 
     privilege.require_root()
-    user = privilege.resolve()
+    user = onboarding.run_platform_preflight()
 
     # State management flags, applied before any phase runs (doc 00 §3.3;
     # mirrors 00_bootstrap.sh's RESET_STATE_FLAG / FORCE_MODELS handling,
@@ -603,6 +611,13 @@ def main(
 
     log_dir = pathlib.Path(args.log_dir) if args.log_dir else None
     open_transcript(log_dir)
+
+    # doc 00 §3.2 step 9: after the transcript opens, so every prompt and
+    # its redacted outcome is part of the auditable record. No-op on every
+    # launch after the first (doc 00 §5.2).
+    onboarding.onboard(
+        cfg.install_dir, cfg.webapp_integration, non_interactive=args.non_interactive
+    )
 
     reconcile_result = reboot_mod.reconcile(sm)
     if reconcile_result is reboot_mod.ReconcileResult.STILL_PENDING:

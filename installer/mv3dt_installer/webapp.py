@@ -14,16 +14,18 @@ Public API:
     normalize_endpoint(raw)  -- §14.2 normalization; raises ValueError on an
         empty result.
     join(endpoint, path)     -- §14.2 strict route joining (never urljoin).
-    capture_credentials(non_interactive) -> Credentials -- the prompt flow.
+    capture_credentials(non_interactive, install_dir=...) -> Credentials --
+        the prompt flow.
     store_credentials(creds, install_dir) -> Path -- atomic, chmod 600,
         chowned to the invoking user.
     load_credentials(install_dir=None) -> Credentials | None -- reads back
         and re-normalizes the endpoint on every load.
-    enabled(gate_value) -> bool -- see calling convention below.
+    enabled(gate_value, install_dir=...) -> bool -- see calling convention
+        below.
     redact_url(url) -> str -- §14.4 signed-URL redaction.
 
-Calling convention for `enabled(gate_value)` (read this before wiring
-app.py or any step to this module):
+Calling convention for `enabled(gate_value, install_dir=...)` (read this
+before wiring app.py or any step to this module):
 
     §14.3 defines `enabled()` as "the §3.4 gate combined with a successful
     `load_credentials()`". The §3.4 gate (`MV3DT_WEBAPP_INTEGRATION`, values
@@ -32,21 +34,28 @@ app.py or any step to this module):
     So `enabled()` here takes the already-resolved gate value as a plain
     string parameter instead of resolving it itself:
 
-        enabled(gate_value: str) -> bool
+        enabled(gate_value: str, install_dir=...) -> bool
 
     The caller (app.py, which has both config.py and webapp.py available) is
     responsible for resolving the gate (e.g. `config.load().webapp_gate` or
-    equivalent) and passing the resulting string in. `enabled()` returns
-    True only when `gate_value == "on"` AND `load_credentials()` succeeds.
+    equivalent) and passing the resulting string in. `gate_value` stays
+    first and mandatory -- `install_dir` is added alongside it, not instead
+    of it. `enabled()` returns True only when `gate_value == "on"` AND
+    `load_credentials(install_dir)` succeeds.
 
-Calling convention for `load_credentials()` / `capture_credentials()`:
+Calling convention for `load_credentials()` / `capture_credentials()` /
+`enabled()`'s `install_dir`:
 
-    Neither takes an `install_dir` the way `store_credentials()` does,
-    mirroring §10.2's `ngc.load_key()` shape. Since this module must not
-    depend on config.py for install-dir resolution either, both default to
-    module-level `DEFAULT_INSTALL_DIR` (the doc §11.1 default,
-    `/opt/mv3dt`). Callers that already know the resolved install dir (e.g.
-    a step, via config.py) may pass it explicitly to `load_credentials()`.
+    All three take an optional `install_dir`, defaulting to module-level
+    `DEFAULT_INSTALL_DIR` (the doc §11.1 default, `/opt/mv3dt`), mirroring
+    §10.2's `ngc.load_key()` shape. This closes a real bug: `capture_credentials`
+    and `enabled` used to call a bare `load_credentials()` internally, so
+    both silently ignored `--install-dir` and read/wrote against the
+    default location regardless of the operator's actual choice.
+    `load_credentials` itself was always correct. Framework callers (e.g.
+    `onboarding.py`) MUST pass the `install_dir` resolved by `config.load()`
+    (§11.2) -- the zero-argument call sites this module's docstring
+    documents keep working for anything that hasn't been updated yet.
 
 Redaction (§14.4, REQUIRED) is two distinct rules:
     - The API key: never pass the raw key into any logs.py call. Any log
@@ -147,16 +156,22 @@ def _ask_keep(found_desc: str) -> bool:
     return answer in ("", "y", "yes")
 
 
-def capture_credentials(non_interactive: bool) -> Credentials:
+def capture_credentials(
+    non_interactive: bool,
+    install_dir: "pathlib.Path | str | None" = None,
+) -> Credentials:
     """The §14.3 prompt flow.
 
-    When a value already exists (per `load_credentials()` against the
-    default install dir), ask before replacing it, defaulting to keep. The
-    API key prompt suppresses echo (`getpass.getpass`); the endpoint prompt
-    does not. Under `non_interactive=True`, existing values are kept
-    silently and missing ones are left unset -- no prompting occurs at all.
+    When a value already exists (per `load_credentials(install_dir)`), ask
+    before replacing it, defaulting to keep. The API key prompt suppresses
+    echo (`getpass.getpass`); the endpoint prompt does not. Under
+    `non_interactive=True`, existing values are kept silently and missing
+    ones are left unset -- no prompting occurs at all.
+
+    `install_dir` defaults to `DEFAULT_INSTALL_DIR` -- see the module
+    docstring's `install_dir` calling-convention note.
     """
-    existing = load_credentials()
+    existing = load_credentials(install_dir)
     existing_key = existing.api_key if existing else None
     existing_endpoint = existing.endpoint if existing else None
 
@@ -285,16 +300,21 @@ def load_credentials(
     return Credentials(api_key=api_key, endpoint=endpoint)
 
 
-def enabled(gate_value: str) -> bool:
+def enabled(
+    gate_value: str,
+    install_dir: "pathlib.Path | str | None" = None,
+) -> bool:
     """§3.4 gate combined with a successful load_credentials().
 
     `gate_value` is the already-resolved MV3DT_WEBAPP_INTEGRATION value
     ("on"/"off") -- see the module docstring's calling-convention note.
-    True only when gate_value == "on" AND load_credentials() succeeds.
+    `install_dir` defaults to `DEFAULT_INSTALL_DIR`, same as
+    `capture_credentials`/`load_credentials`. True only when
+    `gate_value == "on"` AND `load_credentials(install_dir)` succeeds.
     """
     if gate_value != "on":
         return False
-    return load_credentials() is not None
+    return load_credentials(install_dir) is not None
 
 
 # ---------------------------------------------------------------------------
