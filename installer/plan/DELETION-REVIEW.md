@@ -216,7 +216,7 @@ whose `cameras.yml` *is* a static list. Flagged, not solved.
 | `laptop/docs/*`, `laptop/README.md` | Cited 22+ times across the plans; `DEEPSTREAM-SETUP.md` is the source of truth for the version pins in [`STEP-1` §2](STEP-1-PREREQUISITES.md#2-the-ds-90-dgpu-prerequisite-pins-equality). |
 | `laptop/scripts/00_bootstrap.sh`, `lib/common.sh`, `30_start_amc.sh`, `50_start_pipeline.sh`, `99_stop_all.sh` | Ported by Steps 1, 2, 3, 5, and 6. Deletable on the same gate as [§3](#3-deletions-gated-on-the-harvest-the-jetson-tree), but the gate there is the *installer implementation*, not this documentation work — **out of scope for this triage**. |
 | `laptop/scripts/40_export_watcher.sh` | **Never deletable.** [`STEP-4` §4.4](STEP-4-CALIB-OUTPUT-WIRING.md#44-one-shot-vs-watcher) retains the long-running `inotifywait` watch mode as a standalone script; only the one-shot path is ported. |
-| `laptop/scripts/10_setup_mosquitto.sh`, `20_verify_cameras.sh` | Retained because of the coverage gaps in [§6](#6-coverage-gaps-this-triage-exposed). |
+| `laptop/scripts/10_setup_mosquitto.sh`, `20_verify_cameras.sh` | No longer load-bearing — gaps 1 and 2 in [§6](#6-coverage-gaps-this-triage-exposed) are closed — but retained in git as developer tools. |
 | `laptop/scripts/60_record_tracking.sh`, `70_plot_floorplan.py`, `record_cameras_mp4.sh`, `view_cameras.sh` | Sponsor-demo and validation tooling with no plan coverage — and the **producers of the artifacts** [`STEP-7` §E](STEP-7-WEBAPP-INTEGRATION.md#e-artifact-upload-daemon) uploads. |
 
 ---
@@ -227,20 +227,22 @@ Surfaced by checking which `laptop/scripts/` entries no step doc claims. Each
 is a spec gap, not a deletion candidate — recorded here so the retention above
 has a stated reason and the gap is not lost.
 
-1. **Mosquitto install is unowned.**
-   [`STEP-4` §1](STEP-4-CALIB-OUTPUT-WIRING.md#1-scope) defers it to "Step 1/2
-   bootstrap", but neither [`STEP-1`](STEP-1-PREREQUISITES.md) nor
-   [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) mentions it. Meanwhile
+1. **RESOLVED — Mosquitto install is owned by Step 1.**
+   [`STEP-1` §3.2](STEP-1-PREREQUISITES.md#32-mosquitto-broker) now owns
+   installing the `mosquitto` broker daemon and its `mv3dt.conf` drop-in,
+   closing the gap that used to leave
    [`STEP-6` §E.1](STEP-6-REMOTE-SUPERVISION.md#e1-lifecycle) `preflight`
-   **requires** a reachable broker and
-   [`STEP-6` §D](STEP-6-REMOTE-SUPERVISION.md#d-security-remote-control-must-be-authenticated)
-   **rewrites** its configuration. Until a step adopts
-   `10_setup_mosquitto.sh`, it is load-bearing.
+   requiring a reachable broker nothing installed.
+   `10_setup_mosquitto.sh` is no longer load-bearing.
 
-2. **Camera verification is only partly ported.**
+2. **RESOLVED — camera verification is fully ported, split across two
+   steps.**
    [`STEP-5` §3.3](STEP-5-PER-PROJECT-EXES.md#33-what-the-exe-does-at-runtime-pipeline-subcommand)
-   ports the ping sweep from `20_verify_cameras.sh`; the `ffprobe`-over-RTSP
-   check and the pass/fail table are not ported anywhere.
+   ports the shallow ping sweep from `20_verify_cameras.sh`; the
+   `ffprobe`-over-RTSP check is ported into camera discovery
+   ([`00` §15](00-FRAMEWORK-AND-BOOTSTRAP.md#15-camera-discovery)), which
+   records the result as a `stream_ok` field on each inventory entry.
+   `20_verify_cameras.sh` is no longer load-bearing.
 
 3. **The export watcher is not superseded.** Recorded in
    [§5](#5-retained-files-and-why) and made explicit in

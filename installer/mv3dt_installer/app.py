@@ -57,7 +57,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from mv3dt_installer import __version__
+from mv3dt_installer import __version__, build_stamp
 from mv3dt_installer import config as config_mod
 from mv3dt_installer import ngc as ngc_mod
 from mv3dt_installer import privilege
@@ -161,8 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
         # than via argparse's %(prog)s so the banner reads the same however
         # the installer was invoked, which matters when an operator pastes
         # it into a bug report.
-        version=f"mv3dt-installer {__version__}"
-        + __import__("mv3dt_installer").build_stamp(),
+        version=f"mv3dt-installer {__version__}" + build_stamp(),
     )
     return parser
 

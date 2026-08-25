@@ -79,24 +79,31 @@ steps in order.
    exists to guarantee.
 
    **`--delete-branch` itself is the hazard for a stacked chain — not just
-   manual deletion.** Before merging any entry, check whether its
-   `headRefName` is the `baseRefName` of any *other, still-unmerged* entry
-   in this run's list (not just the immediate next one — a branch can be
-   the base of more than one stacked PR). If so:
-   - Merge it **without** `--delete-branch`:
+   manual deletion.** Before merging any entry, find every *open* PR based
+   on its `headRefName` by querying GitHub directly, not just scanning this
+   run's own list:
+   `gh pr list --state open --json number,baseRefName --jq '.[] | select(.baseRefName == "<headRefName>") | .number'`.
+   This catches a dependent PR that isn't part of this run at all — a
+   teammate's PR, or one opened after this run's argument list was
+   assembled — which a list-only check would miss and which would still be
+   auto-closed by the branch deletion below. If that query returns any PR
+   number:
+   - Merge the current entry **without** `--delete-branch`:
      `gh pr merge <id> --squash --subject "<pr title>" --body "<pr body>"`.
    - Immediately after that merge succeeds — before doing anything else,
-     and before moving to the next entry in the list — retarget every one
-     of those dependent entries to `main` via the API
+     and before moving to the next entry — retarget every PR number the
+     query returned to `main` via the API
      (`gh api repos/<owner>/<repo>/pulls/<id> -X PATCH -f base=main`) and
-     re-check each one's `mergeable`.
+     re-check each one's `mergeable`. For any that are *not* in this run's
+     own list, note them in the final report (step 6) rather than merging
+     them yourself — retargeting keeps them alive and correct; merging a PR
+     nobody asked this run to merge is not this command's call to make.
    - Only then delete the just-merged branch, explicitly:
-     `git push origin --delete <branch>`. It is safe now because nothing
-     in the list still depends on it as a base.
+     `git push origin --delete <branch>`. It is safe now because no open
+     PR anywhere still depends on it as a base.
 
-   If `headRefName` is not the base of any other entry still in the list,
-   `--delete-branch` on the merge call itself is fine — nothing depends on
-   that branch surviving.
+   If the query returns nothing, `--delete-branch` on the merge call itself
+   is fine — nothing depends on that branch surviving.
 
    The reason this matters: GitHub does not auto-retarget a dependent PR
    just because its base branch's content later lands on `main` through

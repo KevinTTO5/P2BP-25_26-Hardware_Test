@@ -10,6 +10,8 @@ exactly `"v" + __version__`. Bumping the version is therefore an ordinary
 source commit; pushing the matching tag is what publishes a release.
 """
 
+import sys
+
 __version__ = "0.1.0"
 
 # Build stamp. `.github/workflows/release.yml` writes an untracked
@@ -17,14 +19,24 @@ __version__ = "0.1.0"
 # released binary can name the exact tag, commit, and build time it came
 # from. A source checkout has no such file and falls back to the values
 # below; that fallback is why this import is allowed to fail instead of
-# being a hard dependency of the package.
+# being a hard dependency of the package. The broad `except Exception`
+# (not just `ImportError`) is deliberate: a malformed generated file should
+# degrade to the same fallback, not crash every `import mv3dt_installer`.
 try:
     from ._buildinfo import BUILT_UTC, COMMIT, TAG
-except ImportError:
+except Exception:
     TAG, COMMIT, BUILT_UTC = "", "source", "unknown"
     _STAMPED = False
 else:
-    _STAMPED = True
+    # `sys.frozen` is set by the PyInstaller bootloader on a running frozen
+    # binary, and only there. Gating on it (not just on the import
+    # succeeding) means an untracked `_buildinfo.py` left behind by an
+    # earlier local `pyinstaller` build cannot be picked up the next time
+    # the package runs unfrozen from source — the scenario the module's own
+    # docstring below promises can never happen.
+    _STAMPED = bool(getattr(sys, "frozen", False))
+    if not _STAMPED:
+        TAG, COMMIT, BUILT_UTC = "", "source", "unknown"
 
 
 def build_info() -> tuple[str, str, str]:

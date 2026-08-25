@@ -39,9 +39,11 @@ P2BP Senior Design (Fall '25 – Spring '26) hardware stack for a multi-camera
 - Three `laptop/scripts/` entries are **not** superseded by the installer and
   must not be deleted as part of the port —
   `40_export_watcher.sh` (watch mode has no installer equivalent),
-  `10_setup_mosquitto.sh` (no step owns Mosquitto install), and
-  `20_verify_cameras.sh` (only its ping sweep is ported, not the `ffprobe`
-  check). See `DELETION-REVIEW.md` §6.
+  `10_setup_mosquitto.sh` (retained as a developer tool now that Step 1 owns
+  the broker install itself), and `20_verify_cameras.sh` (retained as a
+  developer tool now that its `ffprobe` check is ported into camera
+  discovery, `00` §15; only the shallow ping sweep is ported into Step 5).
+  See `DELETION-REVIEW.md` §6.
 - PeopleNet is the only detector wired into the DeepStream pipeline; `yolo11n`
   is reserved for future work — don't add YOLO wiring without being asked.
 - [`laptop/config/cameras.yml`](laptop/config/cameras.yml) is the camera
