@@ -203,8 +203,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 class NgcHandle:
     """Binds `ngc.py`'s install-dir-parameterized API to the resolved
     `install_dir` (doc 00 §12.3: "ngc handle (`load_key`,
-    `configure_ngc_cli`, expose `manual_fallback` status to the resolved
-    `install_dir`)")."""
+    `configure_ngc_cli`, §10)"). The NGC key is required, so a present key
+    is guaranteed by the time any step runs -- `load_key()` returning
+    `None` here would mean onboarding did not complete, not a fallback
+    state a step needs to branch on."""
 
     install_dir: pathlib.Path
 
@@ -213,15 +215,6 @@ class NgcHandle:
 
     def configure_ngc_cli(self) -> Optional[pathlib.Path]:
         return ngc_mod.configure_ngc_cli(self.install_dir)
-
-    @property
-    def manual_fallback(self) -> bool:
-        """Whether the operator chose the manual NGC key fallback (doc 00
-        §10.3). `ngc.py` doesn't persist this flag itself -- `KeyState` is
-        only the transient result of `capture_key()` at bootstrap time --
-        so it's derived here from `load_key()` returning `None`, which is
-        exactly the signal doc 00 §10.3 tells step authors to check."""
-        return self.load_key() is None
 
 
 @dataclass

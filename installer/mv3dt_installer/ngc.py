@@ -1,13 +1,12 @@
 """NGC API key capture and local secure storage for mv3dt-installer (doc 00
 §10).
 
-The key is captured once in the bootstrap stage (doc 00 §5.1 step 4) and
-consumed later by Step 2 (PeopleNet model fetch, Docker install method) and
-any other NGC-gated step, via `load_key()` / `configure_ngc_cli()`. This
-module is a self-contained sibling of laptop/ (doc 00 §3.1) and of steps/
-(doc 00 §9.3) -- it does not import from either, and adds no step1-7
-business logic (that is out of scope here; see doc 00 §10.3 for what a
-future step author does with a `None` result from `load_key()`).
+The key is captured once in the onboarding stage (doc 00 §5.2) and consumed
+later by Step 2 (PeopleNet model fetch, Docker install method) and any other
+NGC-gated step, via `load_key()` / `configure_ngc_cli()`. The key is
+REQUIRED: `capture_key()` never returns without one. This module is a
+self-contained sibling of laptop/ (doc 00 §3.1) and of steps/ (doc 00 §9.3)
+-- it does not import from either, and adds no step1-7 business logic.
 
 Storage contract (doc 00 §10.1):
     Canonical secret file: `<install_dir>/secrets/ngc.env`, owned by the
@@ -17,14 +16,18 @@ Storage contract (doc 00 §10.1):
     `NGC_API_KEY=<redacted>` instead.
 
 Public API (doc 00 §10.2):
-    KeyState -- small dataclass: `key: str | None`, `manual_fallback: bool`.
-    capture_key(non_interactive) -> KeyState -- secret prompt (no echo,
-        `getpass.getpass`); blank input (or `--non-interactive`, which never
-        prompts at all) is recorded as `manual_fallback = True`.
+    capture_key(non_interactive) -> str -- secret prompt (no echo,
+        `getpass.getpass`); a blank answer re-prompts rather than being
+        accepted. Under `--non-interactive` there is no human to re-prompt,
+        so this dies immediately (doc 00 §4: "fail if a required value is
+        missing") -- the caller (`onboarding.ensure_ngc_key()`) is expected
+        to have already checked a pre-set `NGC_API_KEY` environment
+        variable before ever calling this.
     store_key(key, install_dir) -> Path -- atomic write of `secrets/ngc.env`.
     load_key(install_dir=DEFAULT_INSTALL_DIR) -> str | None -- read back for
-        a step; `None` means the operator chose the manual fallback (doc 00
-        §10.3) -- no key was ever stored.
+        a step; `None` only before onboarding has captured a key yet (or a
+        hand-tampered/missing secrets file) -- every step that runs after
+        onboarding can treat a present key as guaranteed.
     configure_ngc_cli(install_dir=DEFAULT_INSTALL_DIR) -> Path | None --
         writes `~/.ngc/config` for the invoking user, mirroring Phase 10 of
         00_bootstrap.sh's `NGCINI` heredoc.
@@ -61,14 +64,12 @@ import getpass
 import os
 import pathlib
 import tempfile
-from dataclasses import dataclass
 from typing import Optional, Union
 
 from . import privilege
-from .logs import log
+from .logs import die, log
 
 __all__ = [
-    "KeyState",
     "DEFAULT_INSTALL_DIR",
     "capture_key",
     "store_key",
@@ -91,53 +92,41 @@ _REDACTED_LOG_LINE = "NGC_API_KEY=<redacted>"
 StrPath = Union[str, "os.PathLike[str]"]
 
 
-@dataclass
-class KeyState:
-    """Result of `capture_key()` (doc 00 §10.2).
-
-    `key` is the raw captured value, or `None` if the operator left the
-    prompt blank (or the capture ran `--non-interactive`, which never
-    prompts). `manual_fallback` is `True` in exactly that case -- doc 00
-    §10.3 governs what a step does when it later observes this via
-    `load_key()` returning `None`.
-    """
-
-    key: Optional[str]
-    manual_fallback: bool
-
-
 # ---------------------------------------------------------------------------
 # 10.2 -- capture
 # ---------------------------------------------------------------------------
 
 
-def capture_key(non_interactive: bool) -> KeyState:
-    """Prompt for the NGC API key (doc 00 §10.2).
+def capture_key(non_interactive: bool) -> str:
+    """Prompt for the NGC API key (doc 00 §10.2). The key is REQUIRED --
+    this never returns without one.
 
     Echo is suppressed via `getpass.getpass` -- the key is never displayed
-    and never logged. Under `--non-interactive` (doc 00 §4: "never prompt;
-    use defaults/config; fail if a required value is missing"), there is no
-    stored/default key to fall back to yet at first-capture time, so this
-    skips the prompt entirely and reports the manual fallback, exactly as if
-    the operator had left the interactive prompt blank.
+    and never logged. A blank answer re-prompts (with a one-line reminder
+    that the key is required) rather than being accepted, matching
+    `config.py`'s `_prompt_for_gate()` retry-until-valid convention.
+
+    Under `--non-interactive` (doc 00 §4: "never prompt; use
+    defaults/config; fail if a required value is missing") there is no
+    human to re-prompt, so this dies immediately instead of looping forever
+    or silently accepting no key. The caller, `onboarding.ensure_ngc_key()`,
+    is expected to have already checked a pre-set `NGC_API_KEY` environment
+    variable (doc 00 §9.1's `sudo -E` path) before ever calling this, so a
+    non-interactive run only reaches here when no key is available at all.
     """
     if non_interactive:
-        log.info(
-            "Non-interactive: skipping NGC API key prompt "
-            f"({_REDACTED_LOG_LINE} not captured; manual fallback)."
+        die(
+            "NGC API key is required but --non-interactive was passed with "
+            "no NGC_API_KEY set in the environment; re-run with NGC_API_KEY "
+            "exported (sudo -E) or without --non-interactive."
         )
-        return KeyState(key=None, manual_fallback=True)
 
-    raw = getpass.getpass(
-        "NGC API key (leave blank to configure manually later): "
-    ).strip()
-
-    if not raw:
-        log.info(f"No key entered ({_REDACTED_LOG_LINE}); manual fallback.")
-        return KeyState(key=None, manual_fallback=True)
-
-    log.info(f"Captured {_REDACTED_LOG_LINE}.")
-    return KeyState(key=raw, manual_fallback=False)
+    while True:
+        raw = getpass.getpass("NGC API key (required): ").strip()
+        if raw:
+            log.info(f"Captured {_REDACTED_LOG_LINE}.")
+            return raw
+        log.warn("NGC API key cannot be blank; please try again.")
 
 
 # ---------------------------------------------------------------------------
@@ -208,12 +197,12 @@ def store_key(key: str, install_dir: StrPath) -> pathlib.Path:
 
 
 def load_key(install_dir: StrPath = DEFAULT_INSTALL_DIR) -> Optional[str]:
-    """Read back the stored key (doc 00 §10.2/§10.3).
+    """Read back the stored key (doc 00 §10.2).
 
     Returns `None` when `secrets/ngc.env` doesn't exist, or exists but has
-    no usable `NGC_API_KEY=` value -- both cases mean "the operator chose
-    the manual fallback; no key was ever stored" from a calling step's point
-    of view.
+    no usable `NGC_API_KEY=` value. Since the key is required, this should
+    only happen before onboarding has run; every step that runs after
+    onboarding can treat a present key as guaranteed.
     """
     path = pathlib.Path(install_dir) / _SECRET_RELATIVE_PATH
     if not path.is_file():
@@ -274,15 +263,12 @@ def configure_ngc_cli(
     process without ever becoming a CLI argument or a Python-source literal.
 
     Reads the key via `load_key(install_dir)` only to decide whether there
-    is anything to configure. If no key was ever stored (manual fallback,
-    doc 00 §10.3), this is a no-op that returns `None` -- it is each step's
-    job to detect that from `load_key()` directly and surface a
-    USER_ACTION_REQUIRED block, not this function's.
+    is anything to configure. If no key has been stored yet (only possible
+    before onboarding has run), this is a no-op that returns `None`.
     """
     if load_key(install_dir) is None:
         log.warn(
-            f"{_REDACTED_LOG_LINE} not configured (manual fallback); "
-            "skipping ~/.ngc/config."
+            f"{_REDACTED_LOG_LINE} not stored yet; skipping ~/.ngc/config."
         )
         return None
 

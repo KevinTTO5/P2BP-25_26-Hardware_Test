@@ -70,38 +70,58 @@ def test_capture_key_returns_key_when_prompt_answered(monkeypatch):
 
     result = ngc.capture_key(non_interactive=False)
 
-    assert result.key == _FAKE_KEY
-    assert result.manual_fallback is False
+    assert result == _FAKE_KEY
 
 
-def test_capture_key_blank_input_sets_manual_fallback(monkeypatch):
-    monkeypatch.setattr(ngc.getpass, "getpass", lambda prompt="": "")
+def test_capture_key_reprompts_on_blank_input(monkeypatch):
+    answers = iter(["", _FAKE_KEY])
+    calls = []
 
-    result = ngc.capture_key(non_interactive=False)
+    def _fake_getpass(prompt=""):
+        calls.append(prompt)
+        return next(answers)
 
-    assert result.key is None
-    assert result.manual_fallback is True
-
-
-def test_capture_key_blank_input_after_whitespace_only_sets_manual_fallback(monkeypatch):
-    monkeypatch.setattr(ngc.getpass, "getpass", lambda prompt="": "   ")
+    monkeypatch.setattr(ngc.getpass, "getpass", _fake_getpass)
 
     result = ngc.capture_key(non_interactive=False)
 
-    assert result.key is None
-    assert result.manual_fallback is True
+    assert result == _FAKE_KEY
+    assert len(calls) == 2
 
 
-def test_capture_key_non_interactive_never_prompts(monkeypatch):
+def test_capture_key_reprompts_on_whitespace_only_input(monkeypatch):
+    answers = iter(["   ", _FAKE_KEY])
+    monkeypatch.setattr(ngc.getpass, "getpass", lambda prompt="": next(answers))
+
+    result = ngc.capture_key(non_interactive=False)
+
+    assert result == _FAKE_KEY
+
+
+def test_capture_key_reprompts_indefinitely_until_a_key_is_given(monkeypatch):
+    answers = iter(["", "", "", _FAKE_KEY])
+    calls = []
+
+    def _fake_getpass(prompt=""):
+        calls.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr(ngc.getpass, "getpass", _fake_getpass)
+
+    result = ngc.capture_key(non_interactive=False)
+
+    assert result == _FAKE_KEY
+    assert len(calls) == 4
+
+
+def test_capture_key_non_interactive_never_prompts_and_dies(monkeypatch):
     def _boom(prompt=""):
         raise AssertionError("getpass.getpass must not be called in non-interactive mode")
 
     monkeypatch.setattr(ngc.getpass, "getpass", _boom)
 
-    result = ngc.capture_key(non_interactive=True)
-
-    assert result.key is None
-    assert result.manual_fallback is True
+    with pytest.raises(SystemExit):
+        ngc.capture_key(non_interactive=True)
 
 
 # ---------------------------------------------------------------------------

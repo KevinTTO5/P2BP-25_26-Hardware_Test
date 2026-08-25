@@ -189,11 +189,10 @@ Steps, in order:
    in-container UID 1000 can write (Notion §8.3; lines 130–142). As root this is
    a direct `chown`; as the user it is `sudo chown` with a warning fallback.
 5. **Optional `docker login nvcr.io`** using the NGC key from the `ctx.ngc`
-   handle (doc 00 §10): `echo "$key" | docker login nvcr.io --username
-   '$oauthtoken' --password-stdin` (lines 144–150). AMC images may be public;
-   on failure, warn and continue. If `ctx.ngc.load_key()` is `None`
-   (manual-fallback), skip and log "assuming AMC images are public or
-   `docker login` already done".
+   handle (doc 00 §10, required — always present at this point): `echo
+   "$key" | docker login nvcr.io --username '$oauthtoken' --password-stdin`
+   (lines 144–150). AMC images may be public; on failure, warn and continue
+   rather than fail the step.
 6. **Locate the compose dir** — `AMC_ROOT/tools/auto-magic-calib/compose`
    (the monorepo layout) if present, else fall back to `AMC_ROOT/compose` or
    `AMC_ROOT` itself if `compose.yaml`/`docker-compose.yml` sit there (in case

@@ -461,7 +461,6 @@ def test_build_context_bindings_work(tmp_path, capsys):
 
     # ngc handle bound to this install_dir; no key ever stored here.
     assert ctx.ngc.load_key() is None
-    assert ctx.ngc.manual_fallback is True
 
     # webapp handle bound to gate "off" -> never enabled regardless of
     # whatever credentials might exist.
