@@ -96,12 +96,24 @@ __all__ = [
     "GATE_DEFAULTS",
     "GATE_CHOICES",
     "GATE_FLAGS",
+    "CAMERAS_FILE_KEY",
+    "CAMERA_SCAN_CIDR_KEY",
+    "CAMERA_SCAN_IFACE_KEY",
     "Config",
     "load",
+    "persist_value",
 ]
 
 # Mirrored file under the install dir (doc 00 §11.2's layout tree).
 CONF_FILENAME = "installer.conf"
+
+# doc 00 §11.2/§15.5: camera-scan tuning and the CAMERAS_FILE pointer,
+# persisted alongside the gates but not gate-shaped (no seeding precedence,
+# no CLI-flag-overwrite-and-log rule) -- app.py writes these directly via
+# persist_value() below, after a --scan-cameras run.
+CAMERAS_FILE_KEY = "CAMERAS_FILE"
+CAMERA_SCAN_CIDR_KEY = "CAMERA_SCAN_CIDR"
+CAMERA_SCAN_IFACE_KEY = "CAMERA_SCAN_IFACE"
 
 # §3.4 opt-in step gates. Key names match the installer.conf KEY=VALUE shape
 # exactly (bash-fragment-safe, uppercase, no lowercase/mixed variants).
@@ -187,6 +199,18 @@ def _write_conf(path: pathlib.Path, values: dict[str, str]) -> None:
     ]
     lines.extend(f"{key}={values[key]}" for key in sorted(values))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def persist_value(install_dir: "pathlib.Path | str", key: str, value: str) -> None:
+    """Write a single non-gate `KEY=VALUE` into `installer.conf`, preserving
+    every other key already there (doc 00 §11.2's `CAMERA_SCAN_CIDR` /
+    `CAMERA_SCAN_IFACE`, doc 00 §15.5). Unlike the gate keys, there is no
+    seeding precedence here -- this always overwrites, the same way a gate
+    flag overwrites an already-persisted gate value."""
+    conf_path = pathlib.Path(install_dir) / CONF_FILENAME
+    values = _read_conf(conf_path)
+    values[key] = value
+    _write_conf(conf_path, values)
 
 
 def _resolve_install_dir(
