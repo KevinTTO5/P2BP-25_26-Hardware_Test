@@ -65,6 +65,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from mv3dt_installer import __version__, build_stamp
+from mv3dt_installer import cameras as cameras_mod
 from mv3dt_installer import config as config_mod
 from mv3dt_installer import ngc as ngc_mod
 from mv3dt_installer import onboarding
@@ -182,6 +183,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Set the Step 7 web-app-integration gate "
         "(MV3DT_WEBAPP_INTEGRATION in installer.conf, doc 00 §3.4). "
         "Overrides an already-persisted value.",
+    )
+    parser.add_argument(
+        "--scan-cameras",
+        action="store_true",
+        help="Discover the camera fleet by MAC OUI, probe RTSP, run the "
+        "one-time position binding, write cameras.yml/cameras.scan.json, "
+        "print the table, and exit (doc 00 §15). Needs sudo for raw "
+        "sockets, so unlike --status this runs after the root check.",
+    )
+    parser.add_argument(
+        "--camera-scan-cidr",
+        metavar="CIDR",
+        default=None,
+        help="Override the discovery sweep range "
+        f"(default {cameras_mod.DEFAULT_SCAN_CIDR}); persisted as "
+        "CAMERA_SCAN_CIDR (doc 00 §11.2).",
+    )
+    parser.add_argument(
+        "--camera-scan-iface",
+        metavar="IFACE",
+        default=None,
+        help="Restrict discovery to one interface; persisted as "
+        "CAMERA_SCAN_IFACE (doc 00 §11.2).",
     )
     parser.add_argument(
         "--version",
@@ -550,6 +574,75 @@ def _reset_step(sm: StateMachine, order: int) -> int:
     return 0
 
 
+def _seed_camera_inventory() -> tuple[str, list[str]]:
+    """Read the bundled `assets/cameras/cameras.yml` (doc 00 §4.1/§15.5)
+    for its header block and its cameras' IPs, used only on a genuinely
+    first scan (no `<install_dir>/cameras.yml` yet)."""
+    seed_path = shellout.asset_path("cameras", "cameras.yml")
+    try:
+        text = seed_path.read_text(encoding="utf-8")
+    except OSError:
+        return "", []
+    header = text.split("\n\ncameras:", 1)[0]
+    prime_ips = [cam.ip for cam in cameras_mod.parse_inventory(text) if cam.ip]
+    return header, prime_ips
+
+
+def _run_scan_cameras(cfg: config_mod.Config, args: argparse.Namespace) -> int:
+    """`--scan-cameras` (doc 00 §3.3/§15.5): a standalone mode shaped like
+    `--status`, but run after `require_root()` since ARP scanning needs
+    raw sockets. Discovers, probes, binds, writes both artifacts, prints
+    the resulting table, and exits -- it never enters the dispatch loop.
+    """
+    if args.camera_scan_cidr:
+        config_mod.persist_value(
+            cfg.install_dir, config_mod.CAMERA_SCAN_CIDR_KEY, args.camera_scan_cidr
+        )
+    if args.camera_scan_iface:
+        config_mod.persist_value(
+            cfg.install_dir, config_mod.CAMERA_SCAN_IFACE_KEY, args.camera_scan_iface
+        )
+
+    cidr = (
+        args.camera_scan_cidr
+        or cfg.values.get(config_mod.CAMERA_SCAN_CIDR_KEY)
+        or cameras_mod.DEFAULT_SCAN_CIDR
+    )
+    iface = args.camera_scan_iface or cfg.values.get(config_mod.CAMERA_SCAN_IFACE_KEY)
+    interfaces = [iface] if iface else None
+
+    seed_header, prime_ips = _seed_camera_inventory()
+
+    result = cameras_mod.refresh(
+        cfg.install_dir,
+        seed_header=seed_header,
+        cam_user=cfg.values.get("CAM_USER", ""),
+        cam_password=cfg.values.get("CAM_PASSWORD", ""),
+        cidr=cidr,
+        interfaces=interfaces,
+        prime_ips=prime_ips,
+        non_interactive=args.non_interactive,
+    )
+
+    # doc 00 §15.5: the pointer bundled bash and later steps read.
+    config_mod.persist_value(
+        cfg.install_dir,
+        config_mod.CAMERAS_FILE_KEY,
+        str(cfg.install_dir / "cameras.yml"),
+    )
+
+    for cam in result.cameras:
+        stream = "unknown" if cam.stream_ok is None else ("ok" if cam.stream_ok else "FAILED")
+        log.info(
+            f"{cam.id}: {cam.mac or '(no mac)'} {cam.ip} {cam.position or '(unlabeled)'} "
+            f"stream={stream} enabled={cam.enabled}"
+        )
+    if result.unmatched:
+        log.info(f"unmatched hosts (non-camera OUI): {', '.join(result.unmatched)}")
+
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # doc 00 §3.2 -- entrypoint
 # ---------------------------------------------------------------------------
@@ -611,6 +704,9 @@ def main(
 
     log_dir = pathlib.Path(args.log_dir) if args.log_dir else None
     open_transcript(log_dir)
+
+    if args.scan_cameras:
+        return _run_scan_cameras(cfg, args)
 
     # doc 00 §3.2 step 9: after the transcript opens, so every prompt and
     # its redacted outcome is part of the auditable record. No-op on every
