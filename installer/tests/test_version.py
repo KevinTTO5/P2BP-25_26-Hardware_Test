@@ -48,12 +48,21 @@ def _make_package(root: Path, name: str, buildinfo: str | None = None) -> None:
         (package_dir / "_buildinfo.py").write_text(buildinfo, encoding="utf-8")
 
 
-def _import_package(root: Path, name: str, monkeypatch):
+def _import_package(root: Path, name: str, monkeypatch, frozen: bool = False):
     """Import `root/name` as a fresh top-level package and make sure it does
-    not linger in `sys.modules` for the next test."""
+    not linger in `sys.modules` for the next test.
+
+    `frozen` simulates the PyInstaller bootloader's `sys.frozen` attribute,
+    which is what `__init__.py` actually gates a CI-written `_buildinfo.py`
+    on; the real release workflow always runs the stamped import inside a
+    frozen binary, so a test that wants "CI wrote this and it took effect"
+    has to set it too, not just drop the file next to the package.
+    """
     monkeypatch.syspath_prepend(str(root))
     monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.delitem(sys.modules, f"{name}._buildinfo", raising=False)
+    if frozen:
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
     module = __import__(name)
     return module
 
@@ -100,7 +109,7 @@ def test_build_info_reads_the_ci_written_buildinfo(tmp_path, monkeypatch):
             'BUILT_UTC = "2026-08-19T14:02:11Z"\n'
         ),
     )
-    module = _import_package(tmp_path, "stamped_pkg", monkeypatch)
+    module = _import_package(tmp_path, "stamped_pkg", monkeypatch, frozen=True)
 
     assert module.build_info() == ("v9.9.9", "a1b2c3d", "2026-08-19T14:02:11Z")
     assert module.build_stamp() == (
@@ -121,7 +130,7 @@ def test_build_stamp_drops_an_empty_tag(tmp_path, monkeypatch):
             'BUILT_UTC = "2026-08-19T22:19:36Z"\n'
         ),
     )
-    module = _import_package(tmp_path, "untagged_pkg", monkeypatch)
+    module = _import_package(tmp_path, "untagged_pkg", monkeypatch, frozen=True)
 
     assert module.build_stamp() == " (commit e215330, built 2026-08-19T22:19:36Z)"
 
@@ -137,7 +146,7 @@ def test_build_stamp_composes_the_release_version_banner(tmp_path, monkeypatch):
             'BUILT_UTC = "2026-08-19T14:02:11Z"\n'
         ),
     )
-    module = _import_package(tmp_path, "banner_pkg", monkeypatch)
+    module = _import_package(tmp_path, "banner_pkg", monkeypatch, frozen=True)
 
     banner = f"mv3dt-installer {module.__version__}{module.build_stamp()}"
     assert banner == (
@@ -146,14 +155,34 @@ def test_build_stamp_composes_the_release_version_banner(tmp_path, monkeypatch):
     )
 
 
-def test_installed_package_reports_source_provenance():
-    """`_buildinfo.py` is CI-generated and gitignored, so a plain checkout
-    must report itself as an unstamped source build. A committed one would
-    make every developer's binary claim to be a published release."""
-    buildinfo = PACKAGE_INIT.parent / "_buildinfo.py"
-    if buildinfo.exists():
-        pytest.skip("a local PyInstaller build left an untracked _buildinfo.py behind")
+def test_buildinfo_present_but_unfrozen_still_reports_source_provenance(
+    tmp_path, monkeypatch
+):
+    """A `_buildinfo.py` left behind by an earlier local `pyinstaller` build
+    (an untracked, gitignored file that can easily survive a return to
+    running from source) must not be picked up outside a frozen binary.
+    This is what makes `test_installed_package_reports_source_provenance`
+    below safe to assert unconditionally rather than skip."""
+    _make_package(
+        tmp_path,
+        "leftover_buildinfo_pkg",
+        buildinfo=(
+            'TAG = "v9.9.9"\n'
+            'COMMIT = "a1b2c3d"\n'
+            'BUILT_UTC = "2026-08-19T14:02:11Z"\n'
+        ),
+    )
+    module = _import_package(tmp_path, "leftover_buildinfo_pkg", monkeypatch)
 
+    assert module.build_info() == ("", "source", "unknown")
+    assert module.build_stamp() == ""
+
+
+def test_installed_package_reports_source_provenance():
+    """The test suite always runs unfrozen, so the real package must report
+    itself as an unstamped source build regardless of whether an untracked
+    `_buildinfo.py` happens to be sitting next to it from an earlier local
+    PyInstaller build."""
     assert mv3dt_installer.build_info() == ("", "source", "unknown")
     assert mv3dt_installer.build_stamp() == ""
 
