@@ -270,26 +270,23 @@ text is retained in each item so the reason the script was kept is not lost.
    probe proves it serves a decodable stream — the distinction the original
    script existed to make. `20_verify_cameras.sh` itself is therefore dropped
    as an operator-run script: the capability survives with no command to type.
-   The cited `STEP-5` §3.3 still carries its "Partial port (flagged)"
-   blockquote on this branch, saying the script "stays load-bearing for
-   genuine pre-flight camera verification" — that text has not yet been
-   updated to reflect the `cameras.py` port recorded here; it is a pending
-   `STEP-5` edit, not a disagreement with this row.
+   `STEP-5` §3.3 now carries the resolved blockquote confirming this split —
+   the ping sweep stays in `STEP-5`, the `ffprobe` check moved to
+   `cameras.py` — so this row and `STEP-5` agree.
 
-3. **The export watcher — RESOLVED, superseded operationally, pending the
+3. **The export watcher — RESOLVED, superseded operationally by the
    [`STEP-4` §4.4](STEP-4-CALIB-OUTPUT-WIRING.md#44-one-shot-vs-watcher)
    auto-ingest rewrite.**
    The earlier reading — "not superseded, do not delete" — was written before
-   auto-ingest was designed. As `STEP-4` §4.4 reads on this branch today, the
-   installer still does a one-shot copy+render pass and must not block on a
-   long-running `inotifywait` loop, and that section explicitly says
-   `40_export_watcher.sh` is **NOT superseded** and must not be deleted. The
-   in-session blocking + systemd path-unit auto-ingest that supersedes the
-   watcher operationally is real, but lands with the sibling `STEP-4` rewrite
-   (U7, PR #28), not yet merged — this row records the intended decision, not
-   the current state of §4.4. Until that rewrite lands,
+   auto-ingest was designed. `STEP-4` §4.4 now reads in the resolved voice
+   ("LOCKED — the operator never types a command to run a script"): the
+   one-shot ingest+render logic is ported into `run()`, and continuous
+   re-ingest is handed to the systemd path unit described in §4.5, superseding
+   the watcher's `inotifywait` loop operationally.
    [`40_export_watcher.sh`](../../laptop/scripts/40_export_watcher.sh) stays
-   retained in git as a developer tool and load-bearing per §4.4 as written.
+   retained in git as a developer tool — the standalone watch mode has no
+   installer equivalent and is never deletable — but it is no longer
+   load-bearing for the installer's own ingest path.
 
 ---
 
