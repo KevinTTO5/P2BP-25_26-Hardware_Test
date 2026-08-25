@@ -123,8 +123,18 @@ writes the template with `%i`-parameterized paths; the per-instance config is
 resolved from the registry at install time (or by the pipeline subcommand at
 `ExecStart` time — see [§A.2](#a2-step-5-handoff--the-pipeline-slug-exe-becomes-a-systemctl-controller)).
 
-File `/etc/systemd/system/mv3dt-pipeline@.service` (installed as a bundled
-asset, root-owned, `0644`):
+File `/etc/systemd/system/mv3dt-pipeline@.service`. This is a genuine systemd
+**template** unit — `%i` is systemd's own instance specifier, resolved
+natively at `systemctl start mv3dt-pipeline@<slug>` time, never touched by
+the installer. `User=`, below, is a different kind of substitution: there is
+no systemd specifier for "the invoking user of the installer," so that one
+field is filled in once at install time via `systemd.render_unit()`
+(framework module, [`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-and-staging-bundled-assets-at-runtime)
+staging + `@MARKER@`-style substitution, same mechanism
+[`STEP-4` §4.5](STEP-4-CALIB-OUTPUT-WIRING.md#45-re-ingest-on-later-recalibrations-systemd-path-unit)
+uses for the ingest units) — the bundled template on disk is
+`mv3dt-pipeline@.service.in` with an `@USER@` marker, not the literal `%i`
+unit shown rendered below:
 
 ```ini
 [Unit]
@@ -135,7 +145,7 @@ Requires=mosquitto.service
 
 [Service]
 Type=simple
-User=%u_placeholder                     ; rendered to the invoking user (framework §9.2)
+User=@USER@                             ; rendered to the invoking user (framework §9.2)
 WorkingDirectory=/opt/mv3dt/deepstream/%i
 
 # ExecStart ports 50_start_pipeline.sh: ensure mosquitto up, source the DS env,
@@ -189,9 +199,10 @@ Notes:
 - **`Requires=mosquitto.service`** guarantees the broker the pipeline
   publishes MV3DT telemetry to is up before the pipeline starts (the
   service-context equivalent of `ensure_mosquitto()`).
-- `User=` is rendered to the invoking user (framework §9.2) so
-  `deepstream-app`, the DS env, and GPU access run as the same user the rest
-  of the install used, not root.
+- `User=` is rendered to the invoking user (framework §9.2) via
+  `systemd.render_unit()`'s `@USER@` marker, so `deepstream-app`, the DS
+  env, and GPU access run as the same user the rest of the install used, not
+  root. This is a one-time install-time substitution, independent of `%i`.
 - `WorkingDirectory=/opt/mv3dt/deepstream/%i` matches the Step 5 registry
   layout (`<install_dir>/deepstream/<slug>/`).
 - Hardening directives from `tracker.service` (`ProtectSystem`,
@@ -264,9 +275,18 @@ point at this step (it is no longer out of scope).
 since that script is being removed
 ([`DELETION-REVIEW` §3](DELETION-REVIEW.md#3-deletions-gated-on-the-harvest-the-jetson-tree)):
 
-1. Copy `mv3dt-pipeline@.service` and `mv3dt-agent.service` into
-   `/etc/systemd/system/` (bundled assets via `ctx.asset_path`, framework
-   §4.2; `cp` as root).
+1. Render `mv3dt-pipeline@.service.in` and `mv3dt-agent.service.in`
+   (bundled templates staged via `ctx.asset_path`, framework §4.2) through
+   `systemd.render_unit()` — substituting `@USER@` with the invoking user —
+   then install the rendered text into `/etc/systemd/system/` via
+   `systemd.install_unit()` (content-idempotent, root-owned `0644`; see the
+   callout below). `systemd.py` today only implements the STEP-4-specific
+   `render_ingest_units()` wrapper around the generic `render_unit()`
+   primitive; Step 6 calls `render_unit()` directly (or adds its own thin
+   wrapper) since `mv3dt-pipeline@.service.in` and `mv3dt-agent.service.in`
+   are a different template pair. Neither `.in` template exists yet under
+   `installer/mv3dt_installer/assets/systemd/` — creating them is part of
+   implementing this step.
 2. `systemctl daemon-reload` — **required** before any `enable`, or systemd
    acts on a stale view of the unit files.
 3. For each project in `registry.json`:
@@ -292,8 +312,10 @@ since that script is being removed
 > drift on unit-install semantics.
 
 **Sudo/root:** all of the above require root; Step 6 uses `ctx.run_root(...)`
-(framework §12.3). The installer already runs as root under `sudo -E`
-(framework §9.1), so no extra privilege prompt is needed.
+(framework §12.3). The installer already runs as root under plain `sudo`
+(framework §5.1, §9.1 — `-E` is optional, only needed to pass a pre-set
+`NGC_API_KEY` through the environment), so no extra privilege prompt is
+needed.
 
 ---
 
@@ -329,7 +351,7 @@ Wants=network-online.target mosquitto.service
 
 [Service]
 Type=simple
-User=%u_placeholder                     ; rendered to the invoking user
+User=@USER@                             ; rendered to the invoking user, via systemd.render_unit()
 ExecStart=/opt/mv3dt/bin/mv3dt-installer agent
 WorkingDirectory=/opt/mv3dt
 

@@ -200,9 +200,15 @@ args = ["--non-interactive"] if ctx.non_interactive else []
 
 shellout.run_bundled_script(
     "scripts", "10_setup_mosquitto.sh",
-    args=args, tree=("scripts",),
+    args=args, tree=(),
 )
 ```
+
+`tree=()` stages the whole `assets/` tree, not just `scripts/` — required because
+the script resolves its config from `$(asset_root)/mosquitto/mv3dt.conf`, a
+sibling directory of `scripts/`. `tree=("scripts",)` would stage only the
+`scripts/` subtree and the script's own `die "Missing source config..."` path
+would fire on every real invocation.
 
 The script ships inside the release binary
 ([`00` §5](00-FRAMEWORK-AND-BOOTSTRAP.md#5-distribution-the-github-release-binary)),
@@ -215,8 +221,15 @@ The script calls `pause_for_config_review` after installing the drop-in,
 which prints the installed config and then, unless the script's own
 `NONINTERACTIVE` variable is `1`, blocks on `read -r -p "Press Enter to
 continue..." </dev/tty`. `NONINTERACTIVE` starts at `0` and is set to `1`
-only by the script's `--non-interactive` CLI flag — there is no environment
-variable it reads instead. So Step 1 must pass the flag itself, exactly the
+only by the script's `--non-interactive` CLI flag. The bundled copy also
+gates the same pause on an `MV3DT_NO_PAUSE` environment variable, echoing the
+name of the framework's own `--no-pause` flag
+([`00` §3.3](00-FRAMEWORK-AND-BOOTSTRAP.md#33-cli-flags-framework-level)) —
+but nothing on the Python side sets it yet; `run_bundled_script` does not
+export it, and `--no-pause` does not currently propagate to bundled scripts.
+Treat it as an operator escape hatch (`MV3DT_NO_PAUSE=1` in the environment
+before running), not something Step 1's `run()` can rely on. So Step 1 must
+pass the `--non-interactive` flag itself, exactly the
 way `--with-firewall` is described just below (passed only when the operator
 asked for it, otherwise omitted): when `ctx.non_interactive` is set (the
 installer's own `--non-interactive`, framework §3.3), Step 1 appends
@@ -228,8 +241,12 @@ call that omits the flag under an unattended run would hang forever on the
 #### What the script actually does, in order
 
 Read against
-[`10_setup_mosquitto.sh`](../../laptop/scripts/10_setup_mosquitto.sh), which
-Step 1 runs unmodified — nothing about it is bundled-variant-specific.
+[`10_setup_mosquitto.sh`](../../laptop/scripts/10_setup_mosquitto.sh), the
+developer-harness original. Step 1 runs the bundled copy at
+`installer/mv3dt_installer/assets/scripts/10_setup_mosquitto.sh`, a ported
+variant functionally equivalent to the original but not byte-identical — it
+resolves its source config from the staged `asset_root` rather than the repo
+tree, and adds the `MV3DT_NO_PAUSE` gate noted above.
 
 1. **Packages.** `dpkg -s mosquitto` gates the install. Missing → `apt-get
    install -y --no-install-recommends libmosquitto1 mosquitto

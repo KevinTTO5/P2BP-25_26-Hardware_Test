@@ -461,8 +461,19 @@ install/verify:
   removed model format.
 
 These are awareness constraints on *which* verification path Step 2 takes;
-they do not add scope. Downstream detector/model work (PeopleNet) belongs to
-later steps, not Step 2.
+they do not add scope for detector/model *configuration* work (authoring or
+editing inference-graph config), which stays with
+[`STEP-4` §6.3](STEP-4-CALIB-OUTPUT-WIRING.md#63-config_infer_primarytxt-peoplenet--reference-only)
+and later steps.
+
+> **Open gap, not yet resolved here.** [`00` §10](00-FRAMEWORK-AND-BOOTSTRAP.md#10-ngc-api-key-capture--local-secure-storage)
+> and [`STEP-4` §1](STEP-4-CALIB-OUTPUT-WIRING.md#1-scope)/[§6.3](STEP-4-CALIB-OUTPUT-WIRING.md#63-config_infer_primarytxt-peoplenet--reference-only)
+> both state that Step 2 places the PeopleNet model artifacts, but §5 above
+> (Acquisition) specifies only the DS SDK artifact itself — deb/tar via
+> public GitHub Release, or the DS docker image via NGC — with no step that
+> fetches or places a PeopleNet model file anywhere. Until that acquisition
+> is actually specified (here, or explicitly reassigned elsewhere), treat
+> "Step 2 owns the PeopleNet model fetch" as aspirational, not implemented.
 
 ---
 

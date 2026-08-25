@@ -134,9 +134,11 @@ sudo usermod -aG docker "$USER"
 Adding a user to the `docker` group **does not take effect until that user
 starts a new login session**. Consequences:
 
-- **During the install run**, the binary is launched via `sudo -E`
-  (doc 00 §9.1), so `docker` calls run as root and work regardless of group
-  membership. Bring-up from inside the installer is fine.
+- **During the install run**, the binary is launched via `sudo`
+  (doc 00 §5.1, §9.1 — `-E` is optional now, only needed to pass a
+  pre-set `NGC_API_KEY` through the environment), so `docker` calls run as
+  root and work regardless of group membership. Bring-up from inside the
+  installer is fine.
 - **Later, when the operator runs `<install_dir>/bin/amc` as themselves**,
   their shell may not yet have picked up the `docker` group. The launcher must
   handle this:
