@@ -177,10 +177,16 @@ jobs:
   publish:
     needs: build
     # Tag pushes publish; a manual dispatch publishes only when explicitly
-    # asked for a draft. Pull requests never reach this job.
+    # asked for a draft, and only from a tag ref (a draft dispatch from a
+    # branch has no tag for --verify-tag to check, so it is excluded here
+    # rather than left to fail late inside the run: step). Pull requests
+    # never reach this job. A non-draft workflow_dispatch never publishes,
+    # even against an existing tag: only the push:tags trigger publishes
+    # a real release.
     if: >-
-      startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' && inputs.draft)
+      github.ref_type == 'tag' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.draft))
     # Same pin as the build job; see the comment there.
     runs-on: ubuntu-24.04
     permissions:
@@ -206,10 +212,9 @@ jobs:
           DRAFT: ${{ inputs.draft }}
         run: |
           set -euo pipefail
+          flags=(--generate-notes --verify-tag)
           if [ "${DRAFT:-}" = "true" ]; then
-            gh release create "$GITHUB_REF_NAME" --draft --generate-notes \
-              --verify-tag dist/mv3dt-installer dist/mv3dt-installer.sha256
-          else
-            gh release create "$GITHUB_REF_NAME" --generate-notes \
-              --verify-tag dist/mv3dt-installer dist/mv3dt-installer.sha256
+            flags+=(--draft)
           fi
+          gh release create "$GITHUB_REF_NAME" "${flags[@]}" \
+            dist/mv3dt-installer dist/mv3dt-installer.sha256

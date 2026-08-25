@@ -78,28 +78,65 @@ steps in order.
    show up as its own commit on `main` — the property this whole workflow
    exists to guarantee.
 
-   **Never manually force-delete a branch that any other entry in this
-   run still uses as its base.** Doing so does not trigger GitHub's
-   retarget behavior — it auto-*closes* the dependent PR instead, and a
-   PR whose base branch is gone cannot be reopened or retargeted through
-   the API at all (a hard GitHub limitation, not a bug to route around).
-   If this has already happened before you notice: don't try to reopen
-   it. Open a fresh PR from the same, still-existing head branch, targeted
-   at `main`; verify its `headRefOid` matches the closed PR's, so you know
-   no code or review work was lost, and merge that instead. Because step
-   4 now always retargets each entry to `main` immediately before its own
-   merge, branches are safe to delete right after each merge completes —
-   no later entry is ever left depending on an earlier entry's branch,
-   since every entry gets pointed at `main` on its own turn regardless of
-   what happened to any branch before it.
+   **`--delete-branch` itself is the hazard for a stacked chain — not just
+   manual deletion.** Before merging any entry, find every *open* PR based
+   on its `headRefName` by querying GitHub directly, not just scanning this
+   run's own list:
+   `gh pr list --state open --json number,baseRefName --jq '.[] | select(.baseRefName == "<headRefName>") | .number'`.
+   This catches a dependent PR that isn't part of this run at all — a
+   teammate's PR, or one opened after this run's argument list was
+   assembled — which a list-only check would miss and which would still be
+   auto-closed by the branch deletion below. If that query returns any PR
+   number:
+   - Merge the current entry **without** `--delete-branch`:
+     `gh pr merge <id> --squash --subject "<pr title>" --body "<pr body>"`.
+   - Immediately after that merge succeeds — before doing anything else,
+     and before moving to the next entry — retarget every PR number the
+     query returned to `main` via the API
+     (`gh api repos/<owner>/<repo>/pulls/<id> -X PATCH -f base=main`) and
+     re-check each one's `mergeable`. For any that are *not* in this run's
+     own list, note them in the final report (step 6) rather than merging
+     them yourself — retargeting keeps them alive and correct; merging a PR
+     nobody asked this run to merge is not this command's call to make.
+   - Only then delete the just-merged branch, explicitly:
+     `git push origin --delete <branch>`. It is safe now because no open
+     PR anywhere still depends on it as a base.
+
+   If the query returns nothing, `--delete-branch` on the merge call itself
+   is fine — nothing depends on that branch surviving.
+
+   The reason this matters: GitHub does not auto-retarget a dependent PR
+   just because its base branch's content later lands on `main` through
+   some other path. Deleting a branch while an open PR still points at it
+   as `base` doesn't retarget that PR to wherever the content went — it
+   auto-*closes* it, and a PR whose base branch is gone cannot be reopened
+   or retargeted through the API at all (a hard GitHub limitation, not a
+   bug to route around). Retargeting "on that entry's own turn" (this
+   step, applied earlier in this same list) is too late for a stacked
+   entry specifically *because* its own turn comes after the branch it's
+   based on was already deleted as a side effect of merging the entry
+   before it — by the time you'd retarget it, GitHub has already closed
+   it. Pre-emptive retargeting, right after the dependency's merge and
+   before its branch is deleted, is what actually prevents this.
+
+   If a PR has already been auto-closed this way before you notice: don't
+   try to reopen it. Open a fresh PR from the same, still-existing head
+   branch, targeted at `main`; verify its `headRefOid` matches the closed
+   PR's, so you know no code or review work was lost, review the diff for
+   conflicts against the now-updated `main` (a stacked branch cut before
+   its dependency merged will very likely show textual conflicts — usually
+   cosmetic doc/status-marker duplication from both branches independently
+   fixing the same lines — resolve, re-run the full test suite, and push
+   before merging the fresh PR), and merge that instead.
 
    With the merge itself, always pass an explicit commit message:
-   `gh pr merge <id> --squash --delete-branch --subject "<pr title>" --body "<pr body>"`.
-   Never omit `--subject`/`--body` and never use `--merge`. Individual
-   commits on a feature branch may carry trailers or wording that violate
-   the content style rules (they are working history, not the final
-   record), so the default squash message (which can fold in raw commit
-   messages) is not safe to use as-is. Always pass the PR's own
+   `gh pr merge <id> --squash [--delete-branch] --subject "<pr title>" --body "<pr body>"`
+   (omit `--delete-branch` per the stacked-chain rule above; include it
+   otherwise). Never omit `--subject`/`--body` and never use `--merge`.
+   Individual commits on a feature branch may carry trailers or wording
+   that violate the content style rules (they are working history, not the
+   final record), so the default squash message (which can fold in raw
+   commit messages) is not safe to use as-is. Always pass the PR's own
    already-cleaned title and body explicitly, so the commit that lands on
    `main` is exactly that text, never a concatenation of the branch's
    individual commits. If `--delete-branch` reports a local deletion
