@@ -281,13 +281,18 @@ def test_preflight_fails_when_no_nvidia_gpu(tmp_path):
 
 def test_run_dispatches_to_launch_a_when_driver_not_loaded(tmp_path):
     """No driver_version -> _driver_loaded() is False -> Launch A path,
-    which (with the .run staged) ends in REBOOT_REQUIRED."""
+    which (with the .run staged) ends in USER_ACTION_REQUIRED -- not
+    REBOOT_REQUIRED, since the merged reboot.reconcile()/app._dispatch()
+    would auto-complete this step on a confirmed reboot before its
+    post-reboot Launch B work (TensorRT/cuDNN/verify) ever ran. See this
+    module's "Reboot handling" docstring section."""
     ctx, runner = _make_ctx(tmp_path, driver_version="")
     _stage_driver_run(ctx)
 
     result = s1.Step1Prerequisites().run(ctx)
 
-    assert result.status is StepStatus.REBOOT_REQUIRED
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert any(a.command == "sudo reboot" for a in result.user_actions)
     # The driver .run was actually invoked.
     assert any(str(c[0]).endswith(".run") for c in runner.calls)
 
@@ -326,22 +331,25 @@ def _patch_mosquitto_success(ctx: FakeContext):
     return _restore
 
 
-def test_launch_a_returns_reboot_required_early_when_nouveau_cleanup_needed(tmp_path):
-    """STEP-1 section 5 step 5: nouveau loaded -> REBOOT_REQUIRED *before*
-    the Secure Boot check or the .run installer are ever reached."""
+def test_launch_a_returns_user_action_required_early_when_nouveau_cleanup_needed(tmp_path):
+    """STEP-1 section 5 step 5: nouveau loaded -> USER_ACTION_REQUIRED
+    (reboot instructions) *before* the Secure Boot check or the .run
+    installer are ever reached. Not REBOOT_REQUIRED -- see this module's
+    "Reboot handling" docstring section for why."""
     ctx, runner = _make_ctx(tmp_path, nouveau_loaded=True, secure_boot_enabled=True)
     _stage_driver_run(ctx)
 
     result = s1.Step1Prerequisites()._run_launch_a(ctx)
 
-    assert result.status is StepStatus.REBOOT_REQUIRED
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
     assert "nouveau" in result.message
+    assert any(a.command == "sudo reboot" for a in result.user_actions)
     # Never reached the .run invocation or the mokutil check.
     assert not any(str(c[0]).endswith(".run") for c in runner.calls)
     assert not any(c[0] == "mokutil" for c in runner.calls)
 
 
-def test_launch_a_returns_reboot_required_early_when_distro_driver_purged(tmp_path):
+def test_launch_a_returns_user_action_required_early_when_distro_driver_purged(tmp_path):
     ctx, runner = _make_ctx(
         tmp_path, nouveau_loaded=False, distro_nvidia_packages=("nvidia-driver-550",)
     )
@@ -349,17 +357,17 @@ def test_launch_a_returns_reboot_required_early_when_distro_driver_purged(tmp_pa
 
     result = s1.Step1Prerequisites()._run_launch_a(ctx)
 
-    assert result.status is StepStatus.REBOOT_REQUIRED
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
     assert any(c[0] == "apt-get" and c[1] == "purge" for c in runner.calls)
 
 
-def test_launch_a_ends_in_reboot_required_after_a_successful_driver_run(tmp_path):
+def test_launch_a_ends_in_user_action_required_after_a_successful_driver_run(tmp_path):
     ctx, runner = _make_ctx(tmp_path)
     run_path = _stage_driver_run(ctx)
 
     result = s1.Step1Prerequisites()._run_launch_a(ctx)
 
-    assert result.status is StepStatus.REBOOT_REQUIRED
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
     assert any(str(c[0]) == str(run_path) for c in runner.calls)
     # doc 00 section 6.2: three UserAction entries -- driver, CUDA path, reboot cmd.
     assert len(result.user_actions) == 3
@@ -376,6 +384,93 @@ def test_launch_a_fails_when_driver_run_exits_nonzero(tmp_path):
     result = s1.Step1Prerequisites()._run_launch_a(ctx)
 
     assert result.status is StepStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Regression: a confirmed reboot must not let the *real* merged
+# reboot.reconcile()/app._dispatch() skip Launch B (review PR #44 finding 1).
+# ---------------------------------------------------------------------------
+
+
+def test_confirmed_reboot_still_lets_launch_b_run_on_next_dispatch(tmp_path, monkeypatch):
+    """End-to-end against the actual merged `mv3dt_installer.reboot` and
+    `mv3dt_installer.app` modules (not a re-derivation of their logic):
+
+    `reboot.reconcile()` marks the *requesting* step COMPLETE in
+    `state.json` the instant it confirms a real reboot happened, and
+    `app._dispatch()` then skips any step already COMPLETE without
+    re-running its lifecycle. If Step 1 returned REBOOT_REQUIRED for its
+    own reboot points, that combination would mark step1_prerequisites
+    COMPLETE the moment the reboot confirmed -- before TensorRT, cuDNN,
+    mosquitto, or verify() ever ran on Launch B. Step 1 instead returns
+    USER_ACTION_REQUIRED for both reboot points, so state.json never
+    records step1_prerequisites as COMPLETE or as a pending reboot; this
+    test proves Launch B genuinely executes on the next dispatch.
+    """
+    from mv3dt_installer import app as app_mod
+    from mv3dt_installer import reboot as reboot_mod
+    from mv3dt_installer.state import StateMachine
+
+    boot_id_path = tmp_path / "boot_id"
+    boot_id_path.write_text("boot-A\n")
+    monkeypatch.setattr(reboot_mod, "BOOT_ID_PATH", boot_id_path)
+
+    sm = StateMachine(path=tmp_path / "state.json")
+    step = s1.Step1Prerequisites()
+
+    # -- Launch A: driver not loaded, .run staged -> reboot instructions.
+    ctx_a, runner_a = _make_ctx(tmp_path, driver_version="")
+    _stage_driver_run(ctx_a)
+
+    result_a = app_mod._run_step_lifecycle(step, ctx_a)
+    assert result_a.status is StepStatus.USER_ACTION_REQUIRED
+
+    # Mirror what app._dispatch() itself does with a USER_ACTION_REQUIRED
+    # result: nothing written to state.json (no mark_complete, no
+    # set_reboot_pending -- see app._dispatch()'s branching).
+    assert sm.status(step.id) is StepStatus.PENDING
+
+    # -- The operator actually reboots.
+    boot_id_path.write_text("boot-B\n")
+
+    # reconcile() must see NOTHING_PENDING (this step never registered a
+    # pending reboot with the framework) and must not mutate state.json.
+    reconcile_result = reboot_mod.reconcile(sm)
+    assert reconcile_result is reboot_mod.ReconcileResult.NOTHING_PENDING
+    assert sm.status(step.id) is StepStatus.PENDING
+
+    # -- Launch B, driven through the real dispatch loop: driver now loads.
+    # `_dispatch()` runs the full preflight -> run -> verify() lifecycle
+    # (unlike calling `_run_launch_b` directly), so every pin verify() will
+    # check needs a matching value -- including nvcc release, which
+    # `run()`'s own launch-B apt calls don't touch.
+    ctx_b, runner_b = _make_ctx(
+        tmp_path,
+        driver_version=s1.DRIVER_VERSION,
+        nvcc_release=s1.CUDA_VERSION,
+        gstreamer_version=s1.GSTREAMER_VERSION,
+        mosquitto_active=True,
+    )
+    monkeypatch.setattr(s1, "_mosquitto_conf_matches_bundled", lambda ctx: True)
+    restore = _patch_mosquitto_success(ctx_b)
+    try:
+        exit_code = app_mod._dispatch(sm, ctx_b, cfg=object())
+    finally:
+        restore()
+
+    assert exit_code == 0
+    assert sm.status(step.id) is StepStatus.COMPLETE
+    # Launch B's TensorRT apt-install actually ran (not skipped as
+    # already-COMPLETE) -- the smoking gun for the bug under regression.
+    apt_installs = [
+        c for c in runner_b.calls if c[0] == "apt-get" and c[1] == "install"
+    ]
+    assert any(
+        any(f"{s1.TENSORRT_PACKAGES[0]}=" in tok for tok in call)
+        for call in apt_installs
+    )
+    # The driver .run was never re-invoked on Launch B.
+    assert not any(str(c[0]).endswith(".run") for c in runner_b.calls)
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +539,29 @@ def test_apt_install_reported_uses_pinned_apt_args_for_tensorrt(tmp_path):
     s1._apt_install_reported(ctx, s1.TENSORRT_PACKAGES, apt_args=apt_args)
     for pkg in s1.TENSORRT_PACKAGES:
         assert (pkg, s1.TENSORRT_VERSION) in ctx.installed
+
+
+def test_launch_b_pins_cudnn_version_at_apt_install(tmp_path):
+    """Secondary review fix: cuDNN must be apt-pinned like TensorRT, not
+    installed via a bare unpinned `libcudnn9*` glob -- so a version
+    mismatch fails fast at apt-install time, not only later at verify()."""
+    ctx, runner = _make_ctx(
+        tmp_path,
+        driver_version=s1.DRIVER_VERSION,
+        gstreamer_version=s1.GSTREAMER_VERSION,
+        mosquitto_active=True,
+    )
+    restore = _patch_mosquitto_success(ctx)
+
+    s1.Step1Prerequisites()._run_launch_b(ctx)
+
+    restore()
+
+    install_calls = [c for c in runner.calls if c[0] == "apt-get" and c[1] == "install"]
+    pinned_cudnn_arg = f"{s1.CUDNN_QUERY_PACKAGE}={s1.CUDNN_VERSION}"
+    assert any(pinned_cudnn_arg in call for call in install_calls)
+    # The rest of the cuDNN family is still picked up via the glob.
+    assert any(s1.CUDNN_APT_GLOB in call for call in install_calls)
 
 
 # ---------------------------------------------------------------------------
@@ -662,12 +780,29 @@ def test_is_non_interactive_prefers_explicit_ctx_attribute(tmp_path):
     assert s1._is_non_interactive(ctx) is True
 
 
-def test_is_non_interactive_falls_back_to_stdin_tty_when_unset(tmp_path, monkeypatch):
+def test_is_non_interactive_falls_back_to_argv_when_unset(tmp_path, monkeypatch):
+    """Not a tty-detection fallback: `not sys.stdin.isatty()` silently drops
+    `--non-interactive` forwarding whenever a tty happens to be attached to
+    an otherwise-unattended run. `sys.argv` has no such false negative."""
+    ctx, _ = _make_ctx(tmp_path)
+    ctx.non_interactive = None
+
+    monkeypatch.setattr(sys, "argv", ["mv3dt-installer"])
+    assert s1._is_non_interactive(ctx) is False
+
+    monkeypatch.setattr(sys, "argv", ["mv3dt-installer", "--non-interactive"])
+    assert s1._is_non_interactive(ctx) is True
+
+
+def test_is_non_interactive_argv_fallback_ignores_stdin_tty_state(tmp_path, monkeypatch):
+    """Regression for the rejected tty-detection fallback: a real tty
+    attached to stdin must not suppress `--non-interactive` forwarding when
+    that flag was actually passed on the command line."""
     ctx, _ = _make_ctx(tmp_path)
     ctx.non_interactive = None
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
-    assert s1._is_non_interactive(ctx) is False
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+
+    monkeypatch.setattr(sys, "argv", ["mv3dt-installer", "--non-interactive"])
     assert s1._is_non_interactive(ctx) is True
 
 

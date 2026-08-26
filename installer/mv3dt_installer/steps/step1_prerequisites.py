@@ -17,13 +17,32 @@ reporting a driver version -- rather than writing `state.json` itself
 * **Launch A** (driver not yet loaded): base deps, the DS 9.1 section 4.1
   apt prerequisites, the CUDA repo + toolkit, nouveau/distro-driver
   cleanup, the Secure Boot gate, stopping the desktop session, and running
-  the driver `.run`. Always ends in `REBOOT_REQUIRED` once the `.run`
-  succeeds (or earlier, `USER_ACTION_REQUIRED`/`FAILED`/an earlier
-  `REBOOT_REQUIRED` for the nouveau/distro-driver cleanup).
+  the driver `.run`. Ends in `USER_ACTION_REQUIRED` (reboot instructions)
+  once the `.run` succeeds, or earlier for the nouveau/distro-driver
+  cleanup, Secure Boot gate, staging gap, or a `gdm`/`lightdm` stop
+  failure; `FAILED` only if the `.run` itself exits non-zero.
 * **Launch B** (driver loaded): TensorRT + cuDNN via apt, a GStreamer pin
   confirmation, and the Mosquitto broker via the bundled
   `10_setup_mosquitto.sh` (section 3.2). Ends in `COMPLETE`, letting the
   framework call `verify()`.
+
+Reboot handling deliberately does not use `ctx.reboot.request()` /
+`StepStatus.REBOOT_REQUIRED` for either of Launch A's two reboot points
+(the driver `.run` and the nouveau/distro-driver cleanup). The merged
+`reboot.reconcile()` (`mv3dt_installer/reboot.py`) marks the *requesting*
+step `COMPLETE` in `state.json` the instant it confirms a reboot happened,
+and `app._dispatch()` skips a `COMPLETE` step without re-running its
+lifecycle -- so a step with real work left to do post-reboot (this one:
+TensorRT/cuDNN/mosquitto/verify) cannot safely ask the framework to
+auto-complete it on reboot. Both reboot points instead return
+`StepResult(status=USER_ACTION_REQUIRED, ...)` with the same reboot
+instructions and `sudo reboot` action; `state.json` never records a
+pending reboot for this step, and the step stays non-`COMPLETE` across the
+reboot. On the next launch, `_driver_loaded(ctx)` -- the same idempotent
+probe used to route `run()` to Launch A vs. B -- is what detects the
+reboot actually happened and lets Launch A's own idempotent cleanup
+probes (nouveau no longer loaded / no distro packages left to purge) fall
+through to whatever comes next.
 
 All subprocess work goes through `ctx.run_root` (never a bare
 `subprocess.run`), which is the seam tests inject a fake `Context` through.
@@ -84,8 +103,12 @@ TENSORRT_PACKAGES: tuple[str, ...] = (
 )
 
 # cuDNN's package set is not enumerated by the DS 9.1 page the way
-# TensorRT's is ("libcudnn9*"), so a glob is installed and the meta package
-# `libcudnn9` alone is used for before/after presence + verify().
+# TensorRT's is, so the family is still installed via a glob -- but (like
+# TensorRT) the meta package itself is version-pinned in the apt invocation
+# (`libcudnn9=9.20.0.48`, alongside the `libcudnn9*` glob for the rest of the
+# family), so a version mismatch fails fast at apt-install time instead of
+# only surfacing later at verify(). `libcudnn9` alone is used for
+# before/after presence + verify().
 CUDNN_APT_GLOB = "libcudnn9*"
 CUDNN_QUERY_PACKAGE = "libcudnn9"
 
@@ -287,16 +310,17 @@ def _is_non_interactive(ctx: "Context") -> bool:
     `read` blocks forever on a TTY that will never answer it. `Context`
     (doc 00 section 12.3) carries no `non_interactive` field today, so this
     prefers one if a caller sets it (duck-typed, forward compatible) and
-    otherwise falls back to "is stdin a real TTY" -- defaulting to
-    non-interactive (safe: never hangs) whenever that can't be determined.
+    otherwise falls back to checking `sys.argv` directly for the flag the
+    operator actually passed to the installer. A tty-detection fallback
+    (`not sys.stdin.isatty()`) was tried first but rejected: it silently
+    drops `--non-interactive` forwarding whenever a tty happens to be
+    attached to an otherwise-unattended run, risking the exact hang this
+    forwarding exists to prevent. `sys.argv` has no such false negative.
     """
     value = getattr(ctx, "non_interactive", None)
     if value is not None:
         return bool(value)
-    try:
-        return not sys.stdin.isatty()
-    except Exception:
-        return True
+    return "--non-interactive" in sys.argv
 
 
 def _mosquitto_dst_path() -> pathlib.Path:
@@ -578,8 +602,21 @@ class Step1Prerequisites:
         _write_cuda_profile()
 
         if _clean_nouveau_and_distro_driver(ctx):
+            # USER_ACTION_REQUIRED, not ctx.reboot.request() -- see the
+            # "Reboot handling" note in this class's module docstring. The
+            # merged reboot.reconcile() marks the *requesting* step COMPLETE
+            # the moment it confirms the reboot, and _dispatch() then skips
+            # a COMPLETE step without re-running its lifecycle -- so a
+            # REBOOT_REQUIRED here would let the framework auto-complete
+            # Step 1 before the driver .run (let alone TensorRT/cuDNN) ever
+            # runs. Rendering the same instructions as USER_ACTION_REQUIRED
+            # instead leaves the step PENDING; on the next launch `run()`
+            # re-enters _run_launch_a(), whose own idempotent probes (no
+            # nouveau loaded, no distro packages left to purge) see the
+            # cleanup already done and fall through to the Secure Boot
+            # check / driver .run.
             return StepResult(
-                status=ctx.reboot.request(),
+                status=StepStatus.USER_ACTION_REQUIRED,
                 message=(
                     "nouveau and/or a distro NVIDIA package were cleaned up; a reboot "
                     "is required before the driver .run installer can run"
@@ -654,8 +691,14 @@ class Step1Prerequisites:
             )
         ctx.report_installed("nvidia-driver", DRIVER_VERSION)
 
+        # USER_ACTION_REQUIRED, not ctx.reboot.request() -- see the reboot
+        # cleanup branch above for the full "why". On the next launch,
+        # `run()`'s `_driver_loaded(ctx)` probe (nvidia-smi reporting a
+        # driver version) is what actually detects the reboot happened and
+        # routes into `_run_launch_b`; the framework's boot-id auto-complete
+        # is never asked to do that job.
         return StepResult(
-            status=ctx.reboot.request(),
+            status=StepStatus.USER_ACTION_REQUIRED,
             message=(
                 "the NVIDIA driver kernel module is installed but not yet loaded; a "
                 "reboot is required before TensorRT/cuDNN install"
@@ -673,6 +716,7 @@ class Step1Prerequisites:
             "install",
             "-y",
             "--no-install-recommends",
+            f"{CUDNN_QUERY_PACKAGE}={CUDNN_VERSION}",
             CUDNN_APT_GLOB,
             check=False,
             capture_output=True,
@@ -684,9 +728,10 @@ class Step1Prerequisites:
         else:
             ctx.report_already_installed(CUDNN_QUERY_PACKAGE, cudnn_after)
 
-        gstreamer_version = _gstreamer_version(ctx)
-        if gstreamer_version:
-            ctx.report_already_installed("gstreamer1.0-tools", gstreamer_version)
+        # No separate GStreamer report here: `gstreamer1.0-tools` is already
+        # reported (installed/already-installed) by Launch A's
+        # `APT_PREREQ_PACKAGES` transaction; `verify()`'s `verify_pinned`
+        # call is what confirms the `1.24.2` pin.
 
         mosquitto_failure = self._run_mosquitto(ctx)
         if mosquitto_failure is not None:
