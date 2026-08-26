@@ -470,17 +470,79 @@ def _docker_login(ctx: "Context"):
 # ---------------------------------------------------------------------------
 
 
+# Marker recording whether `update_rtpmanager.sh` ran and its outcome (doc
+# section 7.1 item 4 / section 7.4: "update_rtpmanager.sh was executed
+# (record a marker/log line)"). An in-memory attribute on the `Step`
+# instance does not survive a re-run/re-verify in a fresh process, so this
+# is a small durable file under the framework `install_dir` -- the one
+# location this step already writes non-fixed-path artifacts under (doc
+# section 6's `<install_dir>/downloads/deepstream`).
+_RTPMANAGER_MARKER_RELATIVE = pathlib.Path("deepstream") / "step2_rtpmanager_marker.txt"
+
+
+def _rtpmanager_marker_path(ctx: "Context") -> pathlib.Path:
+    return ctx.install_dir / _RTPMANAGER_MARKER_RELATIVE
+
+
+def _write_rtpmanager_marker(
+    ctx: "Context", status: str, returncode: Optional[int], detail: str = ""
+) -> None:
+    path = _rtpmanager_marker_path(ctx)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"status={status}", f"returncode={returncode if returncode is not None else ''}"]
+    if detail:
+        # Single line: the marker is a plain KEY=VALUE file, not a log --
+        # collapse any embedded newlines so it stays two-to-three lines.
+        lines.append(f"detail={' '.join(detail.split())}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _read_rtpmanager_marker(ctx: "Context") -> Optional[dict[str, str]]:
+    """`None` when the marker file doesn't exist -- i.e. `run()`'s
+    post-install tail never wrote one -- else its parsed KEY=VALUE
+    contents (possibly `{}` for an empty/unparseable file, which is still
+    "the marker is present")."""
+    try:
+        text = _rtpmanager_marker_path(ctx).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip()
+    return values
+
+
+def _run_update_rtpmanager(ctx: "Context") -> tuple[str, Optional[int], str]:
+    """Run `update_rtpmanager.sh` and classify the outcome as `"ok"`,
+    `"failed"` (nonzero exit -- doc section 9 point 1: logged as a
+    warning, not fatal), or `"missing"` (the script itself could not be
+    launched, e.g. absent from a broken/partial SDK tree). Returns
+    `(status, returncode, detail)`; `detail` is a captured stderr tail
+    (or the exception text for `"missing"`), empty on success.
+    """
+    script = str(DS_SDK_SYMLINK / "update_rtpmanager.sh")
+    try:
+        result = _run_root(ctx, script)
+    except OSError as exc:
+        log.warn(f"update_rtpmanager.sh not found or not executable at {script}: {exc}")
+        return "missing", None, str(exc)
+
+    if result.returncode != 0:
+        stderr_tail = (result.stderr or "").strip()
+        log.warn(f"update_rtpmanager.sh exited {result.returncode}: {stderr_tail}")
+        return "failed", result.returncode, stderr_tail
+
+    log.info("update_rtpmanager.sh completed")
+    return "ok", result.returncode, ""
+
+
 def _post_install(ctx: "Context") -> list[str]:
     actions: list[str] = []
 
-    rtpmanager = _run_root(ctx, str(DS_SDK_SYMLINK / "update_rtpmanager.sh"))
-    if rtpmanager.returncode != 0:
-        log.warn(
-            "update_rtpmanager.sh exited "
-            f"{rtpmanager.returncode}: {(rtpmanager.stderr or '').strip()}"
-        )
-    else:
-        log.info("update_rtpmanager.sh completed")
+    status, returncode, detail = _run_update_rtpmanager(ctx)
+    _write_rtpmanager_marker(ctx, status, returncode, detail)
     actions.append("update_rtpmanager.sh")
 
     _run_root(ctx, "ldconfig")
@@ -490,6 +552,22 @@ def _post_install(ctx: "Context") -> list[str]:
     actions.append(f"wrote {PROFILE_D_PATH}")
 
     return actions
+
+
+def _describe_rtpmanager_marker(marker: Optional[dict[str, str]]) -> str:
+    """Human summary of the rtpmanager marker for `report()` (doc section
+    9: a non-zero exit is "surfaced in report()")."""
+    if marker is None:
+        return "not run (no marker found)"
+    status = marker.get("status", "unknown")
+    returncode = marker.get("returncode", "")
+    if status == "ok":
+        return f"succeeded (exit {returncode or 0})"
+    if status == "failed":
+        return f"FAILED (exit {returncode}) -- treated as a warning, re-check manually"
+    if status == "missing":
+        return "script not found"
+    return status
 
 
 def _write_profile_d() -> None:
@@ -843,6 +921,22 @@ class Step2DeepStreamSdk:
                 message=f"{PROFILE_D_PATH} does not export DEEPSTREAM_DIR",
             )
 
+        # doc section 7.1 item 4 / 7.4: "update_rtpmanager.sh was executed
+        # (record a marker/log line)". A missing marker means the
+        # post-install tail never ran; the marker's *status* (ok/failed/
+        # missing) is not itself a verify failure -- a nonzero exit is a
+        # warning surfaced in report() (doc section 9 point 1), not a
+        # blocker here.
+        if _read_rtpmanager_marker(ctx) is None:
+            return StepResult(
+                status=StepStatus.FAILED,
+                message=(
+                    "update_rtpmanager.sh marker not found at "
+                    f"{_rtpmanager_marker_path(ctx)}; post-install tail did "
+                    "not run"
+                ),
+            )
+
         passed, tail = _run_smoke_test(ctx, docker=False)
         self._smoke_passed = passed
         if not passed:
@@ -854,6 +948,12 @@ class Step2DeepStreamSdk:
         return StepResult(status=StepStatus.COMPLETE)
 
     def _verify_docker(self, ctx: "Context") -> StepResult:
+        # doc section 7.4: "Prereq pins still match" applies to both verify
+        # paths -- the docker runtime still depends on the host driver.
+        pin_failure = _check_prereq_pins(ctx)
+        if pin_failure is not None:
+            return StepResult(status=StepStatus.FAILED, message=pin_failure)
+
         inspect = _run_as_user(ctx, "docker", "image", "inspect", DOCKER_IMAGE)
         if inspect.returncode != 0:
             return StepResult(
@@ -924,6 +1024,13 @@ class Step2DeepStreamSdk:
             "  post-install actions: "
             + (", ".join(actions) if actions else "none (already installed)")
         )
+        # doc section 9 point 1: a non-zero update_rtpmanager.sh exit is
+        # only a warning, but it must be surfaced here. Host installs only
+        # -- docker skips the host post-install tail entirely (doc
+        # section 9's own header), so the marker is never written for it.
+        if method_value != Method.DOCKER.value:
+            marker = _read_rtpmanager_marker(ctx)
+            log.info(f"  update_rtpmanager.sh: {_describe_rtpmanager_marker(marker)}")
         log.info(f"  smoke test: {smoke}")
 
 

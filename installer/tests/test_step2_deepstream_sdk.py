@@ -531,19 +531,24 @@ def test_verify_host_fails_when_sdk_dir_missing(tmp_path, _sdk_paths):
     assert "not found after install" in result.message
 
 
-def _make_sdk_tree(sdk_dir, symlink, profile, *, version_text="DeepStream 9.1.0\n"):
+def _make_sdk_tree(ctx, sdk_dir, symlink, profile, *, version_text="DeepStream 9.1.0\n"):
+    """Simulate a completed `run()`: SDK tree, symlink, profile.d, and the
+    doc section 7.1 item 4 rtpmanager marker all present. Requires `ctx`
+    (not just paths) since the marker lives under `ctx.install_dir`, not a
+    fixed path."""
     sdk_dir.mkdir(parents=True)
     (sdk_dir / "version").write_text(version_text)
     symlink.symlink_to(sdk_dir)
     profile.parent.mkdir(parents=True, exist_ok=True)
     profile.write_text(step2._PROFILE_D_CONTENT)
+    step2._write_rtpmanager_marker(ctx, "ok", 0)
 
 
 def test_verify_host_fails_on_version_mismatch(tmp_path, _sdk_paths):
     sdk_dir, symlink, profile = _sdk_paths
-    _make_sdk_tree(sdk_dir, symlink, profile)
     runner = _host_ready_runner(version_ok=False)
     ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
+    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
 
     step = step2.Step2DeepStreamSdk()
     result = step.verify(ctx)
@@ -552,12 +557,49 @@ def test_verify_host_fails_on_version_mismatch(tmp_path, _sdk_paths):
     assert "version pin mismatch" in result.message
 
 
+def test_verify_host_fails_when_rtpmanager_marker_missing(tmp_path, _sdk_paths):
+    """doc section 7.1 item 4 / 7.4: verify() must fail if the
+    post-install tail never left a marker behind, even when everything
+    else (SDK, symlink, version, profile.d) looks installed."""
+    sdk_dir, symlink, profile = _sdk_paths
+    sdk_dir.mkdir(parents=True)
+    (sdk_dir / "version").write_text("DeepStream 9.1.0\n")
+    symlink.symlink_to(sdk_dir)
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    profile.write_text(step2._PROFILE_D_CONTENT)
+    # Deliberately no _write_rtpmanager_marker(...) call.
+
+    runner = _host_ready_runner()
+    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
+
+    step = step2.Step2DeepStreamSdk()
+    result = step.verify(ctx)
+
+    assert result.status is StepStatus.FAILED
+    assert "update_rtpmanager.sh marker not found" in result.message
+
+
+def test_verify_host_passes_with_failed_rtpmanager_marker(tmp_path, _sdk_paths):
+    """A recorded rtpmanager *failure* (nonzero exit) is a warning (doc
+    section 9 point 1), not a verify blocker -- only a missing marker is."""
+    sdk_dir, symlink, profile = _sdk_paths
+    runner = _host_ready_runner()
+    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
+    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
+    step2._write_rtpmanager_marker(ctx, "failed", 1, "boom")
+
+    step = step2.Step2DeepStreamSdk()
+    result = step.verify(ctx)
+
+    assert result.status is StepStatus.COMPLETE
+
+
 def test_verify_host_fails_on_smoke_test_error(tmp_path, _sdk_paths):
     sdk_dir, symlink, profile = _sdk_paths
-    _make_sdk_tree(sdk_dir, symlink, profile)
     runner = _host_ready_runner()
     runner.when(lambda a: a[:1] == ("timeout",), returncode=1, stderr="ERROR: pipeline failed")
     ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
+    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
 
     step = step2.Step2DeepStreamSdk()
     result = step.verify(ctx)
@@ -568,9 +610,9 @@ def test_verify_host_fails_on_smoke_test_error(tmp_path, _sdk_paths):
 
 def test_verify_host_passes_end_to_end(tmp_path, _sdk_paths):
     sdk_dir, symlink, profile = _sdk_paths
-    _make_sdk_tree(sdk_dir, symlink, profile)
     runner = _host_ready_runner()
     ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
+    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
 
     step = step2.Step2DeepStreamSdk()
     result = step.verify(ctx)
@@ -581,9 +623,9 @@ def test_verify_host_passes_end_to_end(tmp_path, _sdk_paths):
 
 def test_verify_tar_uses_short_version_pin(tmp_path, _sdk_paths):
     sdk_dir, symlink, profile = _sdk_paths
-    _make_sdk_tree(sdk_dir, symlink, profile)
     runner = _host_ready_runner()
     ctx = FakeContext(tmp_path, conf={"ds_install_method": "tar"}, runner_root=runner)
+    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
 
     step = step2.Step2DeepStreamSdk()
     result = step.verify(ctx)
@@ -591,9 +633,34 @@ def test_verify_tar_uses_short_version_pin(tmp_path, _sdk_paths):
     assert result.status is StepStatus.COMPLETE
 
 
+def test_verify_docker_fails_on_prereq_pin_mismatch(tmp_path):
+    """doc section 7.4: "prereq pins still match" applies to the docker
+    verify path too -- the container still depends on the host driver."""
+    runner_root = _passing_pin_runner()
+    runner_root.when(lambda a: a[:1] == ("nvidia-smi",), stdout="000.00.00\n")
+    runner_user = ScriptedRunner(default_returncode=0)  # would otherwise pass
+    ctx = FakeContext(
+        tmp_path,
+        conf={"ds_install_method": "docker"},
+        runner_root=runner_root,
+        runner_user=runner_user,
+    )
+
+    step = step2.Step2DeepStreamSdk()
+    result = step.verify(ctx)
+
+    assert result.status is StepStatus.FAILED
+    assert "NVIDIA driver" in result.message
+
+
 def test_verify_docker_fails_when_image_absent(tmp_path):
     runner_user = ScriptedRunner(default_returncode=1)
-    ctx = FakeContext(tmp_path, conf={"ds_install_method": "docker"}, runner_user=runner_user)
+    ctx = FakeContext(
+        tmp_path,
+        conf={"ds_install_method": "docker"},
+        runner_root=_passing_pin_runner(),
+        runner_user=runner_user,
+    )
 
     step = step2.Step2DeepStreamSdk()
     result = step.verify(ctx)
@@ -614,7 +681,12 @@ def test_verify_docker_passes_end_to_end(tmp_path):
         stdout="PERF: FPS 30.0\nPLAYING\n",
     )
     runner_user.when(lambda a: a[:2] == ("docker", "info"), stdout="Runtimes: nvidia runc\n")
-    ctx = FakeContext(tmp_path, conf={"ds_install_method": "docker"}, runner_user=runner_user)
+    ctx = FakeContext(
+        tmp_path,
+        conf={"ds_install_method": "docker"},
+        runner_root=_passing_pin_runner(),
+        runner_user=runner_user,
+    )
 
     step = step2.Step2DeepStreamSdk()
     result = step.verify(ctx)
@@ -636,6 +708,11 @@ def test_verify_unrecognized_method_is_failed(tmp_path):
 
 
 def test_report_prints_summary_after_successful_run(tmp_path, capsys, _sdk_paths):
+    """doc section 9 point 1: a non-zero update_rtpmanager.sh exit is
+    "surfaced in report()" -- here the fake runner answers every call
+    (including update_rtpmanager.sh) with its ScriptedRunner default
+    (returncode 1), so report() must show it as failed, not silently drop
+    it into an undifferentiated action-name list."""
     sdk_dir, symlink, profile = _sdk_paths
     runner_root = ScriptedRunner()
     runner_root.when(lambda a: a[:2] == ("dpkg", "-s"), returncode=1)
@@ -657,6 +734,37 @@ def test_report_prints_summary_after_successful_run(tmp_path, capsys, _sdk_paths
     assert "DeepStream 9.1 SDK install summary" in err
     assert "method: deb" in err
     assert "post-install actions:" in err
+    # update_rtpmanager.sh's default-runner exit (1) must be surfaced as a
+    # failure, read back from the durable marker run() wrote -- not from
+    # any in-memory state.
+    assert "update_rtpmanager.sh: FAILED (exit 1)" in err
+
+
+def test_report_shows_update_rtpmanager_success_from_marker(tmp_path, capsys):
+    """report() reads the marker fresh from disk (doc section 7.1 item 4),
+    so it reflects a successful update_rtpmanager.sh run too, not just
+    failures."""
+    ctx = FakeContext(tmp_path, conf={step2.CONF_METHOD_KEY: "deb"})
+    step2._write_rtpmanager_marker(ctx, "ok", 0)
+
+    step = step2.Step2DeepStreamSdk()
+    step.report(ctx)
+
+    err = capsys.readouterr().err
+    assert "update_rtpmanager.sh: succeeded (exit 0)" in err
+
+
+def test_report_docker_method_omits_rtpmanager_line(tmp_path, capsys):
+    """Docker skips the host post-install tail entirely (doc section 9's
+    header), so report() must not print a confusing "not run" line for a
+    step that was never supposed to run under this method."""
+    ctx = FakeContext(tmp_path, conf={step2.CONF_METHOD_KEY: "docker"})
+
+    step = step2.Step2DeepStreamSdk()
+    step.report(ctx)
+
+    err = capsys.readouterr().err
+    assert "update_rtpmanager.sh" not in err
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +793,12 @@ def test_full_lifecycle_all_pass_is_complete(tmp_path, _sdk_paths):
 
     ngc = FakeNgc()
     ctx = FakeContext(tmp_path, runner_root=runner_root, ngc=ngc)
+    # This test exercises the "already installed" idempotent path (dpkg -s
+    # already reports the pinned version), which short-circuits run()
+    # before the post-install tail -- so the rtpmanager marker doc section
+    # 7.1 item 4 requires must have been left by a prior real run. Seed it
+    # the same way `_make_sdk_tree` does for the standalone verify() tests.
+    step2._write_rtpmanager_marker(ctx, "ok", 0)
 
     step = step2.Step2DeepStreamSdk()
 
