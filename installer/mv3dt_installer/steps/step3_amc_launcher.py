@@ -95,6 +95,7 @@ __all__ = [
     "render_amc_wrapper",
     "write_amc_wrapper",
     "decide_hold_strategy",
+    "resolved_amc_commit",
     "launch_amc",
     "teardown_amc",
     "handle_amc_subcommand",
@@ -334,6 +335,30 @@ def clone_amc(ctx: "Context", amc_root: pathlib.Path) -> bool:
         "git", "-C", str(amc_root), "checkout", check=False, capture_output=True, text=True
     )
     return True
+
+
+def resolved_amc_commit(ctx: "Context", amc_root: pathlib.Path) -> Optional[str]:
+    """`git rev-parse HEAD` inside the AMC clone (section 7.3: "no pinned
+    upstream AMC version -- AMC tracks the tools/auto-magic-calib path in
+    NVIDIA/DeepStream main; verify() records the resolved commit for the
+    transcript rather than equality-pinning it"). Returns `None` when the
+    clone doesn't exist or the command fails -- never raises, since this is
+    informational only and must not itself fail `verify()`.
+    """
+    result = ctx.run_as_user(
+        "git",
+        "-C",
+        str(amc_root),
+        "rev-parse",
+        "HEAD",
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    commit = (result.stdout or "").strip()
+    return commit or None
 
 
 # ---------------------------------------------------------------------------
@@ -723,6 +748,16 @@ def execute_hold(
     """Execute the strategy `decide_hold_strategy` chose. `--keep-up`
     (section 5.1 step 3) short-circuits every strategy: AMC is left
     running and `teardown` is never called.
+
+    `teardown` is expected to already be the run-once-guarded callable
+    `_install_teardown_guards` returns -- section 5.1 step 3 requires the
+    `SIGINT`/`SIGTERM`/`atexit` fail-safe installed *before* `docker
+    compose up -d` runs, not merely before this function's own wait/prompt,
+    so `launch_amc` installs the guard itself, earlier, and this function
+    only ever calls the already-guarded `teardown` it was handed. Calling
+    it directly here (rather than re-wrapping it) is what keeps a signal
+    arriving during `proc.wait()`/the prompt and a normal fall-through both
+    routed through the exact same run-once state.
     """
     if keep_up:
         ctx.log.info(f"--keep-up set: leaving AMC running at {url}")
@@ -731,7 +766,6 @@ def execute_hold(
     if strategy is HoldStrategy.DEDICATED_WINDOW:
         proc = open_dedicated_window(url, popen=popen, which=which)
         if proc is not None:
-            _install_teardown_guards(teardown)
             ctx.log.info(
                 f"AutoMagicCalib is running at {url} -- close the AMC browser "
                 "window when you're done; the service stays up until you do."
@@ -746,7 +780,6 @@ def execute_hold(
 
     if strategy is HoldStrategy.XDG_OPEN_AND_PROMPT:
         _xdg_open(url, popen=popen)
-        _install_teardown_guards(teardown)
         try:
             prompt("Press Enter (or Ctrl-C) when you have closed AMC to shut it down.")
         except KeyboardInterrupt:
@@ -756,7 +789,6 @@ def execute_hold(
 
     if strategy is HoldStrategy.PRINT_URL_AND_PROMPT:
         ctx.log.info(f"Headless session detected; open {url} in your browser.")
-        _install_teardown_guards(teardown)
         try:
             prompt("Press Enter (or Ctrl-C) when you have closed AMC to shut it down.")
         except KeyboardInterrupt:
@@ -965,6 +997,22 @@ def launch_amc(
     else:
         ctx.report_already_installed("AMC compose/.env", cfg.project_name)
 
+    def _teardown() -> None:
+        compose_down(ctx, compose_dir)
+
+    # section 5.1 step 3 (REQUIRED, not merely a nicety around the browser
+    # hold below): "Install SIGINT/SIGTERM handlers and an atexit hook
+    # before up -d so AMC is always torn down even if the launcher is
+    # interrupted." `compose_pull`/`compose_up`/`wait_for_ui` below can run
+    # for tens of seconds (the readiness poll alone is up to
+    # `_UI_WAIT_TIMEOUT_S`), so the guard has to be armed *before* any of
+    # that runs, not merely before the hold-until-close step -- otherwise a
+    # Ctrl-C during pull/up/the readiness poll leaves AMC containers running
+    # with no fail-safe teardown. `--keep-up` means "never tear down", so
+    # the guard is skipped entirely in that case rather than installed and
+    # never invoked.
+    teardown = _teardown if keep_up else _install_teardown_guards(_teardown)
+
     if not skip_pull:
         compose_pull(ctx, compose_dir)
     compose_up(ctx, compose_dir)
@@ -987,10 +1035,7 @@ def launch_amc(
         non_interactive=non_interactive,
     )
 
-    def _teardown() -> None:
-        compose_down(ctx, compose_dir)
-
-    execute_hold(ctx, strategy, ui_url, teardown=_teardown, keep_up=keep_up)
+    execute_hold(ctx, strategy, ui_url, teardown=teardown, keep_up=keep_up)
 
     return StepResult(status=StepStatus.COMPLETE)
 
@@ -1195,6 +1240,20 @@ class Step3AmcLauncher:
                     status=StepStatus.FAILED,
                     message=f"{key} missing from installer.conf",
                 )
+
+        # section 7.3: "no pinned upstream AMC version ... verify() records
+        # the resolved commit for the transcript rather than equality-
+        # pinning it." Informational only -- an unresolvable commit (clone
+        # missing, git failure) is logged, not a verify failure.
+        cfg = resolve_config(ctx)
+        commit = resolved_amc_commit(ctx, cfg.amc_root)
+        if commit:
+            ctx.log.info(f"AMC resolved commit ({cfg.amc_root}): {commit}")
+        else:
+            ctx.log.info(
+                f"AMC resolved commit: unknown (could not resolve HEAD at "
+                f"{cfg.amc_root})"
+            )
 
         return StepResult(status=StepStatus.COMPLETE)
 

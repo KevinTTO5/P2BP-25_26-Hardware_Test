@@ -684,6 +684,91 @@ def test_preflight_complete_when_everything_ready(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# launch_amc() -- section 5.1 step 3: teardown guard installed before `up -d`
+# ---------------------------------------------------------------------------
+
+
+def _stub_amc_root_with_compose(ctx) -> pathlib.Path:
+    amc_root = ctx.user.home / "auto-magic-calib"
+    (amc_root / "tools" / "auto-magic-calib" / "compose").mkdir(parents=True)
+    return amc_root
+
+
+def test_launch_amc_installs_teardown_guard_before_compose_up(tmp_path, monkeypatch):
+    """Section 5.1 step 3 (REQUIRED): the SIGINT/SIGTERM/atexit fail-safe
+    must be armed before `docker compose up -d` runs, not merely before the
+    browser-hold step -- a Ctrl-C during pull/up/the readiness poll must
+    still tear AMC down. Assert the actual call order, not just that all
+    of these eventually happen."""
+    ctx = FakeContext(tmp_path, runner_user=_passing_runner())
+    _stub_amc_root_with_compose(ctx)
+
+    order: list[str] = []
+    monkeypatch.setattr(
+        step3, "_install_teardown_guards", lambda teardown: order.append("guard_installed") or teardown
+    )
+    monkeypatch.setattr(step3, "compose_pull", lambda ctx, compose_dir: order.append("pull"))
+    monkeypatch.setattr(step3, "compose_up", lambda ctx, compose_dir: order.append("up"))
+    monkeypatch.setattr(
+        step3, "wait_for_ui", lambda ctx, url: order.append("wait") or True
+    )
+    monkeypatch.setattr(step3, "execute_hold", lambda *a, **k: order.append("hold"))
+
+    result = step3.launch_amc(ctx, non_interactive=True)
+
+    assert result.status is StepStatus.COMPLETE
+    assert order == ["guard_installed", "pull", "up", "wait", "hold"]
+
+
+def test_launch_amc_skips_teardown_guard_when_keep_up(tmp_path, monkeypatch):
+    """`--keep-up` means "never tear down" -- the guard must not be
+    installed at all, not merely installed-and-then-ignored."""
+    ctx = FakeContext(tmp_path, runner_user=_passing_runner())
+    _stub_amc_root_with_compose(ctx)
+
+    guard_calls: list[int] = []
+    monkeypatch.setattr(
+        step3,
+        "_install_teardown_guards",
+        lambda teardown: guard_calls.append(1) or teardown,
+    )
+    monkeypatch.setattr(step3, "compose_pull", lambda ctx, compose_dir: None)
+    monkeypatch.setattr(step3, "compose_up", lambda ctx, compose_dir: None)
+    monkeypatch.setattr(step3, "wait_for_ui", lambda ctx, url: True)
+    monkeypatch.setattr(step3, "execute_hold", lambda *a, **k: None)
+
+    step3.launch_amc(ctx, keep_up=True, non_interactive=True)
+
+    assert guard_calls == []
+
+
+def test_launch_amc_passes_the_guarded_teardown_to_execute_hold(tmp_path, monkeypatch):
+    """`execute_hold` must receive the exact run-once-guarded callable
+    `_install_teardown_guards` returns, not a fresh, unguarded closure --
+    otherwise a signal delivered during the hold step and a normal
+    fall-through would race on two different `state["ran"]` flags."""
+    ctx = FakeContext(tmp_path, runner_user=_passing_runner())
+    _stub_amc_root_with_compose(ctx)
+
+    sentinel = object()
+    monkeypatch.setattr(step3, "_install_teardown_guards", lambda teardown: sentinel)
+    monkeypatch.setattr(step3, "compose_pull", lambda ctx, compose_dir: None)
+    monkeypatch.setattr(step3, "compose_up", lambda ctx, compose_dir: None)
+    monkeypatch.setattr(step3, "wait_for_ui", lambda ctx, url: True)
+
+    captured = {}
+
+    def _fake_execute_hold(ctx, strategy, url, *, teardown, keep_up=False, **kwargs):
+        captured["teardown"] = teardown
+
+    monkeypatch.setattr(step3, "execute_hold", _fake_execute_hold)
+
+    step3.launch_amc(ctx, non_interactive=True)
+
+    assert captured["teardown"] is sentinel
+
+
+# ---------------------------------------------------------------------------
 # run() -- section 7.2 (deliverable-vs-launch split, section 2)
 # ---------------------------------------------------------------------------
 
@@ -780,3 +865,60 @@ def test_verify_fails_when_nvidia_runtime_missing(tmp_path):
     ctx.runner_user = ScriptedRunner()  # docker info reports no nvidia runtime
     result = step3.Step3AmcLauncher().verify(ctx)
     assert result.status is StepStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# resolved_amc_commit() -- section 7.3 ("verify() records the resolved
+# commit for the transcript rather than equality-pinning it")
+# ---------------------------------------------------------------------------
+
+
+def test_resolved_amc_commit_returns_stripped_sha(tmp_path):
+    amc_root = tmp_path / "amc"
+    sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+    runner_user = ScriptedRunner()
+    runner_user.when(
+        lambda a: a[:5] == ("git", "-C", str(amc_root), "rev-parse", "HEAD"),
+        stdout=f"{sha}\n",
+    )
+    ctx = FakeContext(tmp_path, runner_user=runner_user)
+    assert step3.resolved_amc_commit(ctx, amc_root) == sha
+
+
+def test_resolved_amc_commit_none_on_git_failure(tmp_path):
+    runner_user = ScriptedRunner(default_returncode=1)
+    ctx = FakeContext(tmp_path, runner_user=runner_user)
+    assert step3.resolved_amc_commit(ctx, tmp_path / "amc") is None
+
+
+def test_resolved_amc_commit_none_on_blank_output(tmp_path):
+    runner_user = ScriptedRunner(default_returncode=0, default_stdout="\n")
+    ctx = FakeContext(tmp_path, runner_user=runner_user)
+    assert step3.resolved_amc_commit(ctx, tmp_path / "amc") is None
+
+
+def test_verify_logs_the_resolved_amc_commit(tmp_path, capsys):
+    ctx = _fully_provisioned_ctx(tmp_path)
+    sha = "deadbeefcafefeed0000111122223333deadbeef"
+    ctx.runner_user.when(
+        lambda a: a[:4] == ("git", "-C", str(tmp_path / "amc"), "rev-parse"),
+        stdout=f"{sha}\n",
+    )
+
+    result = step3.Step3AmcLauncher().verify(ctx)
+
+    assert result.status is StepStatus.COMPLETE
+    err = capsys.readouterr().err
+    assert sha in err
+
+
+def test_verify_logs_unknown_commit_when_resolution_fails(tmp_path, capsys):
+    ctx = _fully_provisioned_ctx(tmp_path)
+    ctx.runner_user.when(lambda a: a[:2] == ("git", "-C"), returncode=1)
+
+    result = step3.Step3AmcLauncher().verify(ctx)
+
+    # An unresolvable commit is informational only -- verify() still passes.
+    assert result.status is StepStatus.COMPLETE
+    err = capsys.readouterr().err
+    assert "AMC resolved commit: unknown" in err
