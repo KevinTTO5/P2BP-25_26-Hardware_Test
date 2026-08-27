@@ -720,6 +720,80 @@ def test_launch_amc_installs_teardown_guard_before_compose_up(tmp_path, monkeypa
     assert order == ["guard_installed", "pull", "up", "wait", "hold"]
 
 
+def test_launch_amc_no_open_never_installs_teardown_guard(tmp_path, monkeypatch):
+    """Regression: `--no-open` returns COMPLETE right after bring-up
+    without ever reaching `execute_hold`. `atexit.register` fires on *any*
+    normal process exit, not just a signal -- so installing the guard here
+    and then simply returning would silently tear AMC back down the moment
+    this process exits, defeating `--no-open`'s documented purpose ("bring
+    up without opening/holding -- for scripting"). Nothing must be armed
+    with `atexit` at all in this path.
+
+    `atexit.register` itself is monkeypatched to capture handlers rather
+    than really registering them with the interpreter, so this proves the
+    guard is never armed without touching the real process-exit machinery
+    (or any other test's atexit state).
+    """
+    ctx = FakeContext(tmp_path, runner_user=_passing_runner())
+    _stub_amc_root_with_compose(ctx)
+
+    registered: list = []
+    monkeypatch.setattr(step3.atexit, "register", lambda fn: registered.append(fn))
+
+    teardown_calls = {"count": 0}
+    monkeypatch.setattr(
+        step3,
+        "compose_down",
+        lambda ctx, compose_dir: teardown_calls.__setitem__(
+            "count", teardown_calls["count"] + 1
+        ),
+    )
+
+    result = step3.launch_amc(ctx, no_open=True, non_interactive=True)
+
+    assert result.status is StepStatus.COMPLETE
+    assert registered == []  # nothing armed with atexit at all
+
+    # Simulate every finalizer that *was* registered actually firing (there
+    # should be none) -- proves this isn't merely "installed but not yet
+    # triggered synchronously" the way the original bug was.
+    for fn in registered:
+        fn()
+    assert teardown_calls["count"] == 0
+
+
+def test_launch_amc_open_case_atexit_fire_does_trigger_teardown(tmp_path, monkeypatch):
+    """Contrast case for the regression above, proving the harness itself
+    is meaningful (not just trivially empty): in the ordinary hold path
+    (no `--no-open`), the guard IS armed with `atexit`, and firing that
+    captured handler -- simulating a normal process exit -- does trigger
+    `compose down`."""
+    ctx = FakeContext(tmp_path, runner_user=_passing_runner())
+    _stub_amc_root_with_compose(ctx)
+
+    registered: list = []
+    monkeypatch.setattr(step3.atexit, "register", lambda fn: registered.append(fn))
+    monkeypatch.setattr(step3, "wait_for_ui", lambda ctx, url: True)
+    monkeypatch.setattr(step3, "execute_hold", lambda *a, **k: None)  # skip the real hold
+
+    teardown_calls = {"count": 0}
+    monkeypatch.setattr(
+        step3,
+        "compose_down",
+        lambda ctx, compose_dir: teardown_calls.__setitem__(
+            "count", teardown_calls["count"] + 1
+        ),
+    )
+
+    result = step3.launch_amc(ctx, non_interactive=True)
+
+    assert result.status is StepStatus.COMPLETE
+    assert len(registered) == 1
+
+    registered[0]()
+    assert teardown_calls["count"] == 1
+
+
 def test_launch_amc_skips_teardown_guard_when_keep_up(tmp_path, monkeypatch):
     """`--keep-up` means "never tear down" -- the guard must not be
     installed at all, not merely installed-and-then-ignored."""

@@ -1008,10 +1008,23 @@ def launch_amc(
     # `_UI_WAIT_TIMEOUT_S`), so the guard has to be armed *before* any of
     # that runs, not merely before the hold-until-close step -- otherwise a
     # Ctrl-C during pull/up/the readiness poll leaves AMC containers running
-    # with no fail-safe teardown. `--keep-up` means "never tear down", so
-    # the guard is skipped entirely in that case rather than installed and
-    # never invoked.
-    teardown = _teardown if keep_up else _install_teardown_guards(_teardown)
+    # with no fail-safe teardown.
+    #
+    # Two cases skip the guard entirely rather than installing it and never
+    # (synchronously) calling it:
+    #   - `--keep-up` means "never tear down" -- installing the guard would
+    #     be harmless in isolation (`execute_hold` returns before calling
+    #     `teardown` anyway), but skipping it is the clearer statement of
+    #     intent.
+    #   - `no_open=True` returns COMPLETE right after bring-up, without ever
+    #     reaching `execute_hold`. `atexit.register` fires on *any* normal
+    #     process exit, not just a signal -- installing the guard here and
+    #     then simply returning would silently tear AMC back down the
+    #     moment this process exits, defeating `--no-open`'s documented
+    #     purpose ("bring up without opening/holding -- for scripting").
+    #     There is nothing later in this call that will ever invoke the
+    #     guard on purpose, so it must not be armed at all.
+    teardown = _teardown if (keep_up or no_open) else _install_teardown_guards(_teardown)
 
     if not skip_pull:
         compose_pull(ctx, compose_dir)
