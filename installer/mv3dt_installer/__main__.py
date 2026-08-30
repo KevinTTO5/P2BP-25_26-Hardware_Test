@@ -11,6 +11,20 @@ import sys
 
 from mv3dt_installer import app
 
+# Import every step module for its registration side effect: each populates
+# `steps.STEP_REGISTRY` via `steps.register(...)` and, where it defines a
+# subcommand, `app.SUBCOMMAND_REGISTRY` via `app.register_subcommand(...)`.
+# Nothing else on the run path imports these modules, so without this block
+# both registries are empty and `app.main()` has no steps or subcommands to
+# dispatch to.
+from mv3dt_installer.steps import step1_prerequisites  # noqa: F401
+from mv3dt_installer.steps import step2_deepstream_sdk  # noqa: F401
+from mv3dt_installer.steps import step3_amc_launcher  # noqa: F401
+from mv3dt_installer.steps import step4_calib_output_wiring  # noqa: F401
+from mv3dt_installer.steps import step5_per_project_exes  # noqa: F401
+from mv3dt_installer.steps import step6_remote_supervision  # noqa: F401
+from mv3dt_installer.steps import step7_webapp_integration  # noqa: F401
+
 
 def run() -> int:
     return app.main()
