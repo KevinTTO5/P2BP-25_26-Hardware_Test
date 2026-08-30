@@ -53,6 +53,7 @@ import pathlib
 import socket
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -86,6 +87,9 @@ __all__ = [
     "RequestDedup",
     "resolve_project",
     "handle_command",
+    "build_status_payload",
+    "status_round_trip_dry_run",
+    "status_round_trip_check",
     "check_polkit_authorization",
     "Step6RemoteSupervision",
     "handle_agent_subcommand",
@@ -109,8 +113,23 @@ def PIPELINE_UNIT_NAME(slug: str) -> str:  # noqa: N802 -- reads like a constant
     return f"mv3dt-pipeline@{slug}.service"
 
 
-def _run(runner: Runner, *args: str) -> "subprocess.CompletedProcess[Any]":
-    return runner(list(args), check=False, capture_output=True, text=True)
+# Bound on the read-only systemctl/nvidia-smi probes the status path makes
+# (section C.5's ActiveState/SubState show, is-active/is-enabled, and the
+# GPU snapshot) -- these must never hang the agent's periodic status publish
+# or a verify() round trip on a wedged systemd/D-Bus call.
+_STATUS_CALL_TIMEOUT_S = 5.0
+
+
+def _run(
+    runner: Runner, *args: str, timeout: Optional[float] = None
+) -> "subprocess.CompletedProcess[Any]":
+    kwargs: dict[str, Any] = {"check": False, "capture_output": True, "text": True}
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    try:
+        return runner(list(args), **kwargs)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(list(args), 1, "", "timed out")
 
 
 def _returncode(result: Any) -> int:
@@ -354,7 +373,13 @@ SETTLE_POLL_S = 0.5
 
 
 def _systemctl_state(unit: str, prop: str, *, runner: Runner) -> str:
-    result = _run(runner, "systemctl", "is-active" if prop == "active" else "is-enabled", unit)
+    result = _run(
+        runner,
+        "systemctl",
+        "is-active" if prop == "active" else "is-enabled",
+        unit,
+        timeout=_STATUS_CALL_TIMEOUT_S,
+    )
     return _stdout(result) or "unknown"
 
 
@@ -480,18 +505,23 @@ def _handle_lifecycle_action(
 
 
 def _handle_status_action(
-    *, request_id: str, project_ref: Optional[str], install_dir: pathlib.Path, runner: Runner
+    *,
+    request_id: str,
+    project_ref: Optional[str],
+    install_dir: pathlib.Path,
+    runner: Runner,
+    host_id: str,
 ) -> dict[str, Any]:
     if not project_ref:
-        return _build_result(
-            request_id=request_id,
-            ok=True,
-            action="status",
-            project=None,
-            state="unknown",
-            enabled="unknown",
-            error=None,
-        )
+        # Section C.3: "optional for status (omit = whole host)"; section
+        # C.3 also says a bare `status` command "returns the current status
+        # payload (section C.5) as a result" -- so this returns the real
+        # build_status_payload() output (host_id/agent_version/pipelines/
+        # gpu), not a per-unit placeholder, with the section C.4 envelope
+        # fields layered on top for request correlation.
+        payload = build_status_payload(host_id=host_id, install_dir=install_dir, runner=runner)
+        payload.update({"request_id": request_id, "ok": True, "action": "status", "error": None})
+        return payload
     entry = resolve_project(install_dir, project_ref)
     if entry is None:
         return _build_result(
@@ -533,6 +563,7 @@ def handle_command(
     install_dir: pathlib.Path,
     runner: Runner,
     dedup: RequestDedup,
+    host_id: str = "",
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
@@ -540,7 +571,12 @@ def handle_command(
     (section C.6's table), and return the exact result envelope to publish
     to `mv3dt/<HOST_ID>/cmd/result`. Never raises -- every failure path
     (malformed command, unknown project, systemctl failure, settle
-    timeout) is represented as `ok: false` with a short `error` string."""
+    timeout) is represented as `ok: false` with a short `error` string.
+
+    `host_id` is only consumed by the whole-host `status` action (section
+    C.3: "omit `project` = whole host"), which embeds it in the returned
+    section C.5 payload; every other action ignores it. Defaults to `""`
+    so existing per-project callers don't need to pass it."""
     error = validate_command(payload)
     request_id = payload.get("request_id", "") if isinstance(payload, dict) else ""
     action = payload.get("action") if isinstance(payload, dict) else None
@@ -565,7 +601,11 @@ def handle_command(
         result = _handle_list_action(request_id=request_id, install_dir=install_dir, runner=runner)
     elif action == "status":
         result = _handle_status_action(
-            request_id=request_id, project_ref=project_ref, install_dir=install_dir, runner=runner
+            request_id=request_id,
+            project_ref=project_ref,
+            install_dir=install_dir,
+            runner=runner,
+            host_id=host_id,
         )
     else:
         result = _handle_lifecycle_action(
@@ -596,6 +636,7 @@ def _gpu_snapshot(runner: Runner) -> Optional[dict[str, Any]]:
         "nvidia-smi",
         "--query-gpu=utilization.gpu,memory.used,temperature.gpu",
         "--format=csv,noheader,nounits",
+        timeout=_STATUS_CALL_TIMEOUT_S,
     )
     if _returncode(result) != 0:
         return None
@@ -613,13 +654,67 @@ def _gpu_snapshot(runner: Runner) -> Optional[dict[str, Any]]:
         return None
 
 
+# systemd's `ActiveEnterTimestamp` prints like "Wed 2024-01-17 10:15:23 UTC"
+# (day-of-week, date, time, timezone abbreviation) under the installer's own
+# C-locale invocation of systemctl; a bare (no-timezone) form is accepted too
+# in case a caller's environment strips it.
+_SYSTEMD_TIMESTAMP_FORMATS = ("%a %Y-%m-%d %H:%M:%S %Z", "%a %Y-%m-%d %H:%M:%S")
+_SYSTEMD_TIMESTAMP_UNSET = ("", "n/a", "0")
+
+
+def _parse_systemd_timestamp(value: str) -> Optional[datetime]:
+    """Best-effort parse of a `systemctl show -p ActiveEnterTimestamp`
+    value. Returns `None` for the unset sentinel (never entered active) or
+    any value this can't parse -- never raises."""
+    text = (value or "").strip()
+    if text in _SYSTEMD_TIMESTAMP_UNSET:
+        return None
+    for fmt in _SYSTEMD_TIMESTAMP_FORMATS:
+        try:
+            parsed = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    return None
+
+
+def _compute_uptime_s(
+    active_enter_timestamp: str,
+    *,
+    now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> int:
+    """Section C.5's `uptime_s`: whole seconds since `ActiveEnterTimestamp`,
+    or 0 when that timestamp can't be parsed -- matching every other
+    section C.5 field's never-raise, degrade-to-a-safe-default contract.
+    `now` is injectable so a test can pin "the current time" instead of
+    racing a real clock."""
+    parsed = _parse_systemd_timestamp(active_enter_timestamp)
+    if parsed is None:
+        return 0
+    return max(0, int((now() - parsed).total_seconds()))
+
+
 def build_status_payload(
-    *, host_id: str, install_dir: pathlib.Path, runner: Runner
+    *,
+    host_id: str,
+    install_dir: pathlib.Path,
+    runner: Runner,
+    now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> dict[str, Any]:
     """Section C.5's exact schema. `active`/`sub` are section C.5's REQUIRED
     fallback: any failure of `systemctl show ... -p ActiveState -p SubState`
     yields `"unknown"`/`"unknown"` rather than raising, so one unreadable
-    unit never blocks the whole payload."""
+    unit never blocks the whole payload.
+
+    Note (STEP-7 cross-reference, non-blocking): this module's own
+    `active`/`sub` keys are lowercase, matching this doc's (STEP-6 section
+    C.5) own worked example verbatim. STEP-7 section D.1's status payload
+    uses capitalized `Active`/`Sub` for the same concept -- a pre-existing
+    naming inconsistency between the two sibling docs, not introduced here;
+    each module matches its own doc's literal spelling.
+    """
     pipelines: dict[str, Any] = {}
     for entry in step5_mod.list_projects(install_dir):
         unit = PIPELINE_UNIT_NAME(entry.slug)
@@ -638,6 +733,7 @@ def build_status_payload(
             "ExecMainStatus",
             "-p",
             "NRestarts",
+            timeout=_STATUS_CALL_TIMEOUT_S,
         )
         props: dict[str, str] = {}
         if _returncode(show) == 0:
@@ -646,11 +742,22 @@ def build_status_payload(
                 if key:
                     props[key] = value
 
+        active_state = props.get("ActiveState", "unknown")
+        # Uptime only means something while the unit is actually active --
+        # a failed/inactive unit's ActiveEnterTimestamp is stale history,
+        # not "how long it has been up" (matches the doc's own worked
+        # example: an active unit gets a real uptime_s, a failed one 0).
+        uptime_s = (
+            _compute_uptime_s(props.get("ActiveEnterTimestamp", ""), now=now)
+            if active_state == "active"
+            else 0
+        )
+
         pipelines[entry.slug] = {
-            "active": props.get("ActiveState", "unknown"),
+            "active": active_state,
             "sub": props.get("SubState", "unknown"),
             "enabled": _systemctl_state(unit, "enabled", runner=runner),
-            "uptime_s": 0,
+            "uptime_s": uptime_s,
             "last_exit_code": _int_or(props.get("ExecMainStatus"), 0),
             "restarts": _int_or(props.get("NRestarts"), 0),
         }
@@ -672,6 +779,109 @@ def _int_or(value: Optional[str], default: int) -> int:
         return int(value) if value is not None else default
     except ValueError:
         return default
+
+
+# ---------------------------------------------------------------------------
+# section E.1 -- REQUIRED round-trip status check
+# ---------------------------------------------------------------------------
+
+
+def status_round_trip_dry_run(
+    *, install_dir: pathlib.Path, runner: Runner, host_id: str
+) -> dict[str, Any]:
+    """Section E.1's dry-run-equivalent round trip: invoke the command
+    handler in-process (no real broker) exactly as a real
+    `mv3dt/<HOST_ID>/cmd` -> `.../cmd/result` round trip would resolve.
+    This is what `verify()` falls back to under `--non-interactive` or when
+    no live agent/broker answers -- "verify() never depends on the cloud
+    webapp existing"."""
+    return handle_command(
+        {"action": "status", "request_id": str(uuid.uuid4()), "ts": _now_utc_iso()},
+        install_dir=install_dir,
+        runner=runner,
+        dedup=RequestDedup(),
+        host_id=host_id,
+    )
+
+
+def _attempt_live_status_round_trip(
+    host_id: str, *, timeout_s: float = 5.0
+) -> Optional[dict[str, Any]]:
+    """Section E.1's primary path: publish `{"action":"status"}` to
+    `mv3dt/<HOST_ID>/cmd` against the local broker and wait for a reply on
+    `.../cmd/result` -- the actual end-to-end proof that a running
+    `mv3dt-agent.service` is consuming commands over MQTT, not just that the
+    unit is `active`. Returns `None` on any connection/timeout failure (no
+    local broker reachable, no agent listening yet, `paho-mqtt`
+    unavailable) -- this never raises; the caller falls back to
+    `status_round_trip_dry_run` in that case."""
+    try:
+        import json
+
+        import paho.mqtt.client as mqtt
+    except ImportError:  # pragma: no cover -- paho-mqtt is a hard dependency
+        return None
+
+    received: dict[str, Any] = {}
+
+    def _on_message(_client: Any, _userdata: Any, msg: Any) -> None:
+        try:
+            received["result"] = json.loads(msg.payload.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            pass
+
+    client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+    client.on_message = _on_message
+    try:
+        client.connect("127.0.0.1", 1883, keepalive=int(timeout_s) or 1)
+    except OSError:
+        return None
+
+    try:
+        client.subscribe(result_topic(host_id), qos=1)
+        client.loop_start()
+        client.publish(
+            cmd_topic(host_id),
+            json.dumps({"action": "status", "request_id": str(uuid.uuid4()), "ts": _now_utc_iso()}),
+            qos=1,
+        )
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline and "result" not in received:
+            time.sleep(0.1)
+    except OSError:
+        return None
+    finally:
+        client.loop_stop()
+        client.disconnect()
+
+    return received.get("result")
+
+
+def status_round_trip_check(
+    *,
+    ctx: "Context",
+    host_id: str,
+    install_dir: pathlib.Path,
+    runner: Runner,
+    live_round_trip: Callable[[str], Optional[dict[str, Any]]] = _attempt_live_status_round_trip,
+) -> tuple[bool, dict[str, Any]]:
+    """`verify()`'s REQUIRED round-trip status check (section E.1): "publish
+    a `{"action":"status"}` command ... and assert a result returns ...
+    within a timeout (the end-to-end remote-control proof). Under
+    `--non-interactive` / no reachable cloud, fall back to the dry-run
+    equivalent ... so verify never depends on the cloud webapp existing."
+
+    `live_round_trip` is injectable so tests exercise both "the live round
+    trip answered" and "it didn't, so this fell back to the in-process
+    dry-run equivalent" without ever touching a real broker. Returns
+    `(ok, result)` -- `ok` is the result's own `ok` field."""
+    if not ctx.non_interactive:
+        live = live_round_trip(host_id)
+        if live is not None:
+            return bool(live.get("ok")), live
+
+    result = status_round_trip_dry_run(install_dir=install_dir, runner=runner, host_id=host_id)
+    return bool(result.get("ok")), result
 
 
 # ---------------------------------------------------------------------------
@@ -769,7 +979,7 @@ def handle_agent_subcommand(argv: list, ctx: "Context") -> int:
         except (ValueError, UnicodeDecodeError):
             payload = None
         result = handle_command(
-            payload, install_dir=ctx.install_dir, runner=runner, dedup=dedup
+            payload, install_dir=ctx.install_dir, runner=runner, dedup=dedup, host_id=host_id
         )
         client.publish(result_topic(host_id), json.dumps(result), qos=1)
 
@@ -922,6 +1132,21 @@ class Step6RemoteSupervision:
             return StepResult(status=StepStatus.FAILED, message=f"{AGENT_UNIT_NAME} not enabled")
         if not systemd_mod.is_active(AGENT_UNIT_NAME, runner=runner):
             return StepResult(status=StepStatus.FAILED, message=f"{AGENT_UNIT_NAME} not active")
+
+        # section E.1 REQUIRED: "publish a {"action":"status"} command ...
+        # and assert a result returns ... the end-to-end remote-control
+        # proof" -- falls back to the in-process dry-run equivalent under
+        # --non-interactive / no reachable cloud (status_round_trip_check's
+        # own contract), so this never depends on the cloud webapp existing.
+        host_id = resolve_host_id(ctx.conf)
+        round_trip_ok, round_trip_result = status_round_trip_check(
+            ctx=ctx, host_id=host_id, install_dir=ctx.install_dir, runner=runner
+        )
+        if not round_trip_ok:
+            return StepResult(
+                status=StepStatus.FAILED,
+                message=f"status round-trip check failed: {round_trip_result}",
+            )
 
         for entry in step5_mod.list_projects(ctx.install_dir):
             unit = PIPELINE_UNIT_NAME(entry.slug)

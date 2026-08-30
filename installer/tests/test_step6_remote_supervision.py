@@ -15,6 +15,7 @@ from __future__ import annotations
 import pathlib
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 import pytest
 
@@ -544,16 +545,20 @@ class _FakeUser:
 
 
 class _FakeCtx:
-    def __init__(self, install_dir, conf, runner):
+    def __init__(self, install_dir, conf, runner, *, non_interactive=True):
         self.install_dir = install_dir
         self.conf = conf
         self.user = _FakeUser()
         self._runner = runner
+        self.non_interactive = non_interactive
         from mv3dt_installer import logs
 
         self.log = logs.log
 
     def run_root(self, *args, **kwargs):
+        return self._runner(list(args), **kwargs)
+
+    def run_as_user(self, *args, **kwargs):
         return self._runner(list(args), **kwargs)
 
 
@@ -587,3 +592,259 @@ def test_remove_project_artifacts_calls_the_registered_hook_before_removing(tmp_
     step5.remove_project_artifacts(ctx, entry)
 
     assert runner.calls == [["systemctl", "disable", "--now", "mv3dt-pipeline@north-lobby-2.service"]]
+
+
+# ---------------------------------------------------------------------------
+# section C.5 -- build_status_payload() / uptime_s
+# ---------------------------------------------------------------------------
+
+
+def _show_stdout(**props):
+    return "\n".join(f"{k}={v}" for k, v in props.items()) + "\n"
+
+
+def test_uptime_s_computed_from_active_enter_timestamp(tmp_path):
+    install_dir = tmp_path / "mv3dt"
+    _make_entry(install_dir)
+    runner = ScriptedRunner()
+    runner.when(
+        _prefix("systemctl", "show", "mv3dt-pipeline@north-lobby-2.service"),
+        stdout=_show_stdout(
+            ActiveState="active",
+            SubState="running",
+            ActiveEnterTimestamp="Wed 2024-01-17 10:15:00 UTC",
+            ExecMainStatus="0",
+            NRestarts="0",
+        ),
+    )
+    runner.when(_prefix("systemctl", "is-enabled"), stdout="enabled\n")
+    runner.when(_prefix("nvidia-smi"), returncode=1)
+
+    fixed_now = lambda: datetime(2024, 1, 17, 10, 15, 30, tzinfo=timezone.utc)  # noqa: E731
+    payload = step6.build_status_payload(
+        host_id="desk-lab-01", install_dir=install_dir, runner=runner, now=fixed_now
+    )
+    assert payload["pipelines"]["north-lobby-2"]["uptime_s"] == 30
+
+
+def test_uptime_s_is_zero_when_unit_is_not_active(tmp_path):
+    install_dir = tmp_path / "mv3dt"
+    _make_entry(install_dir)
+    runner = ScriptedRunner()
+    runner.when(
+        _prefix("systemctl", "show", "mv3dt-pipeline@north-lobby-2.service"),
+        stdout=_show_stdout(
+            ActiveState="failed",
+            SubState="failed",
+            ActiveEnterTimestamp="Wed 2024-01-17 10:15:00 UTC",
+            ExecMainStatus="1",
+            NRestarts="5",
+        ),
+    )
+    runner.when(_prefix("systemctl", "is-enabled"), stdout="enabled\n")
+    runner.when(_prefix("nvidia-smi"), returncode=1)
+
+    payload = step6.build_status_payload(host_id="desk-lab-01", install_dir=install_dir, runner=runner)
+    entry = payload["pipelines"]["north-lobby-2"]
+    assert entry["uptime_s"] == 0
+    assert entry["active"] == "failed"
+    assert entry["last_exit_code"] == 1
+    assert entry["restarts"] == 5
+
+
+def test_uptime_s_is_zero_when_timestamp_unparseable_or_unset(tmp_path):
+    install_dir = tmp_path / "mv3dt"
+    _make_entry(install_dir)
+    runner = ScriptedRunner()
+    runner.when(
+        _prefix("systemctl", "show", "mv3dt-pipeline@north-lobby-2.service"),
+        stdout=_show_stdout(ActiveState="active", SubState="running", ActiveEnterTimestamp="n/a"),
+    )
+    runner.when(_prefix("systemctl", "is-enabled"), stdout="enabled\n")
+    runner.when(_prefix("nvidia-smi"), returncode=1)
+
+    payload = step6.build_status_payload(host_id="desk-lab-01", install_dir=install_dir, runner=runner)
+    assert payload["pipelines"]["north-lobby-2"]["uptime_s"] == 0
+
+
+def test_parse_systemd_timestamp_accepts_the_documented_format():
+    parsed = step6._parse_systemd_timestamp("Wed 2024-01-17 10:15:23 UTC")
+    assert parsed == datetime(2024, 1, 17, 10, 15, 23, tzinfo=timezone.utc)
+
+
+def test_parse_systemd_timestamp_returns_none_for_unset_sentinels():
+    assert step6._parse_systemd_timestamp("n/a") is None
+    assert step6._parse_systemd_timestamp("") is None
+    assert step6._parse_systemd_timestamp("0") is None
+    assert step6._parse_systemd_timestamp("garbage") is None
+
+
+def test_build_status_payload_falls_back_to_unknown_when_show_fails(tmp_path):
+    install_dir = tmp_path / "mv3dt"
+    _make_entry(install_dir)
+    runner = ScriptedRunner()
+    runner.when(_prefix("systemctl", "show"), returncode=1)
+    runner.when(_prefix("systemctl", "is-enabled"), stdout="enabled\n")
+    runner.when(_prefix("nvidia-smi"), returncode=1)
+
+    payload = step6.build_status_payload(host_id="desk-lab-01", install_dir=install_dir, runner=runner)
+    entry = payload["pipelines"]["north-lobby-2"]
+    assert entry["active"] == "unknown"
+    assert entry["sub"] == "unknown"
+    assert entry["uptime_s"] == 0
+
+
+def test_build_status_payload_omits_gpu_when_nvidia_smi_fails(tmp_path):
+    install_dir = tmp_path / "mv3dt"
+    _make_entry(install_dir)
+    runner = ScriptedRunner(default_returncode=1)
+    payload = step6.build_status_payload(host_id="desk-lab-01", install_dir=install_dir, runner=runner)
+    assert "gpu" not in payload
+
+
+def test_build_status_payload_includes_gpu_snapshot_on_success(tmp_path):
+    install_dir = tmp_path / "mv3dt"
+    _make_entry(install_dir)
+    runner = ScriptedRunner()
+    runner.when(_prefix("systemctl", "show"), returncode=1)
+    runner.when(_prefix("systemctl", "is-enabled"), stdout="enabled\n")
+    runner.when(_prefix("nvidia-smi"), returncode=0, stdout="61, 4210, 57\n")
+
+    payload = step6.build_status_payload(host_id="desk-lab-01", install_dir=install_dir, runner=runner)
+    assert payload["gpu"] == {"utilization_pct": 61, "memory_used_mb": 4210, "temperature_c": 57}
+
+
+# ---------------------------------------------------------------------------
+# section C.3 -- whole-host status command (project omitted)
+# ---------------------------------------------------------------------------
+
+
+def test_handle_command_whole_host_status_returns_the_c5_payload(tmp_path):
+    install_dir = tmp_path / "mv3dt"
+    _make_entry(install_dir)
+    runner = ScriptedRunner()
+    runner.when(_prefix("systemctl", "show"), returncode=1)
+    runner.when(_prefix("systemctl", "is-enabled"), stdout="enabled\n")
+    runner.when(_prefix("nvidia-smi"), returncode=1)
+
+    result = step6.handle_command(
+        {"action": "status", "request_id": "r1", "ts": "x"},
+        install_dir=install_dir,
+        runner=runner,
+        dedup=step6.RequestDedup(),
+        host_id="desk-lab-01",
+    )
+    assert result["ok"] is True
+    assert result["action"] == "status"
+    assert result["request_id"] == "r1"
+    assert result["error"] is None
+    # The real section C.5 payload shape, not a per-unit placeholder.
+    assert result["host_id"] == "desk-lab-01"
+    assert "pipelines" in result
+    assert "north-lobby-2" in result["pipelines"]
+    assert "agent_version" in result
+
+
+def test_handle_command_per_project_status_is_unaffected_by_whole_host_change(tmp_path):
+    install_dir = tmp_path / "mv3dt"
+    _make_entry(install_dir)
+    runner = ScriptedRunner(default_stdout="active\n")
+    result = step6.handle_command(
+        {"action": "status", "project": "north-lobby-2", "request_id": "r2", "ts": "x"},
+        install_dir=install_dir,
+        runner=runner,
+        dedup=step6.RequestDedup(),
+        host_id="desk-lab-01",
+    )
+    assert result["project"] == "north-lobby-2"
+    assert result["state"] == "active"
+    assert "pipelines" not in result
+
+
+# ---------------------------------------------------------------------------
+# section E.1 -- REQUIRED round-trip status check
+# ---------------------------------------------------------------------------
+
+
+def test_status_round_trip_dry_run_invokes_handle_command_in_process(tmp_path):
+    install_dir = tmp_path / "mv3dt"
+    _make_entry(install_dir)
+    runner = ScriptedRunner()
+    runner.when(_prefix("systemctl", "show"), returncode=1)
+    runner.when(_prefix("systemctl", "is-enabled"), stdout="enabled\n")
+    runner.when(_prefix("nvidia-smi"), returncode=1)
+
+    result = step6.status_round_trip_dry_run(install_dir=install_dir, runner=runner, host_id="desk-lab-01")
+    assert result["ok"] is True
+    assert result["host_id"] == "desk-lab-01"
+
+
+def test_status_round_trip_check_uses_dry_run_when_non_interactive(tmp_path):
+    install_dir = tmp_path / "mv3dt"
+    _make_entry(install_dir)
+    runner = ScriptedRunner()
+    runner.when(_prefix("systemctl", "show"), returncode=1)
+    runner.when(_prefix("systemctl", "is-enabled"), stdout="enabled\n")
+    runner.when(_prefix("nvidia-smi"), returncode=1)
+    ctx = _FakeCtx(install_dir, {}, runner, non_interactive=True)
+
+    live_called = []
+    ok, result = step6.status_round_trip_check(
+        ctx=ctx,
+        host_id="desk-lab-01",
+        install_dir=install_dir,
+        runner=runner,
+        live_round_trip=lambda host_id: live_called.append(host_id) or {"ok": True},
+    )
+    assert ok is True
+    assert live_called == []  # non-interactive skips the live attempt entirely
+
+
+def test_status_round_trip_check_tries_live_first_when_interactive(tmp_path):
+    install_dir = tmp_path / "mv3dt"
+    _make_entry(install_dir)
+    runner = ScriptedRunner()
+    ctx = _FakeCtx(install_dir, {}, runner, non_interactive=False)
+
+    ok, result = step6.status_round_trip_check(
+        ctx=ctx,
+        host_id="desk-lab-01",
+        install_dir=install_dir,
+        runner=runner,
+        live_round_trip=lambda host_id: {"ok": True, "host_id": host_id, "via": "live"},
+    )
+    assert ok is True
+    assert result["via"] == "live"
+
+
+def test_status_round_trip_check_falls_back_to_dry_run_when_live_unreachable(tmp_path):
+    install_dir = tmp_path / "mv3dt"
+    _make_entry(install_dir)
+    runner = ScriptedRunner()
+    runner.when(_prefix("systemctl", "show"), returncode=1)
+    runner.when(_prefix("systemctl", "is-enabled"), stdout="enabled\n")
+    runner.when(_prefix("nvidia-smi"), returncode=1)
+    ctx = _FakeCtx(install_dir, {}, runner, non_interactive=False)
+
+    ok, result = step6.status_round_trip_check(
+        ctx=ctx,
+        host_id="desk-lab-01",
+        install_dir=install_dir,
+        runner=runner,
+        live_round_trip=lambda host_id: None,  # no broker/agent reachable
+    )
+    assert ok is True
+    assert result["host_id"] == "desk-lab-01"  # the dry-run payload, not a live one
+
+
+def test_status_round_trip_check_reports_failure_from_live_result():
+    ctx = _FakeCtx(pathlib.Path("/nonexistent"), {}, ScriptedRunner(), non_interactive=False)
+    ok, result = step6.status_round_trip_check(
+        ctx=ctx,
+        host_id="desk-lab-01",
+        install_dir=pathlib.Path("/nonexistent"),
+        runner=ScriptedRunner(),
+        live_round_trip=lambda host_id: {"ok": False, "error": "timed out"},
+    )
+    assert ok is False
+    assert result["error"] == "timed out"
