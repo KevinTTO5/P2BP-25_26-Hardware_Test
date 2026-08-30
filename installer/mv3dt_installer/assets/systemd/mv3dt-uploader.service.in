@@ -1,0 +1,33 @@
+# Template for /etc/systemd/system/mv3dt-uploader.service
+#
+# Rendered by mv3dt_installer.steps.step7_webapp_integration via
+# systemd.render_unit(). STEP-7 section E: the artifact upload daemon --
+# watches the configured export directories and ships finished artifacts
+# via the signed-URL flow (STEP-7 section B). ExecStart runs
+# `mv3dt-installer uploader`, the subcommand step7_webapp_integration.py
+# registers via app.register_subcommand.
+#
+# Runs as @USER@ (not root, not nobody): it loads secrets/webapp.env via
+# EnvironmentFile=, which is chmod 600 and owned by the invoking user (doc
+# 00 section 9.2), and only that user can read it. Independent of the
+# broker -- does not require mosquitto.
+[Unit]
+Description=mv3dt web-app artifact upload daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+EnvironmentFile=@INSTALL_DIR@/installer.conf
+EnvironmentFile=@INSTALL_DIR@/secrets/webapp.env
+ExecStart="@INSTALLER_BIN@" uploader --install-dir "@INSTALL_DIR@" --non-interactive
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=30s
+
+[Install]
+WantedBy=multi-user.target
