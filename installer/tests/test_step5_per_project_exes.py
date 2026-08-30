@@ -22,6 +22,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from mv3dt_installer import app  # noqa: E402
+from mv3dt_installer import config as config_mod  # noqa: E402
 from mv3dt_installer import logs, report  # noqa: E402
 from mv3dt_installer.steps import STEP_REGISTRY, StepStatus  # noqa: E402
 from mv3dt_installer.steps import step3_amc_launcher as step3  # noqa: E402
@@ -771,3 +772,196 @@ def test_generate_preview_config_enables_display_and_keeps_mqtt():
     assert "enable=1" in rendered
     # sink1 (MQTT) config line is preserved.
     assert "msg-conv-config=msgconv_config.txt" in rendered
+
+
+# ---------------------------------------------------------------------------
+# STEP-6-REMOTE-SUPERVISION.md section A.2 -- supervised vs unsupervised
+# pipeline dispatch. No test here imports step6_remote_supervision -- these
+# exercise step5's own conditional purely through injected runners, exactly
+# as an unsupervised workstation (Step 6 never run) must keep behaving.
+# ---------------------------------------------------------------------------
+
+
+def test_supervision_active_false_when_gate_off(tmp_path):
+    ctx = FakeContext(tmp_path, conf={config_mod.GATE_REMOTE_SUPERVISION: "off"})
+    assert step5._supervision_active(ctx, "north-lobby-2") is False
+    # "off" must never even probe systemd.
+    assert ctx.runner_root.calls == []
+
+
+def test_supervision_active_false_when_gate_absent(tmp_path):
+    ctx = FakeContext(tmp_path, conf={})
+    assert step5._supervision_active(ctx, "north-lobby-2") is False
+    assert ctx.runner_root.calls == []
+
+
+def test_supervision_active_false_when_gate_on_but_unit_not_enabled(tmp_path):
+    runner = ScriptedRunner(default_returncode=1)  # is-enabled fails: unit absent
+    ctx = FakeContext(tmp_path, conf={config_mod.GATE_REMOTE_SUPERVISION: "local"}, runner_root=runner)
+    assert step5._supervision_active(ctx, "north-lobby-2") is False
+
+
+def test_supervision_active_true_when_gate_on_and_unit_enabled(tmp_path):
+    runner = ScriptedRunner(default_returncode=0)  # is-enabled succeeds
+    ctx = FakeContext(tmp_path, conf={config_mod.GATE_REMOTE_SUPERVISION: "remote"}, runner_root=runner)
+    assert step5._supervision_active(ctx, "north-lobby-2") is True
+
+
+def test_pipeline_start_dispatches_to_systemctl_when_supervised(tmp_path, monkeypatch):
+    runner = ScriptedRunner(default_returncode=0)  # is-enabled AND systemctl start both succeed
+    ctx = FakeContext(tmp_path, conf={config_mod.GATE_REMOTE_SUPERVISION: "local"}, runner_root=runner)
+    _make_entry(ctx.install_dir)
+
+    called = {}
+    monkeypatch.setattr(
+        step5, "_start_pipeline_foreground", lambda *a, **kw: (called.__setitem__("foreground", True), 0)[1]
+    )
+
+    rc = step5.handle_pipeline_subcommand(["--project", "North Lobby #2"], ctx)
+    assert rc == 0
+    assert "foreground" not in called
+    assert runner.called_with_prefix("systemctl", "start", "mv3dt-pipeline@north-lobby-2.service")
+
+
+def test_pipeline_start_stays_unsupervised_when_gate_off(tmp_path, monkeypatch):
+    runner = ScriptedRunner()
+    ctx = FakeContext(tmp_path, conf={}, runner_root=runner)
+    _make_entry(ctx.install_dir)
+
+    called = {}
+    monkeypatch.setattr(
+        step5, "_start_pipeline_foreground", lambda *a, **kw: (called.__setitem__("foreground", True), 0)[1]
+    )
+
+    rc = step5.handle_pipeline_subcommand(["--project", "North Lobby #2"], ctx)
+    assert rc == 0
+    assert called.get("foreground") is True
+    assert not runner.called_with_prefix("systemctl", "start")
+
+
+def test_pipeline_start_stays_unsupervised_when_gate_on_but_step6_never_ran(tmp_path, monkeypatch):
+    """Gate flipped on but Step 6 has not (re)installed the unit for this
+    project yet -- must behave exactly like an unsupervised workstation,
+    never fail trying to systemctl-start a unit that doesn't exist."""
+    runner = ScriptedRunner(default_returncode=1)  # is-enabled fails: no such unit
+    ctx = FakeContext(tmp_path, conf={config_mod.GATE_REMOTE_SUPERVISION: "local"}, runner_root=runner)
+    _make_entry(ctx.install_dir)
+
+    called = {}
+    monkeypatch.setattr(
+        step5, "_start_pipeline_foreground", lambda *a, **kw: (called.__setitem__("foreground", True), 0)[1]
+    )
+
+    rc = step5.handle_pipeline_subcommand(["--project", "North Lobby #2"], ctx)
+    assert rc == 0
+    assert called.get("foreground") is True
+
+
+def test_pipeline_start_foreground_flag_forces_unsupervised_even_when_active(tmp_path, monkeypatch):
+    runner = ScriptedRunner(default_returncode=0)  # would say "supervised" if asked
+    ctx = FakeContext(tmp_path, conf={config_mod.GATE_REMOTE_SUPERVISION: "remote"}, runner_root=runner)
+    _make_entry(ctx.install_dir)
+
+    called = {}
+    monkeypatch.setattr(
+        step5, "_start_pipeline_foreground", lambda *a, **kw: (called.__setitem__("foreground", True), 0)[1]
+    )
+
+    rc = step5.handle_pipeline_subcommand(["--project", "North Lobby #2", "--foreground"], ctx)
+    assert rc == 0
+    assert called.get("foreground") is True
+    assert not runner.called_with_prefix("systemctl", "start")
+
+
+def test_pipeline_stop_dispatches_to_systemctl_when_supervised(tmp_path):
+    runner = ScriptedRunner(default_returncode=0)
+    ctx = FakeContext(tmp_path, conf={config_mod.GATE_REMOTE_SUPERVISION: "local"}, runner_root=runner)
+    _make_entry(ctx.install_dir)
+
+    rc = step5.handle_pipeline_subcommand(["--project", "North Lobby #2", "--stop"], ctx)
+    assert rc == 0
+    assert runner.called_with_prefix("systemctl", "stop", "mv3dt-pipeline@north-lobby-2.service")
+    assert not runner.called_with_prefix("pkill")
+
+
+def test_pipeline_stop_all_supervised_still_tears_down_amc_and_mosquitto(tmp_path, monkeypatch):
+    runner = ScriptedRunner(default_returncode=0)
+    ctx = FakeContext(tmp_path, conf={config_mod.GATE_REMOTE_SUPERVISION: "local"}, runner_root=runner)
+    _make_entry(ctx.install_dir)
+
+    teardown_calls = []
+    monkeypatch.setattr(step3, "teardown_amc", lambda ctx_: teardown_calls.append(ctx_))
+
+    rc = step5.handle_pipeline_subcommand(["--project", "North Lobby #2", "--stop-all"], ctx)
+    assert rc == 0
+    assert runner.called_with_prefix("systemctl", "stop", "mv3dt-pipeline@north-lobby-2.service")
+    assert len(teardown_calls) == 1
+    assert runner.called_with_prefix("systemctl", "stop", "mosquitto")
+
+
+def test_pipeline_service_exec_mode_skips_ping_sweep(tmp_path, monkeypatch):
+    ctx = FakeContext(tmp_path, conf={})
+    _make_entry(ctx.install_dir)
+
+    ping_called = {}
+    monkeypatch.setattr(step5, "ping_sweep_cameras", lambda ctx_: ping_called.setdefault("called", True))
+
+    rc = step5.handle_pipeline_subcommand(
+        ["--project", "North Lobby #2", "--service-exec", "--dry-run"], ctx
+    )
+    assert rc == 0
+    assert "called" not in ping_called
+
+
+def test_pipeline_project_slug_resolves_via_registry(tmp_path):
+    ctx = FakeContext(tmp_path, conf={})
+    entry = _make_entry(ctx.install_dir)
+
+    rc = step5.handle_pipeline_subcommand(["--project-slug", entry.slug, "--dry-run"], ctx)
+    assert rc == 0
+
+
+def test_pipeline_neither_project_nor_slug_is_an_error(tmp_path):
+    ctx = FakeContext(tmp_path, conf={})
+    rc = step5.handle_pipeline_subcommand([], ctx)
+    assert rc == 1
+
+
+def test_get_by_slug_finds_the_matching_entry(tmp_path):
+    entry = _make_entry(tmp_path)
+    assert step5.get_by_slug(tmp_path, entry.slug) is entry or step5.get_by_slug(
+        tmp_path, entry.slug
+    ).slug == entry.slug
+
+
+def test_get_by_slug_returns_none_for_unknown_slug(tmp_path):
+    _make_entry(tmp_path)
+    assert step5.get_by_slug(tmp_path, "does-not-exist") is None
+
+
+# ---------------------------------------------------------------------------
+# STEP-6-REMOTE-SUPERVISION.md section A.3 -- the removal hook plumbing
+# ---------------------------------------------------------------------------
+
+
+def test_removal_hook_defaults_to_none_and_is_a_noop():
+    previous = step5._REMOVAL_HOOK
+    try:
+        step5.register_removal_hook(None)
+        assert step5._REMOVAL_HOOK is None
+    finally:
+        step5.register_removal_hook(previous)
+
+
+def test_remove_project_artifacts_invokes_the_registered_hook(tmp_path):
+    ctx = FakeContext(tmp_path, conf={})
+    entry = _make_entry(ctx.install_dir)
+
+    calls = []
+    previous = step5._REMOVAL_HOOK
+    try:
+        step5.register_removal_hook(lambda ctx_, entry_: calls.append(entry_.slug))
+        step5.remove_project_artifacts(ctx, entry)
+        assert calls == [entry.slug]
+    finally:
+        step5.register_removal_hook(previous)

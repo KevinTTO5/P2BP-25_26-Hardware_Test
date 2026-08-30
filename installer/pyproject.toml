@@ -25,6 +25,10 @@ license = { text = "Proprietary" }
 dependencies = [
     "rich>=13.7",
     "pyyaml>=6.0",
+    # STEP-6-REMOTE-SUPERVISION.md section B.0: the mv3dt-agent subcommand's
+    # only transport is MQTT over the existing Mosquitto stack -- the one
+    # spec-mandated exception to keeping this list minimal.
+    "paho-mqtt>=2.0",
 ]
 
 [project.optional-dependencies]

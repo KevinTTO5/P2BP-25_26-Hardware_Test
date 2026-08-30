@@ -1,0 +1,32 @@
+# Template for /etc/systemd/system/mv3dt-agent.service
+#
+# Rendered by mv3dt_installer.systemd.render_unit() (STEP-6-REMOTE-SUPERVISION.md
+# section B.1). `@USER@` is the one installer-time substitution -- same
+# convention as mv3dt-pipeline@.service.in and mv3dt-ingest.*.in.
+[Unit]
+Description=MV3DT remote control agent (MQTT command consumer)
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+User=@USER@
+ExecStart=/opt/mv3dt/bin/mv3dt-installer agent
+WorkingDirectory=/opt/mv3dt
+
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+EnvironmentFile=/opt/mv3dt/installer.conf
+EnvironmentFile=-/opt/mv3dt/agent/agent.env
+Environment=PYTHONUNBUFFERED=1
+
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,34 @@
+// Template for /etc/polkit-1/rules.d/49-mv3dt-agent.rules
+//
+// Rendered by mv3dt_installer.systemd.render_unit() (STEP-6-REMOTE-SUPERVISION.md
+// section B.1.1, LOCKED form -- reproduced verbatim below, substituting only
+// the invoking user via the @USER@ marker). The `49-` prefix sorts this rule
+// before the distribution defaults in 50-*.rules.
+//
+// Four properties, each load-bearing (do not "simplify" this rule):
+//   - Anchored regex (^...$) -- no prefix or suffix may be appended to the
+//     instance name; this is what a sudoers wildcard form cannot guarantee.
+//   - Explicit verb allowlist -- start/stop/restart only. enable/disable/mask
+//     are never granted, so a compromised agent cannot make a pipeline
+//     persist across reboots (boot-enablement stays the installer's job).
+//   - Result.YES, not AUTH_ADMIN -- the agent runs headless with no polkit
+//     authentication agent available.
+//   - NOT_HANDLED on every other path -- this rule only ever adds a narrow
+//     permission; every other unit and user is untouched.
+polkit.addRule(function (action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (subject.user !== "@USER@") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    // Anchored: no prefix or suffix may be appended to the instance name.
+    // The charset mirrors the Step 5 slug rules: [a-z0-9-], <=64.
+    if (/^mv3dt-pipeline@[a-z0-9-]{1,64}\.service$/.test(unit) &&
+        (verb === "start" || verb === "stop" || verb === "restart")) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});
