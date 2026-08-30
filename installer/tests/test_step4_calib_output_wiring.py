@@ -182,7 +182,15 @@ def _write_cameras_yml(path: pathlib.Path, *, enabled_ips: list[str], disabled_i
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _stub_amc_root(tmp_path, *, project_name="test-lab-01", export_files=("camInfo-01.yml",)) -> pathlib.Path:
+def _stub_amc_root(
+    tmp_path,
+    *,
+    project_name="test-lab-01",
+    # Two files by default -- matches `_cameras_file_set`'s default of two
+    # enabled cameras, so a `run()`/`verify()` test that doesn't care about
+    # the section 8.1 completeness check isn't tripped by it incidentally.
+    export_files=("camInfo-01.yml", "camInfo-02.yml"),
+) -> pathlib.Path:
     amc_root = tmp_path / "auto-magic-calib"
     export_dir = amc_root / "projects" / project_name / "exports"
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -691,6 +699,92 @@ def test_run_returns_user_action_required_when_export_empty(tmp_path, deepstream
     result = step4.Step4CalibOutputWiring().run(ctx)
     assert result.status is StepStatus.USER_ACTION_REQUIRED
     assert result.user_actions
+
+
+# ---------------------------------------------------------------------------
+# section 8.1 -- "poor calibration (bad RMSE)" incomplete-export detection
+# ---------------------------------------------------------------------------
+
+
+def test_calibration_file_count_ignores_ingest_log_and_zip(tmp_path):
+    dest = tmp_path / "calib"
+    dest.mkdir()
+    (dest / "camInfo-01.yml").write_text("x", encoding="utf-8")
+    (dest / "camInfo-02.yml").write_text("x", encoding="utf-8")
+    (dest / ".ingest.log").write_text("stamp\n", encoding="utf-8")
+    (dest / "mv3dt_export.zip").write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+    assert step4._calibration_file_count(dest) == 2
+
+
+def test_calibration_file_count_zero_for_missing_dir(tmp_path):
+    assert step4._calibration_file_count(tmp_path / "nope") == 0
+
+
+def test_enabled_camera_count_reads_only_enabled_entries(tmp_path):
+    cameras_path = tmp_path / "cameras.yml"
+    _write_cameras_yml(cameras_path, enabled_ips=["10.0.0.1", "10.0.0.2"], disabled_ips=["10.0.0.9"])
+    ctx = FakeContext(tmp_path, conf={config_mod.CAMERAS_FILE_KEY: str(cameras_path)})
+    assert step4._enabled_camera_count(ctx) == 2
+
+
+def test_enabled_camera_count_none_when_cameras_file_unset(tmp_path):
+    ctx = FakeContext(tmp_path, conf={})
+    assert step4._enabled_camera_count(ctx) is None
+
+
+def test_run_surfaces_user_action_required_when_export_looks_incomplete(tmp_path, deepstream_templates_dir):
+    # Two enabled cameras (via `_cameras_file_set`'s default), but only one
+    # camInfo file lands -- section 8.1's "fewer camInfo files than enabled
+    # cameras" case.
+    amc_root = _stub_amc_root(tmp_path, export_files=("camInfo-01.yml",))
+    conf = _default_conf(tmp_path, AMC_ROOT=str(amc_root))
+    ctx = FakeContext(tmp_path, conf=conf, asset_dir=deepstream_templates_dir, non_interactive=True)
+    _amc_wrapper_present(ctx)
+    _cameras_file_set(ctx, tmp_path, enabled_ips=("10.0.0.1", "10.0.0.2"))
+
+    result = step4.Step4CalibOutputWiring().run(ctx)
+
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert result.message == step4.INCOMPLETE_CALIBRATION_MESSAGE
+    assert result.user_actions
+    assert result.user_actions[0].text == step4.INCOMPLETE_CALIBRATION_MESSAGE
+    # An incomplete export must not be treated as a wired-up success: no
+    # CALIBRATION_DIR persisted, no rendered config written.
+    assert step4.CONF_CALIBRATION_DIR_KEY not in ctx.conf
+    assert not (ctx.install_dir / "deepstream" / step4.RENDERED_APP_CONFIG_NAME).exists()
+
+
+def test_run_completes_when_camInfo_count_matches_enabled_cameras(tmp_path, deepstream_templates_dir):
+    amc_root = _stub_amc_root(tmp_path, export_files=("camInfo-01.yml", "camInfo-02.yml"))
+    conf = _default_conf(tmp_path, AMC_ROOT=str(amc_root))
+    ctx = FakeContext(tmp_path, conf=conf, asset_dir=deepstream_templates_dir, non_interactive=True)
+    _amc_wrapper_present(ctx)
+    _cameras_file_set(ctx, tmp_path, enabled_ips=("10.0.0.1", "10.0.0.2"))
+
+    result = step4.Step4CalibOutputWiring().run(ctx)
+    assert result.status is StepStatus.COMPLETE
+
+
+def test_verify_surfaces_user_action_required_when_calibration_looks_incomplete(tmp_path, deepstream_templates_dir):
+    ctx, amc_root = _provisioned_ctx(tmp_path, deepstream_templates_dir)
+    installer_bin = ctx.install_dir / "bin" / step3.INSTALLER_BIN_NAME
+    installer_bin.parent.mkdir(parents=True, exist_ok=True)
+    installer_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    step = step4.Step4CalibOutputWiring()
+    assert step.run(ctx).status is StepStatus.COMPLETE
+
+    dest = step4.default_calibration_dir(ctx, "test-lab-01")
+    # Simulate a later, incomplete recalibration overwriting the directory
+    # (e.g. via the `ingest` subcommand) -- verify() must catch it too, not
+    # just run().
+    for entry in dest.iterdir():
+        if entry.is_file() and entry.name != ".ingest.log":
+            entry.unlink()
+
+    result = step.verify(ctx)
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert result.message == step4.INCOMPLETE_CALIBRATION_MESSAGE
 
 
 def test_run_is_idempotent_on_second_pass(tmp_path, deepstream_templates_dir):

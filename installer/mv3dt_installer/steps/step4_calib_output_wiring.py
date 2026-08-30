@@ -89,6 +89,7 @@ __all__ = [
     "ingest_export",
     "render_tracker_yaml",
     "render_app_config",
+    "INCOMPLETE_CALIBRATION_MESSAGE",
     "handle_ingest_subcommand",
     "Step4CalibOutputWiring",
 ]
@@ -388,6 +389,67 @@ def ingest_export(
         f.write(f"{stamp}  ingested from {export_dir}\n")
 
     return IngestOutcome(used_exporter=used_exporter, ingested=True, stamp=stamp)
+
+
+# ---------------------------------------------------------------------------
+# section 8.1 -- "poor calibration (bad RMSE)" incomplete-export detection
+# ---------------------------------------------------------------------------
+
+#: Exact wording from section 8.1's "Poor calibration (bad RMSE)" failure
+#: surface -- used verbatim as both the `StepResult.message` and the single
+#: `UserAction` text.
+INCOMPLETE_CALIBRATION_MESSAGE = (
+    "Re-run AMC Execute and re-export — the calibration looks incomplete / "
+    "RMSE was rejected on the Results screen."
+)
+
+#: Breadcrumb file this module itself writes (section 4.2 step 4) -- never a
+#: per-camera calibration file, so it must not count toward completeness.
+_IGNORED_CALIBRATION_FILENAMES = {".ingest.log"}
+
+
+def _calibration_file_count(dest: pathlib.Path) -> int:
+    """Count of per-camera calibration files ingested into `dest` (section
+    8.1's "e.g. fewer camInfo files than enabled cameras" check): every
+    regular file except the `.ingest.log` breadcrumb and a `.zip` archive
+    (already unpacked by `_unpack_zip_exports`, so it is packaging, not a
+    calibration file itself) -- counted recursively since section 2 treats
+    the export as "an opaque directory of calibration files" with no fixed
+    layout guaranteed."""
+    if not dest.is_dir():
+        return 0
+    count = 0
+    for entry in dest.rglob("*"):
+        if not entry.is_file():
+            continue
+        if entry.name in _IGNORED_CALIBRATION_FILENAMES or entry.suffix == ".zip":
+            continue
+        count += 1
+    return count
+
+
+def _enabled_camera_count(ctx: "Context") -> Optional[int]:
+    """Number of `enabled: true` entries in the `CAMERAS_FILE` inventory, or
+    `None` when it is unset/unreadable. `preflight()` already guarantees
+    `CAMERAS_FILE` is set and parses before `run()`/`verify()` ever reach
+    this point, but this stays defensive (returns "unknown", never raises)
+    rather than assume that invariant always holds."""
+    cameras_path = pathlib.Path(ctx.conf.get(config_mod.CAMERAS_FILE_KEY, ""))
+    if not cameras_path.is_file():
+        return None
+    try:
+        cams = cameras_mod.parse_inventory(cameras_path.read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    return sum(1 for cam in cams if cam.enabled)
+
+
+def _incomplete_calibration_result() -> StepResult:
+    return StepResult(
+        status=StepStatus.USER_ACTION_REQUIRED,
+        message=INCOMPLETE_CALIBRATION_MESSAGE,
+        user_actions=[UserAction(text=INCOMPLETE_CALIBRATION_MESSAGE)],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -753,6 +815,30 @@ class Step4CalibOutputWiring:
         else:
             ctx.report_installed("calibration-export", label)
 
+        enabled_count = _enabled_camera_count(ctx)
+        file_count = _calibration_file_count(dest)
+        if enabled_count is not None and file_count < enabled_count:
+            ctx.log.warn(
+                f"calibration export looks incomplete: {file_count} file(s) "
+                f"in {dest} for {enabled_count} enabled camera(s)"
+            )
+            return _incomplete_calibration_result()
+
+        # `first_success` gates (re-)installing the re-ingest units on
+        # `CALIBRATION_DIR` not yet being persisted -- i.e. this is the very
+        # first ingest that got this far. Known limitation: if the units
+        # land installed-but-not-enabled here because
+        # `<install_dir>/bin/mv3dt-installer` (STEP-3 section 6.1) has not
+        # been dropped yet, a later re-run never retries `enable_now` --
+        # `CALIBRATION_DIR` is persisted by then, so `first_success` is
+        # False on every subsequent run. `verify()`'s downgrade-to-warning
+        # (section 8 check 5) keeps that from failing loudly, but the path
+        # unit can end up permanently un-enabled. Accepted as-is because
+        # Step 3 always drops the binary before Step 4 runs in the normal
+        # dispatch order (doc 00 section 12.4's step ordering); revisit with
+        # an idempotent "always call enable_now, it already no-ops when the
+        # unit is missing/absent-binary" tweak if that ordering assumption
+        # ever stops holding.
         first_success = not bool(ctx.conf.get(CONF_CALIBRATION_DIR_KEY))
         config_mod.persist_value(ctx.install_dir, CONF_CALIBRATION_DIR_KEY, str(dest))
         ctx.conf[CONF_CALIBRATION_DIR_KEY] = str(dest)
@@ -780,6 +866,11 @@ class Step4CalibOutputWiring:
                 status=StepStatus.FAILED,
                 message=f"calibration dir {calibration_dir} is empty",
             )
+
+        enabled_count = _enabled_camera_count(ctx)
+        file_count = _calibration_file_count(calibration_dir)
+        if enabled_count is not None and file_count < enabled_count:
+            return _incomplete_calibration_result()
 
         deepstream_dir = ctx.install_dir / "deepstream"
         tracker_path = deepstream_dir / TRACKER_YAML_TEMPLATE_NAME
