@@ -32,19 +32,12 @@ Public API:
     Step2DeepStreamSdk -- the registered `Step` implementation
         (`id="step2_deepstream_sdk"`, `order=2`).
 
-Spec ambiguity this module resolves (documented here since doc 00 does not
-cover it): the `Step` protocol's `preflight/run/verify/report` methods take
-only `ctx` -- there is no `non_interactive` flag threaded through from
-`app.py`'s `--non-interactive` flag the way `onboarding.onboard(...)` and
-`config.load(...)` receive it explicitly. Doc section 4.2 point 6 requires
-Step 2 to skip prompting "under `--non-interactive`". Since `Context` (doc
-section 12.3) carries no such flag either, this module infers
-non-interactivity the same way `logs.py` infers colour support --
-`sys.stdin.isatty()` -- via the injectable `_is_interactive()` /
-`_prompt_input()` module functions below, rather than guessing at a
-`Context` field that does not exist. A future integration PR wiring
-`--ds-method` into `app.py` (doc section 4.1's other override input) is the
-natural place to thread a real flag through instead, if one is added later.
+Doc section 4.2 point 6 requires Step 2 to skip prompting "under
+`--non-interactive`". `Context` (doc section 12.3) now carries a real
+`non_interactive` field (threaded through from `app.py`'s `--non-interactive`
+flag via `build_context(..., non_interactive)`), so `_resolve_method(ctx)`
+below reads `ctx.non_interactive` directly rather than inferring it from
+`sys.stdin.isatty()`.
 """
 
 from __future__ import annotations
@@ -54,7 +47,6 @@ import pathlib
 import platform
 import re
 import shutil
-import sys
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Optional
@@ -158,18 +150,11 @@ CONF_HOST_PIPELINE_KEY = "ds_host_pipeline_required"
 
 
 # ---------------------------------------------------------------------------
-# Interactivity (see module docstring's "Spec ambiguity" note)
+# Interactivity
 # ---------------------------------------------------------------------------
 
 # Injectable so tests never touch the real stdin/tty or block on input().
 _INPUT: Callable[[str], str] = input
-
-
-def _is_interactive() -> bool:
-    try:
-        return bool(sys.stdin.isatty())
-    except Exception:
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +300,7 @@ def _resolve_method(ctx: "Context") -> tuple[Method, str]:
     method, reason = detect_method(ctx)
     if method is not None:
         return method, reason
-    if _is_interactive():
+    if not ctx.non_interactive:
         return _prompt_for_method(), "operator selection (ambiguous auto-detect)"
     return Method.DEB, "non-interactive default (ambiguous auto-detect)"
 

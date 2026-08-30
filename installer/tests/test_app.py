@@ -114,6 +114,7 @@ def _minimal_ctx(
     *,
     webapp_integration: str = "off",
     remote_supervision: str = "off",
+    non_interactive: bool = False,
 ):
     """A `Context` + `Config` pair for direct `_dispatch()` unit tests,
     never touching a real install dir or a real invoking user."""
@@ -128,7 +129,7 @@ def _minimal_ctx(
     user = InvokingUser(
         name="tester", home=tmp_path, uid=os.getuid(), gid=os.getgid()
     )
-    ctx = app.build_context(cfg, user)
+    ctx = app.build_context(cfg, user, non_interactive)
     return ctx, cfg
 
 
@@ -1026,3 +1027,201 @@ def test_scan_cameras_persists_cameras_file_pointer(tmp_path, monkeypatch):
     assert rc == 0
     conf_text = (install_dir / "installer.conf").read_text(encoding="utf-8")
     assert f"CAMERAS_FILE={install_dir / 'cameras.yml'}" in conf_text
+
+
+# ---------------------------------------------------------------------------
+# STEP-3 §6.2 -- generic subcommand dispatch extension
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _empty_subcommand_registry():
+    """Snapshot/restore `SUBCOMMAND_REGISTRY` so registry tests are
+    order-independent and never leak a fake handler into another test
+    module, exactly like `test_steps_protocol.py`'s `_empty_registry`
+    fixture does for `STEP_REGISTRY`."""
+    saved = dict(app.SUBCOMMAND_REGISTRY)
+    app.SUBCOMMAND_REGISTRY.clear()
+    yield
+    app.SUBCOMMAND_REGISTRY.clear()
+    app.SUBCOMMAND_REGISTRY.update(saved)
+
+
+def test_register_subcommand_adds_to_registry():
+    def _handler(argv, ctx):
+        return 0
+
+    app.register_subcommand("amc", _handler)
+    assert app.SUBCOMMAND_REGISTRY["amc"] is _handler
+
+
+def test_register_subcommand_overwrites_an_existing_name():
+    app.register_subcommand("amc", lambda argv, ctx: 1)
+    app.register_subcommand("amc", lambda argv, ctx: 2)
+    assert app.SUBCOMMAND_REGISTRY["amc"](None, None) == 2
+
+
+def test_main_dispatches_registered_subcommand_before_parse_args(
+    tmp_path, monkeypatch
+):
+    """A registered subcommand name as the first token must bypass the
+    framework's own `--status`/dispatch-loop flow entirely -- `_dispatch`
+    (and therefore the step loop) must never run."""
+    monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
+
+    def _boom_dispatch(sm, ctx, cfg):
+        raise AssertionError("a subcommand must never re-enter _dispatch()")
+
+    monkeypatch.setattr(app, "_dispatch", _boom_dispatch)
+
+    captured = {}
+
+    def _handler(argv, ctx):
+        captured["argv"] = argv
+        captured["ctx"] = ctx
+        return 7
+
+    app.register_subcommand("amc", _handler)
+
+    install_dir = tmp_path / "install"
+    rc = app.main(
+        [
+            "amc",
+            "--project",
+            "north-lobby",
+            "--skip-pull",
+            "--install-dir",
+            str(install_dir),
+            "--non-interactive",
+            "--log-dir",
+            str(tmp_path / "logs"),
+        ],
+        state_path=tmp_path / "state.json",
+    )
+
+    assert rc == 7
+    assert captured["argv"] == [
+        "--project",
+        "north-lobby",
+        "--skip-pull",
+        "--install-dir",
+        str(install_dir),
+        "--non-interactive",
+        "--log-dir",
+        str(tmp_path / "logs"),
+    ]
+    assert isinstance(captured["ctx"], app.Context)
+    assert captured["ctx"].install_dir == install_dir
+
+
+def test_main_subcommand_bootstrap_resolves_install_dir_and_non_interactive(
+    tmp_path, monkeypatch
+):
+    """The framework-owned `--install-dir`/`--non-interactive` flags a
+    subcommand's own argv may carry (mirroring a systemd `ExecStart=` line
+    for a later step's unit) must both reach the built `Context`, and the
+    full, unmodified argv must still reach the handler."""
+    monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
+
+    captured = {}
+
+    def _handler(argv, ctx):
+        captured["argv"] = argv
+        captured["ctx"] = ctx
+        return 0
+
+    app.register_subcommand("ingest", _handler)
+
+    install_dir = tmp_path / "custom-install"
+    rc = app.main(
+        [
+            "ingest",
+            "--project",
+            "north-lobby",
+            "--non-interactive",
+            "--install-dir",
+            str(install_dir),
+            "--log-dir",
+            str(tmp_path / "logs"),
+        ],
+        state_path=tmp_path / "state.json",
+    )
+
+    assert rc == 0
+    ctx = captured["ctx"]
+    assert ctx.install_dir == install_dir
+    assert ctx.non_interactive is True
+    # The handler still sees the framework-owned flags too -- argv is
+    # forwarded unmodified, not stripped.
+    assert captured["argv"] == [
+        "--project",
+        "north-lobby",
+        "--non-interactive",
+        "--install-dir",
+        str(install_dir),
+        "--log-dir",
+        str(tmp_path / "logs"),
+    ]
+
+
+def test_main_subcommand_requires_root(tmp_path, monkeypatch):
+    """A subcommand still needs root -- it touches docker, package state,
+    and root-owned install-dir paths (STEP-3 §3-§4), same as the install
+    flow."""
+    called = {"count": 0}
+
+    def _require_root():
+        called["count"] += 1
+        raise SystemExit(2)
+
+    monkeypatch.setattr(app.privilege, "require_root", _require_root)
+    app.register_subcommand("amc", lambda argv, ctx: 0)
+
+    with pytest.raises(SystemExit):
+        app.main(["amc"], state_path=tmp_path / "state.json")
+
+    assert called["count"] == 1
+
+
+def test_main_unregistered_first_token_falls_through_to_normal_parsing(tmp_path):
+    """A first token that is not a registered subcommand name must fall
+    through to the ordinary `parse_args()`/dispatch flow -- and since
+    nothing here is a real flag, argparse rejects it exactly as it always
+    has, proving the peek never swallows a plain invocation error."""
+    with pytest.raises(SystemExit):
+        app.main(["not-a-subcommand"], state_path=tmp_path / "state.json")
+
+
+def test_main_subcommand_dispatch_does_not_run_onboarding_or_reboot_reconcile(
+    tmp_path, monkeypatch
+):
+    """Doc 00 §3.2's onboarding/reboot-reconcile steps are install-flow
+    specific (this unit's own scope note); a standalone subcommand must
+    skip both."""
+    monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+    _bypass_onboarding(monkeypatch, tmp_path)
+
+    def _boom_onboard(*args, **kwargs):
+        raise AssertionError("a subcommand must never run onboarding.onboard()")
+
+    def _boom_reconcile(*args, **kwargs):
+        raise AssertionError("a subcommand must never run reboot.reconcile()")
+
+    monkeypatch.setattr(app.onboarding, "onboard", _boom_onboard)
+    monkeypatch.setattr(app.reboot_mod, "reconcile", _boom_reconcile)
+
+    app.register_subcommand("amc", lambda argv, ctx: 0)
+    rc = app.main(
+        [
+            "amc",
+            "--install-dir",
+            str(tmp_path / "install"),
+            "--non-interactive",
+            "--log-dir",
+            str(tmp_path / "logs"),
+        ],
+        state_path=tmp_path / "state.json",
+    )
+    assert rc == 0

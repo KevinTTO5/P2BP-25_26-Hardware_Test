@@ -768,45 +768,6 @@ def test_mosquitto_omits_non_interactive_flag_when_interactive(tmp_path, monkeyp
 
 
 # ---------------------------------------------------------------------------
-# _is_non_interactive fallback behavior
-# ---------------------------------------------------------------------------
-
-
-def test_is_non_interactive_prefers_explicit_ctx_attribute(tmp_path):
-    ctx, _ = _make_ctx(tmp_path)
-    ctx.non_interactive = False
-    assert s1._is_non_interactive(ctx) is False
-    ctx.non_interactive = True
-    assert s1._is_non_interactive(ctx) is True
-
-
-def test_is_non_interactive_falls_back_to_argv_when_unset(tmp_path, monkeypatch):
-    """Not a tty-detection fallback: `not sys.stdin.isatty()` silently drops
-    `--non-interactive` forwarding whenever a tty happens to be attached to
-    an otherwise-unattended run. `sys.argv` has no such false negative."""
-    ctx, _ = _make_ctx(tmp_path)
-    ctx.non_interactive = None
-
-    monkeypatch.setattr(sys, "argv", ["mv3dt-installer"])
-    assert s1._is_non_interactive(ctx) is False
-
-    monkeypatch.setattr(sys, "argv", ["mv3dt-installer", "--non-interactive"])
-    assert s1._is_non_interactive(ctx) is True
-
-
-def test_is_non_interactive_argv_fallback_ignores_stdin_tty_state(tmp_path, monkeypatch):
-    """Regression for the rejected tty-detection fallback: a real tty
-    attached to stdin must not suppress `--non-interactive` forwarding when
-    that flag was actually passed on the command line."""
-    ctx, _ = _make_ctx(tmp_path)
-    ctx.non_interactive = None
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
-
-    monkeypatch.setattr(sys, "argv", ["mv3dt-installer", "--non-interactive"])
-    assert s1._is_non_interactive(ctx) is True
-
-
-# ---------------------------------------------------------------------------
 # Bundled asset presence
 # ---------------------------------------------------------------------------
 

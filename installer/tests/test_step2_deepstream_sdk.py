@@ -124,7 +124,16 @@ class FakeNgc:
 
 
 class FakeContext:
-    def __init__(self, tmp_path, *, conf=None, ngc=None, runner_root=None, runner_user=None):
+    def __init__(
+        self,
+        tmp_path,
+        *,
+        conf=None,
+        ngc=None,
+        runner_root=None,
+        runner_user=None,
+        non_interactive=True,
+    ):
         self.install_dir = tmp_path / "mv3dt"
         self.install_dir.mkdir(parents=True, exist_ok=True)
         self.conf = conf if conf is not None else {}
@@ -136,6 +145,7 @@ class FakeContext:
         self.ngc = ngc if ngc is not None else FakeNgc()
         self.runner_root = runner_root if runner_root is not None else ScriptedRunner()
         self.runner_user = runner_user if runner_user is not None else ScriptedRunner()
+        self.non_interactive = non_interactive
 
     def run_root(self, *args, **kwargs):
         return self.runner_root(*args, **kwargs)
@@ -266,7 +276,7 @@ def test_detect_method_ambiguous_when_host_not_required_and_docker_unusable(tmp_
 # ---------------------------------------------------------------------------
 
 
-def _ambiguous_ctx(tmp_path) -> FakeContext:
+def _ambiguous_ctx(tmp_path, *, non_interactive: bool = True) -> FakeContext:
     runner_root = ScriptedRunner(default_returncode=1)
     runner_user = ScriptedRunner(default_returncode=1)
     return FakeContext(
@@ -274,21 +284,20 @@ def _ambiguous_ctx(tmp_path) -> FakeContext:
         conf={"ds_host_pipeline_required": "false"},
         runner_root=runner_root,
         runner_user=runner_user,
+        non_interactive=non_interactive,
     )
 
 
-def test_resolve_method_non_interactive_ambiguous_defaults_to_deb(tmp_path, monkeypatch):
-    monkeypatch.setattr(step2, "_is_interactive", lambda: False)
-    ctx = _ambiguous_ctx(tmp_path)
+def test_resolve_method_non_interactive_ambiguous_defaults_to_deb(tmp_path):
+    ctx = _ambiguous_ctx(tmp_path, non_interactive=True)
     method, reason = step2._resolve_method(ctx)
     assert method is step2.Method.DEB
     assert "non-interactive default" in reason
 
 
 def test_resolve_method_interactive_ambiguous_prompts_and_honors_answer(tmp_path, monkeypatch):
-    monkeypatch.setattr(step2, "_is_interactive", lambda: True)
     monkeypatch.setattr(step2, "_INPUT", lambda _prompt: "tar")
-    ctx = _ambiguous_ctx(tmp_path)
+    ctx = _ambiguous_ctx(tmp_path, non_interactive=False)
     method, reason = step2._resolve_method(ctx)
     assert method is step2.Method.TAR
     assert "operator selection" in reason

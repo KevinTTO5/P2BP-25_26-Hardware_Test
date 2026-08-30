@@ -61,6 +61,7 @@ import argparse
 import contextlib
 import pathlib
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -92,6 +93,8 @@ __all__ = [
     "WebappHandle",
     "RebootHandle",
     "build_context",
+    "SUBCOMMAND_REGISTRY",
+    "register_subcommand",
     "main",
 ]
 
@@ -305,6 +308,7 @@ class Context:
     webapp: WebappHandle
     asset_path: Callable[..., pathlib.Path]
     reboot: RebootHandle
+    non_interactive: bool
 
     def run_as_user(self, *args: str, **kwargs: Any) -> subprocess.CompletedProcess:
         """Doc 00 §9.2: anything that must run "as the user" (the `ngc`
@@ -322,9 +326,18 @@ class Context:
         return subprocess.run(args, **kwargs)
 
 
-def build_context(cfg: config_mod.Config, user: InvokingUser) -> Context:
+def build_context(
+    cfg: config_mod.Config, user: InvokingUser, non_interactive: bool
+) -> Context:
     """Assemble the `Context` a dispatched step's lifecycle methods receive
-    (doc 00 §12.3), bound to the resolved `Config` and invoking user."""
+    (doc 00 §12.3), bound to the resolved `Config` and invoking user.
+
+    `non_interactive` mirrors the `--non-interactive` flag (doc 00 §3.3)
+    straight onto the `Context`, so a step's `preflight/run/verify` methods
+    can branch on it directly instead of guessing from `sys.argv` or
+    `sys.stdin.isatty()` -- both workarounds Step 1 and Step 2 used before
+    this field existed.
+    """
     return Context(
         install_dir=cfg.install_dir,
         conf=cfg.values,
@@ -339,7 +352,133 @@ def build_context(cfg: config_mod.Config, user: InvokingUser) -> Context:
         ),
         asset_path=shellout.asset_path,
         reboot=RebootHandle(),
+        non_interactive=non_interactive,
     )
+
+
+# ---------------------------------------------------------------------------
+# STEP-3 §6.2 -- generic subcommand dispatch extension
+# ---------------------------------------------------------------------------
+#
+# STEP-3-AMC-LAUNCHER.md §6.2 flags a "small framework CLI dispatch
+# extension owned by DevA": `mv3dt-installer amc [...]` must bypass the
+# `--status`/dispatch-loop flow entirely and call Step 3's launcher
+# directly, so it also runs standalone, long after install (not only as
+# part of a resumable install run). STEP-5's per-project exes reuse it
+# (doc 00 §12.4: "Step 5 ... reuses the `amc` exe"), and STEP-4/6's own
+# docs describe a `mv3dt-installer ingest ...` / `... pipeline ...` /
+# `... agent ...` invocation on the same shape (e.g. the `ingest` line
+# baked into `systemd.render_ingest_units`'s rendered `ExecStart=`). This
+# registry is built generically enough that each of those steps only needs
+# to call `register_subcommand(name, handler)` at import time -- mirroring
+# `steps.register()` -- without any further change to this module.
+
+#: A subcommand handler receives the remaining argv (everything after the
+#: subcommand name itself) and a real, bootstrapped `Context` (built by
+#: `_bootstrap_subcommand_context`, below); it returns the process exit
+#: code, exactly like `main()` itself.
+SubcommandHandler = Callable[[list, Context], int]
+
+#: Populated at import time by each owning step module (`step3_amc_launcher
+#: .register_subcommand("amc", ...)`), the same "import side effect"
+#: pattern `steps.STEP_REGISTRY` uses. Empty until that module is actually
+#: imported -- see `register_subcommand`'s docstring for the pre-existing
+#: gap this shares with `STEP_REGISTRY`.
+SUBCOMMAND_REGISTRY: dict[str, SubcommandHandler] = {}
+
+
+def register_subcommand(name: str, handler: SubcommandHandler) -> None:
+    """Register a top-level subcommand (STEP-3 §6.2).
+
+    Call this once at module scope in the owning step module, mirroring
+    `steps.register()`'s calling convention:
+
+        from mv3dt_installer import app
+
+        def _handle_amc(argv: list[str], ctx: "app.Context") -> int:
+            ...
+
+        app.register_subcommand("amc", _handle_amc)
+
+    Note the asymmetry with `steps.register()`: that registry is populated
+    by importing `steps/__init__.py`'s own package, which is not the case
+    here -- nothing today imports `step3_amc_launcher` (or any other step
+    module) as a side effect of importing `app`, so `SUBCOMMAND_REGISTRY`
+    stays empty in a process that never explicitly imports a step module.
+    `__main__.py` gains that import once Step 3 (and later steps) actually
+    exist as importable modules; wiring that up is a pre-existing gap
+    shared with `STEP_REGISTRY` (see that registry's own docstring) and is
+    out of scope for this extension point itself.
+    """
+    SUBCOMMAND_REGISTRY[name] = handler
+
+
+def _bootstrap_subcommand_context(
+    argv: list, *, state_path: Optional[pathlib.Path] = None
+) -> Context:
+    """Bootstrap the subset of `main()`'s startup sequence a standalone
+    subcommand needs, without re-entering `_dispatch()` (STEP-3 §6.2).
+
+    **Reused** from `main()`'s own ordering (module docstring, steps
+    1/2/4/7/... above):
+
+    - `privilege.require_root()` -- a subcommand still touches docker,
+      root-owned package state, and files under the install root (STEP-3
+      §3-§4), so it needs the same privilege the install flow does.
+    - `onboarding.run_platform_preflight()` -- the same Ubuntu 24.04 /
+      x86_64 + real-`$SUDO_USER` gate `main()` applies, and the source of
+      the `InvokingUser` a subcommand's `ctx.run_as_user(...)` calls need
+      (doc 00 §9.2). Cheap, and a subcommand run standalone long after
+      install deserves the same guarantee every other root-owned artifact
+      relies on.
+    - `config.load(...)` -- the only way to get a real `install_dir` /
+      `Config` to build a `Context` from.
+    - `logs.open_transcript(...)` -- doc 00 §8.2's auditable-record
+      contract applies just as much to a subcommand's docker/clone/compose
+      calls as to anything a step does during install.
+
+    **Deliberately NOT reused** (both are install-flow-specific, per this
+    unit's own scope note -- see this function's call site in `main()`):
+
+    - `onboarding.onboard(...)` -- first-run credential capture. A
+      subcommand only ever runs after Step 2's onboarding already
+      completed; re-entering it would risk a stray prompt in what is
+      supposed to be a quick, scriptable re-launch.
+    - `reboot.reconcile(...)` -- there is no install-time reboot marker for
+      a standalone subcommand to confirm; `state.json`'s `reboot_pending`
+      field is a step-dispatch-loop concern this bypass has no business
+      touching.
+
+    A small, permissive parser (`parse_known_args`, so it never errors on a
+    subcommand's own flags) plucks exactly the framework-owned flags this
+    bootstrap itself needs -- `--install-dir`, `--non-interactive`,
+    `--log-dir` -- out of `argv` without consuming or otherwise altering
+    it: the unmodified `argv` is still exactly what the subcommand handler
+    receives. This is what lets a systemd `ExecStart=` line for a later
+    step's unit (e.g. an `ingest` invocation baked with `--non-interactive
+    --install-dir <install_dir>`, doc 00's `render_ingest_units` example)
+    resolve the right `install_dir` for its `Context` while the handler
+    itself still sees -- and can independently parse -- those same flags.
+    """
+    peek = argparse.ArgumentParser(add_help=False)
+    peek.add_argument("--install-dir", default=None)
+    peek.add_argument("--non-interactive", action="store_true")
+    peek.add_argument("--log-dir", default=None)
+    known, _unused = peek.parse_known_args(argv)
+
+    privilege.require_root()
+    user = onboarding.run_platform_preflight()
+
+    sm_path = state_path if state_path is not None else CANONICAL_STATE_PATH
+    sm = StateMachine(path=sm_path)
+    cfg = config_mod.load(
+        known.install_dir, sm, non_interactive=known.non_interactive
+    )
+
+    log_dir = pathlib.Path(known.log_dir) if known.log_dir else None
+    open_transcript(log_dir)
+
+    return build_context(cfg, user, known.non_interactive)
 
 
 # ---------------------------------------------------------------------------
@@ -671,7 +810,20 @@ def main(
     writes, so an operator (or an unattended health check) can inspect
     installer progress without `sudo`. Every other flag runs after the root
     check, per doc 00 §9.1.
+
+    A registered subcommand (STEP-3 §6.2 -- `amc`, and later `ingest`/
+    `pipeline`/`agent`) is an even earlier exception than `--status`: it is
+    peeked for and dispatched before `parse_args()` even runs, since the
+    framework's own `argparse.ArgumentParser` (`build_parser()`) knows
+    nothing about subcommand names or their flags and would reject them.
     """
+    effective_argv = argv if argv is not None else sys.argv[1:]
+    if effective_argv and effective_argv[0] in SUBCOMMAND_REGISTRY:
+        name, rest = effective_argv[0], effective_argv[1:]
+        handler = SUBCOMMAND_REGISTRY[name]
+        ctx = _bootstrap_subcommand_context(rest, state_path=state_path)
+        return handler(rest, ctx)
+
     args = parse_args(argv)
 
     sm_path = state_path if state_path is not None else CANONICAL_STATE_PATH
@@ -722,5 +874,5 @@ def main(
         privilege.show_reboot_required(title)
         return 0
 
-    ctx = build_context(cfg, user)
+    ctx = build_context(cfg, user, args.non_interactive)
     return _dispatch(sm, ctx, cfg)

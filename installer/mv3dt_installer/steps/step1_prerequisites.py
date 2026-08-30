@@ -58,7 +58,6 @@ from __future__ import annotations
 import hashlib
 import pathlib
 import re
-import sys
 from typing import TYPE_CHECKING, Sequence
 
 from mv3dt_installer import shellout
@@ -302,25 +301,6 @@ def _nouveau_loaded(ctx: "Context") -> bool:
 
 def _driver_run_path(ctx: "Context") -> pathlib.Path:
     return pathlib.Path(ctx.install_dir) / "downloads" / "nvidia" / DRIVER_RUN_FILENAME
-
-
-def _is_non_interactive(ctx: "Context") -> bool:
-    """STEP-1 section 3.2 requires forwarding `--non-interactive` to the
-    bundled mosquitto script under an unattended run, or the script's own
-    `read` blocks forever on a TTY that will never answer it. `Context`
-    (doc 00 section 12.3) carries no `non_interactive` field today, so this
-    prefers one if a caller sets it (duck-typed, forward compatible) and
-    otherwise falls back to checking `sys.argv` directly for the flag the
-    operator actually passed to the installer. A tty-detection fallback
-    (`not sys.stdin.isatty()`) was tried first but rejected: it silently
-    drops `--non-interactive` forwarding whenever a tty happens to be
-    attached to an otherwise-unattended run, risking the exact hang this
-    forwarding exists to prevent. `sys.argv` has no such false negative.
-    """
-    value = getattr(ctx, "non_interactive", None)
-    if value is not None:
-        return bool(value)
-    return "--non-interactive" in sys.argv
 
 
 def _mosquitto_dst_path() -> pathlib.Path:
@@ -749,7 +729,7 @@ class Step1Prerequisites:
         before_hash = _sha256_file(dst_path)
         bundled_hash = _sha256_file(ctx.asset_path("mosquitto", "mv3dt.conf"))
 
-        args = ["--non-interactive"] if _is_non_interactive(ctx) else []
+        args = ["--non-interactive"] if ctx.non_interactive else []
         result = shellout.run_bundled_script(
             "scripts",
             "10_setup_mosquitto.sh",
