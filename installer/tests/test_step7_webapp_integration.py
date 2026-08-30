@@ -594,6 +594,100 @@ class TestCooldownStateMachine:
         assert state["f.jsonl"]["last_failed_at"] is None
         assert state["f.jsonl"]["uploaded_at"] == 1000.0
 
+    def test_repeated_failure_with_unchanged_fingerprint_still_retries(self):
+        """Regression test (PR #48 review): `record_upload_failure` stamps
+        the file's current size/mtime into the record, same as a success
+        does. If `decide_upload` checked the fingerprint before the
+        failure/cooldown state, an unchanged-on-disk file would compare
+        equal to its own just-recorded failure fingerprint and read as
+        SKIP_UNCHANGED forever -- failed_attempts would never advance past
+        1 and cooldown would never be reached. A file with
+        0 < failed_attempts < max_attempts must retry on every scan
+        regardless of the fingerprint.
+        """
+        max_attempts = 5
+        cooldown_seconds = 1800.0
+        size, mtime = 100.0, 1000.0  # never changes on disk for this test
+        state: dict = {}
+        now = 1000.0
+
+        # Attempts 1..max_attempts: every scan must still see UPLOAD, not
+        # SKIP_UNCHANGED, even though size/mtime on disk never change and
+        # the previous failure recorded that exact same fingerprint.
+        for attempt in range(1, max_attempts + 1):
+            record = s7.UploadRecord.from_dict(state["f.jsonl"]) if "f.jsonl" in state else None
+            decision, _ = s7.decide_upload(
+                record,
+                current_size=size,
+                current_mtime=mtime,
+                now=now,
+                max_attempts=max_attempts,
+                cooldown_seconds=cooldown_seconds,
+            )
+            assert decision is s7.UploadDecision.UPLOAD, f"attempt {attempt} should retry"
+            s7.record_upload_failure(state, "f.jsonl", size=size, mtime=mtime, now=now)
+            assert state["f.jsonl"]["failed_attempts"] == attempt
+            now += 60.0  # next scan, well within the cooldown window
+
+        # failed_attempts now == max_attempts: the next scan must enter
+        # cooldown and be skipped, not silently retried forever.
+        record = s7.UploadRecord.from_dict(state["f.jsonl"])
+        last_failed_at = state["f.jsonl"]["last_failed_at"]
+        decision, _ = s7.decide_upload(
+            record,
+            current_size=size,
+            current_mtime=mtime,
+            now=now,
+            max_attempts=max_attempts,
+            cooldown_seconds=cooldown_seconds,
+        )
+        assert decision is s7.UploadDecision.SKIP_COOLDOWN
+
+        # Still within cooldown a while later -- still skipped. Anchored off
+        # last_failed_at (not accumulated `now`) so this stays inside the
+        # cooldown window regardless of how much time the attempt loop above
+        # already consumed.
+        now = last_failed_at + cooldown_seconds - 1.0
+        decision, _ = s7.decide_upload(
+            record,
+            current_size=size,
+            current_mtime=mtime,
+            now=now,
+            max_attempts=max_attempts,
+            cooldown_seconds=cooldown_seconds,
+        )
+        assert decision is s7.UploadDecision.SKIP_COOLDOWN
+
+        # Cooldown elapses -- retried again, unconditionally.
+        now = last_failed_at + cooldown_seconds + 2.0
+        decision, _ = s7.decide_upload(
+            record,
+            current_size=size,
+            current_mtime=mtime,
+            now=now,
+            max_attempts=max_attempts,
+            cooldown_seconds=cooldown_seconds,
+        )
+        assert decision is s7.UploadDecision.UPLOAD
+
+        # This time it succeeds -- counter resets to zero.
+        s7.record_upload_success(state, "f.jsonl", size=size, mtime=mtime, now=now)
+        assert state["f.jsonl"]["failed_attempts"] == 0
+        assert state["f.jsonl"]["last_failed_at"] is None
+
+        # And the fingerprint-unchanged check is back in force: an
+        # unchanged file after a *successful* upload is skipped.
+        record = s7.UploadRecord.from_dict(state["f.jsonl"])
+        decision, _ = s7.decide_upload(
+            record,
+            current_size=size,
+            current_mtime=mtime,
+            now=now + 60.0,
+            max_attempts=max_attempts,
+            cooldown_seconds=cooldown_seconds,
+        )
+        assert decision is s7.UploadDecision.SKIP_UNCHANGED
+
     def test_record_upload_failure_increments_counter(self):
         state = {}
         s7.record_upload_failure(state, "f.jsonl", size=1.0, mtime=1.0, now=100.0)

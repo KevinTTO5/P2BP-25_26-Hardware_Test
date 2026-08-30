@@ -835,11 +835,24 @@ def decide_upload(
     lacking size/mtime is filled in from the current file and skipped this
     cycle, never re-uploaded).
 
-    Once `failed_attempts >= max_attempts` the file is in cooldown (section
-    E.3) until `cooldown_seconds` since `last_failed_at` elapse, at which
-    point it is retried unconditionally (this is the mechanism that makes a
-    permanently-bad, unchanging file retry on a schedule rather than never
-    again).
+    **Failure/cooldown state is checked before the fingerprint comparison,
+    not after it (section E.3).** `record_upload_failure` stamps the
+    file's current size/mtime into the record at the moment of failure, so
+    if the fingerprint check ran first, an unchanged file would compare
+    equal to its own just-recorded failure fingerprint and read as
+    `SKIP_UNCHANGED` forever -- `failed_attempts` would never advance past
+    1 and the cooldown branch below would never be reached. The fingerprint
+    check exists to decide "does this look like a different file than the
+    one we last *successfully* processed"; a failed attempt must not be
+    able to satisfy that question in the negative. So: while
+    `failed_attempts` is between 1 and `max_attempts - 1`, the file is
+    retried unconditionally on every scan (this is what makes "attempted 5
+    times" a real cadence rather than "attempted once"). Once
+    `failed_attempts >= max_attempts` the file enters cooldown until
+    `cooldown_seconds` since `last_failed_at` elapse, at which point it is
+    also retried unconditionally; a success anywhere in this path resets
+    the counter to zero (`record_upload_success`), which is what lets a
+    since-fixed file's fingerprint comparisons resume mattering again.
 
     Returns `(UploadDecision, UploadRecord | None)` -- the second element is
     a hydrated record for `SKIP_LEGACY_HYDRATE`, else the record unchanged
@@ -862,11 +875,13 @@ def decide_upload(
         )
         return UploadDecision.SKIP_LEGACY_HYDRATE, hydrated
 
-    if record.failed_attempts >= max_attempts:
-        last_failed = record.last_failed_at or 0.0
-        if now - last_failed < cooldown_seconds:
-            return UploadDecision.SKIP_COOLDOWN, record
-        return UploadDecision.UPLOAD, record
+    if record.failed_attempts > 0:
+        if record.failed_attempts >= max_attempts:
+            last_failed = record.last_failed_at or 0.0
+            if now - last_failed < cooldown_seconds:
+                return UploadDecision.SKIP_COOLDOWN, record
+            return UploadDecision.UPLOAD, record  # cooldown elapsed -> retry unconditionally
+        return UploadDecision.UPLOAD, record  # still under max_attempts -> keep retrying
 
     changed = current_size != record.size or current_mtime > record.mtime + _MTIME_EPSILON
     if changed:
