@@ -43,15 +43,23 @@ call -- `upsert`/`get`/`list_projects` (section 4.3), `write_pipeline_wrapper`
 --list/--reconcile/--remove`) so the reconciliation and listing
 requirements are met even before a later unit wires the `amc` menu itself.
 
-**Step 6 handoff note (STEP-6 doc section A.2).** The default `pipeline`
-runtime behavior (ensure mosquitto, ping-sweep, source the DeepStream env,
-`exec deepstream-app -c <config>`) lives entirely in
-`_start_pipeline_foreground`, a function separate from the subcommand's
-argument parsing and dispatch (`handle_pipeline_subcommand`). A later unit
-that adds 24/7 systemd supervision changes what the default `start` action
-does (`systemctl start mv3dt-pipeline@<slug>` behind new `--service-exec`/
-`--foreground` modes) without needing to touch argument parsing or
-`--stop`/`--stop-all`'s own separate `_stop_pipeline` function.
+**Step 6 handoff (STEP-6 doc section A.2 -- IMPLEMENTED, not out of scope).**
+Systemd supervision of the per-project pipeline is no longer future work:
+`step6_remote_supervision.py` supervises exactly what this module registers,
+via the templated `mv3dt-pipeline@<slug>.service` instance unit. The default
+`pipeline` runtime behavior (ensure mosquitto, ping-sweep, source the
+DeepStream env, `exec deepstream-app -c <config>`) still lives entirely in
+`_start_pipeline_foreground`, a function kept separate from the subcommand's
+argument parsing and dispatch (`handle_pipeline_subcommand`) so it could be
+swapped without touching argument parsing. `handle_pipeline_subcommand` now
+branches at runtime (`_supervision_active`, below) between three bodies:
+`_start_pipeline_foreground`/`_stop_pipeline` (unsupervised -- what every
+workstation that never opted into Step 6 keeps getting, unchanged),
+`systemctl start/stop mv3dt-pipeline@<slug>` (supervised -- the new default
+once Step 6 is COMPLETE and active), and `_start_pipeline_service_exec`
+(`--service-exec`, what the unit's own `ExecStart=` invokes). `--foreground`
+is the retained debugging escape hatch that always takes the unsupervised
+path regardless of Step 6's state.
 
 Every subprocess call goes through `ctx.run_root`/`ctx.run_as_user` (doc 00
 section 9.2), so no test here shells out to a real systemctl/ping/docker or
@@ -75,7 +83,9 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from mv3dt_installer import app as app_mod
 from mv3dt_installer import cameras as cameras_mod
+from mv3dt_installer import config as config_mod
 from mv3dt_installer import shellout
+from mv3dt_installer import systemd as systemd_mod
 from mv3dt_installer.state import write_json_atomic
 from mv3dt_installer.steps import StepResult, StepStatus, UserAction, register
 from mv3dt_installer.steps import step3_amc_launcher as step3_mod
@@ -93,6 +103,7 @@ __all__ = [
     "resolve_slug",
     "upsert",
     "get",
+    "get_by_slug",
     "list_projects",
     "remove_registry_entry",
     "resolve_rendered_config",
@@ -108,6 +119,7 @@ __all__ = [
     "amc_project_dir",
     "reconcile_registry",
     "remove_project_artifacts",
+    "register_removal_hook",
     "handle_pipeline_subcommand",
     "handle_projects_subcommand",
     "handle_record_subcommand",
@@ -378,6 +390,17 @@ def upsert(
 
 def get(install_dir: pathlib.Path, project_name: str) -> Optional[ProjectEntry]:
     return load_registry(install_dir).projects.get(project_name)
+
+
+def get_by_slug(install_dir: pathlib.Path, slug: str) -> Optional[ProjectEntry]:
+    """Slug-keyed lookup (STEP-6 doc section A.1): the registry itself is
+    keyed by `PROJECT_NAME`, but `mv3dt-pipeline@<slug>.service`'s `%i` only
+    ever carries the slug, so `--project-slug` (the flag the unit's own
+    `ExecStart=`/`ExecStop=` pass) needs this instead of `get()`."""
+    for entry in load_registry(install_dir).projects.values():
+        if entry.slug == slug:
+            return entry
+    return None
 
 
 def list_projects(install_dir: pathlib.Path) -> list[ProjectEntry]:
@@ -723,8 +746,47 @@ def render_validation_banner(entry: ProjectEntry, *, topic_base: str = "mv3dt") 
 
 
 # ---------------------------------------------------------------------------
-# section 3.3 -- the internal "what to run" routine (Step 6 will later gate
-# this behind --service-exec; see module docstring)
+# STEP-6 doc section A.2 -- is Step 6 actually supervising this project?
+# ---------------------------------------------------------------------------
+
+
+def _pipeline_unit_name(slug: str) -> str:
+    return f"mv3dt-pipeline@{slug}.service"
+
+
+def _supervision_active(ctx: "Context", slug: str) -> bool:
+    """Whether `handle_pipeline_subcommand` should hand `start`/`stop` off
+    to systemd (STEP-6 doc section A.2) instead of running the unsupervised
+    foreground/pkill path it always used before Step 6 existed.
+
+    Two real runtime checks, both required -- this is deliberately not a
+    hardcoded "Step 6 exists so always supervise" assumption:
+
+    1. The operator actually opted in (`MV3DT_REMOTE_SUPERVISION` != "off",
+       config.py's already-resolved gate, doc 00 section 3.4). A workstation
+       that never touched the gate keeps behaving exactly as it did before
+       this unit -- the default is "off", so an absent/missing key also
+       means unsupervised.
+    2. Step 6 has actually installed and enabled the templated instance unit
+       for *this* project. The gate can be flipped on before Step 6's own
+       `run()` has ever executed (or before this particular project existed
+       when it did), in which case `systemctl start mv3dt-pipeline@<slug>`
+       would simply fail against a unit that was never enabled -- so this
+       probes the live unit via `systemd.is_enabled` (through the same
+       injected `ctx.run_root` every other systemctl call in this module
+       uses) rather than trusting the gate alone.
+    """
+    gate = ctx.conf.get(config_mod.GATE_REMOTE_SUPERVISION, "off")
+    if not gate or gate == "off":
+        return False
+    return systemd_mod.is_enabled(
+        _pipeline_unit_name(slug),
+        runner=lambda argv, **kwargs: ctx.run_root(*argv, **kwargs),
+    )
+
+
+# ---------------------------------------------------------------------------
+# section 3.3 -- the internal "what to run" routine
 # ---------------------------------------------------------------------------
 
 
@@ -787,6 +849,66 @@ def _start_pipeline_foreground(
     return 0  # pragma: no cover -- execv never returns on success
 
 
+def _start_pipeline_service_exec(
+    ctx: "Context",
+    entry: ProjectEntry,
+    *,
+    config_override: Optional[str] = None,
+    dry_run: bool = False,
+    execv: Callable[[str, list], None] = os.execv,
+) -> int:
+    """STEP-6 doc section A.1's `ExecStart=` body (`--service-exec`): the
+    same ensure-mosquitto -> source-env -> exec deepstream-app steps as
+    `_start_pipeline_foreground`, minus the operator-facing ping-sweep and
+    validation banner -- this runs non-interactively inside
+    `mv3dt-pipeline@<slug>.service`, logging to journald rather than a TTY
+    (doc section A.1's notes: "no ping-sweep gating, no validation-helper
+    banner ... those are for the operator's foreground TTY"). Operators
+    never invoke this mode directly; only the unit's own `ExecStart=` does.
+    """
+    config_path = pathlib.Path(config_override) if config_override else pathlib.Path(entry.rendered_config)
+    if not config_path.is_file():
+        ctx.log.error(f"rendered config not found: {config_path}")
+        return 1
+
+    ensure_mosquitto(ctx)
+    env_overlay = source_deepstream_env(ctx)
+
+    argv = ["deepstream-app", "-c", str(config_path)]
+    if dry_run:
+        ctx.log.info(f"[dry-run] cd {config_path.parent} && {' '.join(argv)}")
+        return 0
+
+    os.chdir(config_path.parent)
+    child_env = {**os.environ, **env_overlay}
+    binary = shutil.which(argv[0], path=child_env.get("PATH")) or argv[0]
+    try:
+        execv(binary, argv)
+    except OSError as exc:
+        ctx.log.error(f"failed to exec deepstream-app: {exc}")
+        return 1
+    return 0  # pragma: no cover -- execv never returns on success
+
+
+def _start_pipeline_supervised(
+    ctx: "Context", entry: ProjectEntry, *, dry_run: bool = False
+) -> int:
+    """STEP-6 doc section A.2's new `start` default once Step 6 is active:
+    `systemctl start mv3dt-pipeline@<slug>` via `ctx.run_root`, instead of
+    execing `deepstream-app` in the operator's own shell."""
+    unit = _pipeline_unit_name(entry.slug)
+    if dry_run:
+        ctx.log.info(f"[dry-run] systemctl start {unit}")
+        return 0
+
+    result = ctx.run_root("systemctl", "start", unit, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        ctx.log.error(f"systemctl start {unit} failed (exit {result.returncode})")
+        return result.returncode
+    ctx.log.info(f"Started {unit} (supervised by systemd; runs 24/7 and survives reboot).")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # section 3.4 -- stopping the pipeline
 # ---------------------------------------------------------------------------
@@ -812,6 +934,7 @@ def _stop_pipeline(
     sleep: Callable[[float], None] = time.sleep,
     grace_polls: int = _STOP_GRACE_POLLS,
     grace_interval_s: float = _STOP_GRACE_INTERVAL_S,
+    use_systemctl: bool = False,
 ) -> int:
     """Port of `99_stop_all.sh` (section 3.4). `--stop` (the default) only
     stops `deepstream-app`; `--stop-all` additionally tears down the AMC
@@ -824,13 +947,25 @@ def _stop_pipeline(
     process is still alive and escalating to SIGKILL. `sleep`/`grace_polls`/
     `grace_interval_s` are injectable so a test can exercise the timing
     without a real wait.
+
+    `use_systemctl` (STEP-6 doc section A.2, set by `handle_pipeline_subcommand`
+    only when `_supervision_active` says so) swaps just the deepstream-stopping
+    step for `systemctl stop mv3dt-pipeline@<slug>` -- the unit's own
+    `KillSignal=SIGTERM` + `TimeoutStopSec=10` then reproduce the same
+    graceful-then-forced shutdown systemd-side. `--stop-all`'s AMC/mosquitto
+    teardown is unaffected either way (doc section A.2: "--stop-all still
+    additionally stops the AMC stack / broker as in Step 5 section 3.4").
     """
     stop_amc = stop_all and not skip_amc
     stop_mosquitto = stop_all and not skip_mosquitto
     stop_deepstream = not skip_deepstream
 
     if stop_deepstream:
-        if _pgrep_deepstream_running(ctx):
+        if use_systemctl:
+            unit = _pipeline_unit_name(entry.slug)
+            ctx.log.info(f"Stopping {unit} (systemctl stop)")
+            ctx.run_root("systemctl", "stop", unit, check=False, capture_output=True, text=True)
+        elif _pgrep_deepstream_running(ctx):
             ctx.log.info("Stopping deepstream-app (SIGTERM)")
             ctx.run_root("pkill", "-TERM", "-x", "deepstream-app", check=False, capture_output=True, text=True)
 
@@ -872,7 +1007,13 @@ def _stop_pipeline(
 
 def _build_pipeline_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mv3dt-installer pipeline", add_help=True)
-    parser.add_argument("--project", required=True)
+    parser.add_argument("--project", default=None)
+    # STEP-6 doc section A.1: mv3dt-pipeline@.service.in's ExecStart=/ExecStop=
+    # only ever carry systemd's own `%i` (the slug), never PROJECT_NAME --
+    # get_by_slug() is what this resolves against. Exactly one of --project /
+    # --project-slug is required (checked below, not via argparse mutual
+    # exclusivity, so the "neither given" error message can name both).
+    parser.add_argument("--project-slug", default=None)
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--config", default=None)
     parser.add_argument("--skip-ping", action="store_true")
@@ -882,6 +1023,11 @@ def _build_pipeline_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-deepstream", action="store_true")
     parser.add_argument("--no-amc", action="store_true")
     parser.add_argument("--no-mosquitto", action="store_true")
+    # STEP-6 doc section A.2: the unit's own ExecStart= mode (operators never
+    # pass this) and the retained foreground debugging escape hatch, which
+    # always takes the pre-Step-6 unsupervised path regardless of the gate.
+    parser.add_argument("--service-exec", action="store_true")
+    parser.add_argument("--foreground", action="store_true")
     # doc 00 section 3.3-shaped framework flags a subcommand's own argv may
     # carry (mirrors step3_amc_launcher's identical passthrough).
     parser.add_argument("--install-dir", default=None)
@@ -890,16 +1036,43 @@ def _build_pipeline_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_pipeline_entry(argv_project: Optional[str], argv_slug: Optional[str], ctx: "Context"):
+    """Resolve the `--project`/`--project-slug` pair `handle_pipeline_subcommand`
+    was called with into a `(entry, label)` pair, or `(None, label)` when
+    unresolvable. Exactly one of the two is expected; `--project-slug` is
+    what the systemd unit actually passes (STEP-6 doc section A.1)."""
+    if argv_slug:
+        return get_by_slug(ctx.install_dir, argv_slug), argv_slug
+    if argv_project:
+        return get(ctx.install_dir, argv_project), argv_project
+    return None, None
+
+
 def handle_pipeline_subcommand(argv: list, ctx: "Context") -> int:
-    """`mv3dt-installer pipeline --project <NAME> [...]` (section 3.3/3.4)."""
+    """`mv3dt-installer pipeline --project <NAME> [...]` (section 3.3/3.4),
+    now also `--project-slug <SLUG>` (STEP-6 doc section A.1's `%i`) and the
+    supervised/unsupervised branch STEP-6 doc section A.2 adds."""
     args = _build_pipeline_arg_parser().parse_args(argv)
 
-    entry = get(ctx.install_dir, args.project)
+    entry, label = _resolve_pipeline_entry(args.project, args.project_slug, ctx)
+    if label is None:
+        ctx.log.error("pipeline: one of --project or --project-slug is required")
+        return 1
     if entry is None:
         ctx.log.error(
-            f"unknown project '{args.project}'; run the amc exe to create/calibrate it first"
+            f"unknown project '{label}'; run the amc exe to create/calibrate it first"
         )
         return 1
+
+    if args.service_exec:
+        return _start_pipeline_service_exec(
+            ctx, entry, config_override=args.config, dry_run=args.dry_run
+        )
+
+    # STEP-6 doc section A.2's runtime conditional: --foreground always
+    # forces the pre-Step-6 unsupervised path; otherwise it's whatever
+    # _supervision_active actually finds on this workstation right now.
+    supervised = not args.foreground and _supervision_active(ctx, entry.slug)
 
     if args.stop or args.stop_all:
         return _stop_pipeline(
@@ -909,7 +1082,11 @@ def handle_pipeline_subcommand(argv: list, ctx: "Context") -> int:
             skip_deepstream=args.no_deepstream,
             skip_amc=args.no_amc,
             skip_mosquitto=args.no_mosquitto,
+            use_systemctl=supervised,
         )
+
+    if supervised:
+        return _start_pipeline_supervised(ctx, entry, dry_run=args.dry_run)
 
     return _start_pipeline_foreground(
         ctx,
@@ -1004,11 +1181,35 @@ def _project_artifact_paths(ctx: "Context", entry: ProjectEntry) -> list[pathlib
     ]
 
 
+# STEP-6 doc section A.3: "before deleting install-side artifacts, run
+# systemctl disable --now mv3dt-pipeline@<slug>". step5 has no business
+# knowing about Step 6's gate/systemd calls (this module is Step 6's
+# dependency, not the other way around), so Step 6 registers a gate-aware
+# callback here at import time via `register_removal_hook`, instead of this
+# module importing step6_remote_supervision. `None` (the default) means "no
+# Step 6 loaded" -- `remove_project_artifacts` is then exactly what it was
+# before this hook existed.
+_REMOVAL_HOOK: Optional[Callable[["Context", ProjectEntry], None]] = None
+
+
+def register_removal_hook(hook: Optional[Callable[["Context", ProjectEntry], None]]) -> None:
+    """Register (or clear, with `None`) the pre-removal callback STEP-6
+    doc section A.3 requires. Call once at module import time from
+    `step6_remote_supervision.py`; the hook itself decides whether Step 6
+    is actually active (gate on + unit installed) before touching systemd,
+    so `remove_project_artifacts` never has to ask."""
+    global _REMOVAL_HOOK
+    _REMOVAL_HOOK = hook
+
+
 def remove_project_artifacts(ctx: "Context", entry: ProjectEntry) -> list[str]:
     """Remove every install-side artifact for `entry`, then drop its
     registry key. Missing artifacts are logged and skipped (idempotent, per
     section 5.4). Returns the paths actually removed, as strings, for the
     caller's report."""
+    if _REMOVAL_HOOK is not None:
+        _REMOVAL_HOOK(ctx, entry)
+
     removed: list[str] = []
     for path in _project_artifact_paths(ctx, entry):
         try:

@@ -1,0 +1,52 @@
+# Template for /etc/systemd/system/mv3dt-pipeline@.service
+#
+# Rendered by mv3dt_installer.systemd.render_unit() (called directly by
+# step6_remote_supervision.py -- this pair is not a render_ingest_units()-style
+# per-project render, it is installed exactly once). This is a genuine systemd
+# TEMPLATE unit: `%i` is systemd's own instance specifier (the Step 5 project
+# slug), resolved natively at `systemctl start mv3dt-pipeline@<slug>` time and
+# never touched by the installer. The one installer-time substitution is
+# `@USER@` -- there is no systemd specifier for "the invoking user of the
+# installer" -- filled in once via render_unit()'s @MARKER@ convention, the
+# same mechanism mv3dt-ingest.*.in uses (STEP-6-REMOTE-SUPERVISION.md section
+# A.1).
+[Unit]
+Description=MV3DT DeepStream pipeline (%i)
+After=network-online.target mosquitto.service
+Wants=network-online.target
+Requires=mosquitto.service
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=/opt/mv3dt/deepstream/%i
+
+# ExecStart ports 50_start_pipeline.sh: ensure mosquitto up, source the DS
+# env, then exec deepstream-app -c <rendered per-project config>. Implemented
+# once, in the pipeline subcommand's --service-exec mode, invoked in a
+# non-interactive service context (no ping-sweep gating, no validation-helper
+# banner -- those are for the operator's foreground TTY).
+ExecStart=/opt/mv3dt/bin/mv3dt-installer pipeline --project-slug %i --service-exec
+ExecStop=/opt/mv3dt/bin/mv3dt-installer pipeline --project-slug %i --stop
+
+# 24/7 crash recovery. on-failure (not always) per the LOCKED decision, so a
+# clean --stop / systemctl stop does not trigger a restart loop.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Graceful teardown mirrors 99_stop_all.sh: SIGTERM, then SIGKILL after grace.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+EnvironmentFile=/opt/mv3dt/installer.conf
+Environment=PYTHONUNBUFFERED=1
+
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+
+[Install]
+WantedBy=multi-user.target
