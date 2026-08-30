@@ -69,6 +69,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -181,10 +182,25 @@ class ProjectEntry:
     rendered_config: str
     calibration_dir: str
     cameras_yml: Optional[str] = None
-    record_exe: Optional[str] = None
     created_utc: str = ""
     updated_utc: str = ""
     calib_runs: int = 1
+
+    @property
+    def record_exe(self) -> str:
+        """`<install_dir>/bin/record-<slug>` (STEP-5 doc section 1.2),
+        derived by convention rather than stored in the registry.
+
+        STEP-5 doc section 4.2 pins the registry schema exactly, and does
+        not list a `record_exe` field -- an earlier revision of this module
+        stored one anyway (a silent deviation a reviewer flagged, since
+        Step 7 also reads `registry.json` and should only ever see the
+        documented fields). `write_record_wrapper` always writes to this
+        exact path (`RECORD_PREFIX + slug` under `<install_dir>/bin/`), so
+        recomputing it here is equivalent to storing it and keeps the
+        on-disk schema exactly as documented.
+        """
+        return str(pathlib.Path(self.exe).parent / f"{RECORD_PREFIX}{self.slug}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -194,7 +210,6 @@ class ProjectEntry:
             "rendered_config": self.rendered_config,
             "calibration_dir": self.calibration_dir,
             "cameras_yml": self.cameras_yml,
-            "record_exe": self.record_exe,
             "created_utc": self.created_utc,
             "updated_utc": self.updated_utc,
             "calib_runs": self.calib_runs,
@@ -210,7 +225,6 @@ class ProjectEntry:
             rendered_config=d.get("rendered_config", ""),
             calibration_dir=d.get("calibration_dir", ""),
             cameras_yml=d.get("cameras_yml"),
-            record_exe=d.get("record_exe"),
             created_utc=d.get("created_utc", ""),
             updated_utc=d.get("updated_utc", ""),
             calib_runs=int(d.get("calib_runs", 1)),
@@ -320,7 +334,6 @@ def upsert(
     calibration_dir: str,
     exe: str,
     cameras_yml: Optional[str] = None,
-    record_exe: Optional[str] = None,
     slug: Optional[str] = None,
 ) -> ProjectEntry:
     """Section 4.3: create or update the `project_name` entry, computing/
@@ -340,7 +353,6 @@ def upsert(
             rendered_config=rendered_config,
             calibration_dir=calibration_dir,
             cameras_yml=cameras_yml if cameras_yml is not None else existing.cameras_yml,
-            record_exe=record_exe if record_exe is not None else existing.record_exe,
             created_utc=existing.created_utc or now,
             updated_utc=now,
             calib_runs=existing.calib_runs + 1,
@@ -354,7 +366,6 @@ def upsert(
             rendered_config=rendered_config,
             calibration_dir=calibration_dir,
             cameras_yml=cameras_yml,
-            record_exe=record_exe,
             created_utc=now,
             updated_utc=now,
             calib_runs=1,
@@ -781,6 +792,15 @@ def _start_pipeline_foreground(
 # ---------------------------------------------------------------------------
 
 
+_STOP_GRACE_POLLS = 5
+_STOP_GRACE_INTERVAL_S = 1.0
+
+
+def _pgrep_deepstream_running(ctx: "Context") -> bool:
+    result = ctx.run_root("pgrep", "-x", "deepstream-app", check=False, capture_output=True, text=True)
+    return result.returncode == 0
+
+
 def _stop_pipeline(
     ctx: "Context",
     entry: ProjectEntry,
@@ -789,23 +809,39 @@ def _stop_pipeline(
     skip_deepstream: bool = False,
     skip_amc: bool = False,
     skip_mosquitto: bool = False,
+    sleep: Callable[[float], None] = time.sleep,
+    grace_polls: int = _STOP_GRACE_POLLS,
+    grace_interval_s: float = _STOP_GRACE_INTERVAL_S,
 ) -> int:
     """Port of `99_stop_all.sh` (section 3.4). `--stop` (the default) only
     stops `deepstream-app`; `--stop-all` additionally tears down the AMC
-    stack and mosquitto, matching `99_stop_all.sh` run with no skip flags."""
+    stack and mosquitto, matching `99_stop_all.sh` run with no skip flags.
+
+    The SIGTERM -> SIGKILL escalation mirrors `99_stop_all.sh` lines 62-78
+    exactly: after sending SIGTERM, poll up to `grace_polls` times (default
+    5, matching the bash `for _ in 1 2 3 4 5; do pgrep || break; sleep 1;
+    done`), sleeping `grace_interval_s` between polls, before concluding the
+    process is still alive and escalating to SIGKILL. `sleep`/`grace_polls`/
+    `grace_interval_s` are injectable so a test can exercise the timing
+    without a real wait.
+    """
     stop_amc = stop_all and not skip_amc
     stop_mosquitto = stop_all and not skip_mosquitto
     stop_deepstream = not skip_deepstream
 
     if stop_deepstream:
-        pgrep = ctx.run_root("pgrep", "-x", "deepstream-app", check=False, capture_output=True, text=True)
-        if pgrep.returncode == 0:
+        if _pgrep_deepstream_running(ctx):
             ctx.log.info("Stopping deepstream-app (SIGTERM)")
             ctx.run_root("pkill", "-TERM", "-x", "deepstream-app", check=False, capture_output=True, text=True)
-            still_up = ctx.run_root(
-                "pgrep", "-x", "deepstream-app", check=False, capture_output=True, text=True
-            )
-            if still_up.returncode == 0:
+
+            still_running = True
+            for _ in range(grace_polls):
+                if not _pgrep_deepstream_running(ctx):
+                    still_running = False
+                    break
+                sleep(grace_interval_s)
+
+            if still_running:
                 ctx.log.warn("deepstream-app still running after SIGTERM; sending SIGKILL")
                 ctx.run_root(
                     "pkill", "-KILL", "-x", "deepstream-app", check=False, capture_output=True, text=True
@@ -1203,7 +1239,6 @@ class Step5PerProjectExes:
             calibration_dir=calibration_dir,
             exe=str(pipeline_path),
             cameras_yml=cameras_yml,
-            record_exe=str(record_path),
             slug=slug,
         )
 

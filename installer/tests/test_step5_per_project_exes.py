@@ -443,14 +443,18 @@ def test_pipeline_subcommand_missing_config_fails(tmp_path):
 
 
 def test_stop_pipeline_default_only_stops_deepstream(tmp_path):
-    runner = ScriptedRunner()
-    runner.when(lambda a: a[:2] == ("pgrep", "-x"), returncode=0)
+    # [initial check: alive, poll 1: gone] -- SIGTERM sent, dies immediately.
+    runner = _SequencedPgrepRunner([0, 1])
     ctx = FakeContext(tmp_path, runner_root=runner)
     entry = _make_entry(ctx.install_dir)
 
-    rc = step5._stop_pipeline(ctx, entry)
+    def _boom(_s):  # pragma: no cover -- must never be called; process is already gone
+        raise AssertionError("sleep() must not be called once the process has exited")
+
+    rc = step5._stop_pipeline(ctx, entry, sleep=_boom)
     assert rc == 0
     assert runner.called_with_prefix("pkill", "-TERM", "-x", "deepstream-app")
+    assert not runner.called_with_prefix("pkill", "-KILL")
     assert not runner.called_with_prefix("systemctl", "stop", "mosquitto")
 
 
@@ -463,14 +467,95 @@ def test_stop_pipeline_deepstream_not_running_does_not_kill(tmp_path):
     assert not runner.called_with_prefix("pkill")
 
 
-def test_stop_pipeline_escalates_to_sigkill_if_still_running(tmp_path):
-    runner = ScriptedRunner()
-    runner.when(lambda a: a[:2] == ("pgrep", "-x"), returncode=0)  # always still running
+class _SequencedPgrepRunner:
+    """Serves a fixed sequence of `pgrep -x deepstream-app` returncodes (one
+    per call -- the *initial* aliveness check consumes the first entry, then
+    one entry per grace-period poll), then `1` (not running) once exhausted.
+    Every other command returns 0. Used to exercise the SIGTERM->SIGKILL
+    grace-period timing precisely."""
+
+    def __init__(self, pgrep_returncodes):
+        self.calls: list[tuple] = []
+        self._pgrep_returncodes = list(pgrep_returncodes)
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append(args)
+        if args[:2] == ("pgrep", "-x"):
+            rc = self._pgrep_returncodes.pop(0) if self._pgrep_returncodes else 1
+            return subprocess.CompletedProcess(list(args), rc, "", "")
+        return subprocess.CompletedProcess(list(args), 0, "", "")
+
+    def called_with_prefix(self, *prefix) -> bool:
+        return any(tuple(call[: len(prefix)]) == prefix for call in self.calls)
+
+    def count_calls(self, *prefix) -> int:
+        return sum(1 for call in self.calls if tuple(call[: len(prefix)]) == prefix)
+
+
+def test_stop_pipeline_grace_period_lets_process_exit_without_sigkill(tmp_path):
+    """Process dies partway through the grace period: SIGKILL must never be
+    sent, and the poll loop must stop as soon as the process is gone rather
+    than always running the full `grace_polls` iterations."""
+    # [initial check: alive, poll 1: alive, poll 2: gone]
+    runner = _SequencedPgrepRunner([0, 0, 1])
     ctx = FakeContext(tmp_path, runner_root=runner)
     entry = _make_entry(ctx.install_dir)
 
-    step5._stop_pipeline(ctx, entry)
+    sleeps: list[float] = []
+    rc = step5._stop_pipeline(
+        ctx, entry, sleep=sleeps.append, grace_polls=5, grace_interval_s=1.0
+    )
+    assert rc == 0
+    assert runner.called_with_prefix("pkill", "-TERM", "-x", "deepstream-app")
+    assert not runner.called_with_prefix("pkill", "-KILL")
+    # Only one grace-period poll happened before the process was confirmed
+    # gone, so only one sleep -- not all 5.
+    assert sleeps == [1.0]
+
+
+def test_stop_pipeline_waits_full_grace_period_before_sigkill(tmp_path):
+    """Regression test for the grace-period bug: SIGTERM must be followed
+    by up to `grace_polls` waits (matching 99_stop_all.sh's `for _ in 1 2 3
+    4 5; do pgrep || break; sleep 1; done`) before SIGKILL is ever sent --
+    not an immediate SIGKILL synchronously after SIGTERM."""
+    events: list[str] = []
+
+    class _EventRunner:
+        def __init__(self):
+            self.calls: list[tuple] = []
+
+        def __call__(self, *args, **kwargs):
+            self.calls.append(args)
+            if args[:2] == ("pgrep", "-x"):
+                events.append("pgrep-alive")
+                return subprocess.CompletedProcess(list(args), 0, "", "")  # always still running
+            if args[:3] == ("pkill", "-TERM", "-x"):
+                events.append("sigterm")
+            elif args[:3] == ("pkill", "-KILL", "-x"):
+                events.append("sigkill")
+            return subprocess.CompletedProcess(list(args), 0, "", "")
+
+        def called_with_prefix(self, *prefix) -> bool:
+            return any(tuple(c[: len(prefix)]) == prefix for c in self.calls)
+
+    runner = _EventRunner()
+    ctx = FakeContext(tmp_path, runner_root=runner)
+    entry = _make_entry(ctx.install_dir)
+
+    def _fake_sleep(_seconds):
+        events.append("sleep")
+
+    rc = step5._stop_pipeline(ctx, entry, sleep=_fake_sleep, grace_polls=3, grace_interval_s=0.01)
+    assert rc == 0
     assert runner.called_with_prefix("pkill", "-KILL", "-x", "deepstream-app")
+
+    sigterm_idx = events.index("sigterm")
+    sigkill_idx = events.index("sigkill")
+    sleeps_between = events[sigterm_idx:sigkill_idx].count("sleep")
+    # All 3 grace-period sleeps must have happened between SIGTERM and
+    # SIGKILL -- the bug this guards against sent SIGKILL immediately, with
+    # zero sleeps in between.
+    assert sleeps_between == 3
 
 
 def test_stop_all_also_stops_mosquitto_and_amc(tmp_path, monkeypatch):
