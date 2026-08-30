@@ -153,7 +153,10 @@ def test_registers_itself_with_the_expected_identity():
 
 
 def test_registers_the_amc_subcommand():
-    assert app.SUBCOMMAND_REGISTRY.get("amc") is step3.handle_amc_subcommand
+    registration = app.SUBCOMMAND_REGISTRY.get("amc")
+    assert registration is not None
+    assert registration.handler is step3.handle_amc_subcommand
+    assert registration.requires_root is True
 
 
 # ---------------------------------------------------------------------------

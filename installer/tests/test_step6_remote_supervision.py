@@ -108,7 +108,21 @@ def test_registers_itself_with_the_expected_identity():
 
 
 def test_registers_the_agent_subcommand():
-    assert app.SUBCOMMAND_REGISTRY.get("agent") is step6.handle_agent_subcommand
+    registration = app.SUBCOMMAND_REGISTRY.get("agent")
+    assert registration is not None
+    assert registration.handler is step6.handle_agent_subcommand
+
+
+def test_agent_subcommand_does_not_require_root():
+    """unit U6's fix for a PR #50 review defect: `mv3dt-agent.service`
+    (this module's own docstring, section B.1) deliberately runs as
+    `User=@USER@`, so `agent` must be registered with
+    `requires_root=False` -- otherwise `app._bootstrap_subcommand_context()`
+    would call `privilege.require_root()` and exit before this module's
+    `handle_agent_subcommand` ever ran."""
+    registration = app.SUBCOMMAND_REGISTRY.get("agent")
+    assert registration is not None
+    assert registration.requires_root is False
 
 
 def test_registers_the_removal_hook_on_import():

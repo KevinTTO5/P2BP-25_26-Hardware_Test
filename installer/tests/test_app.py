@@ -1052,13 +1052,33 @@ def test_register_subcommand_adds_to_registry():
         return 0
 
     app.register_subcommand("amc", _handler)
-    assert app.SUBCOMMAND_REGISTRY["amc"] is _handler
+    assert app.SUBCOMMAND_REGISTRY["amc"].handler is _handler
 
 
 def test_register_subcommand_overwrites_an_existing_name():
     app.register_subcommand("amc", lambda argv, ctx: 1)
     app.register_subcommand("amc", lambda argv, ctx: 2)
-    assert app.SUBCOMMAND_REGISTRY["amc"](None, None) == 2
+    assert app.SUBCOMMAND_REGISTRY["amc"].handler(None, None) == 2
+
+
+def test_register_subcommand_defaults_to_requires_root_true():
+    """unit U6: every registration made without an explicit `requires_root=`
+    keeps requiring root exactly as before this parameter existed -- `amc`
+    (Step 3), `ingest` (Step 4), `reporter`/`uploader` (Step 7), and
+    `pipeline`'s pre-STEP-6 modes all rely on this default."""
+    app.register_subcommand("amc", lambda argv, ctx: 0)
+    assert app.SUBCOMMAND_REGISTRY["amc"].requires_root is True
+
+
+def test_register_subcommand_accepts_requires_root_false():
+    app.register_subcommand("agent", lambda argv, ctx: 0, requires_root=False)
+    assert app.SUBCOMMAND_REGISTRY["agent"].requires_root is False
+
+
+def test_register_subcommand_accepts_requires_root_predicate():
+    predicate = lambda argv: "--service-exec" not in argv  # noqa: E731
+    app.register_subcommand("pipeline", lambda argv, ctx: 0, requires_root=predicate)
+    assert app.SUBCOMMAND_REGISTRY["pipeline"].requires_root is predicate
 
 
 def test_main_dispatches_registered_subcommand_before_parse_args(
@@ -1183,6 +1203,189 @@ def test_main_subcommand_requires_root(tmp_path, monkeypatch):
         app.main(["amc"], state_path=tmp_path / "state.json")
 
     assert called["count"] == 1
+
+
+def _boom_require_root():
+    raise AssertionError(
+        "a requires_root=False subcommand must never call privilege.require_root()"
+    )
+
+
+def test_main_subcommand_requires_root_false_skips_root_check(tmp_path, monkeypatch):
+    """unit U6's fix: `agent` (registered with `requires_root=False`,
+    mirroring STEP-6's real registration) must reach its handler without
+    ever calling `privilege.require_root()` -- the exact bug PR #50's
+    review surfaced (the agent runs as `User=@USER@`, non-root)."""
+    monkeypatch.setattr(app.privilege, "require_root", _boom_require_root)
+    _bypass_onboarding(monkeypatch, tmp_path)
+
+    captured = {}
+
+    def _handler(argv, ctx):
+        captured["ctx"] = ctx
+        return 0
+
+    app.register_subcommand("agent", _handler, requires_root=False)
+
+    install_dir = tmp_path / "install"
+    rc = app.main(
+        ["agent", "--install-dir", str(install_dir)],
+        state_path=tmp_path / "state.json",
+    )
+
+    assert rc == 0
+    assert isinstance(captured["ctx"], app.Context)
+    assert captured["ctx"].install_dir == install_dir
+
+
+def test_main_subcommand_requires_root_false_does_not_write_config_or_state(
+    tmp_path, monkeypatch
+):
+    """The read-only bootstrap path a `requires_root=False` subcommand takes
+    must never create `install_dir`, write `installer.conf`, or touch
+    `state.json` -- `config.load()`'s side effects all assume the root
+    ownership a real install run already established, which a non-root
+    subcommand process cannot safely (or need to) reproduce."""
+    monkeypatch.setattr(app.privilege, "require_root", _boom_require_root)
+    _bypass_onboarding(monkeypatch, tmp_path)
+
+    def _boom_load(*args, **kwargs):
+        raise AssertionError("must not call config.load() for requires_root=False")
+
+    monkeypatch.setattr(app.config_mod, "load", _boom_load)
+
+    def _boom_open_transcript(*args, **kwargs):
+        raise AssertionError("must not open a transcript for requires_root=False")
+
+    monkeypatch.setattr(app, "open_transcript", _boom_open_transcript)
+
+    app.register_subcommand("agent", lambda argv, ctx: 0, requires_root=False)
+
+    install_dir = tmp_path / "install"  # deliberately does not exist yet
+    state_path = tmp_path / "state.json"
+    rc = app.main(["agent", "--install-dir", str(install_dir)], state_path=state_path)
+
+    assert rc == 0
+    assert not install_dir.exists()
+    assert not state_path.exists()
+
+
+def test_main_subcommand_requires_root_false_reads_existing_installer_conf(
+    tmp_path, monkeypatch
+):
+    """A non-root subcommand still needs whatever install already persisted
+    (e.g. the STEP-6 gate value) -- the read-only bootstrap must read
+    `installer.conf` back into `ctx.conf`, it just must never write it."""
+    monkeypatch.setattr(app.privilege, "require_root", _boom_require_root)
+    _bypass_onboarding(monkeypatch, tmp_path)
+
+    install_dir = tmp_path / "install"
+    install_dir.mkdir()
+    conf_path = install_dir / config_mod.CONF_FILENAME
+    conf_path.write_text("MV3DT_REMOTE_SUPERVISION=local\n")
+
+    captured = {}
+
+    def _handler(argv, ctx):
+        captured["ctx"] = ctx
+        return 0
+
+    app.register_subcommand("agent", _handler, requires_root=False)
+
+    rc = app.main(
+        ["agent", "--install-dir", str(install_dir)],
+        state_path=tmp_path / "state.json",
+    )
+
+    assert rc == 0
+    ctx = captured["ctx"]
+    assert ctx.conf.get("MV3DT_REMOTE_SUPERVISION") == "local"
+    # Read back correctly, but never rewritten.
+    assert conf_path.read_text() == "MV3DT_REMOTE_SUPERVISION=local\n"
+
+
+def test_main_subcommand_requires_root_predicate_true_for_default_mode(
+    tmp_path, monkeypatch
+):
+    """unit U6's `pipeline`-shaped fix: a `requires_root` predicate lets a
+    single subcommand registration require root for some modes and not
+    others. The default (non-`--service-exec`) mode must still hit
+    `privilege.require_root()`, exactly like before Step 6 existed."""
+    called = {"count": 0}
+
+    def _require_root():
+        called["count"] += 1
+        raise SystemExit(2)
+
+    monkeypatch.setattr(app.privilege, "require_root", _require_root)
+
+    predicate = lambda argv: "--service-exec" not in argv  # noqa: E731
+    app.register_subcommand("pipeline", lambda argv, ctx: 0, requires_root=predicate)
+
+    with pytest.raises(SystemExit):
+        app.main(
+            ["pipeline", "--project", "north-lobby"],
+            state_path=tmp_path / "state.json",
+        )
+
+    assert called["count"] == 1
+
+
+def test_main_subcommand_requires_root_predicate_true_for_stop_mode(
+    tmp_path, monkeypatch
+):
+    called = {"count": 0}
+
+    def _require_root():
+        called["count"] += 1
+        raise SystemExit(2)
+
+    monkeypatch.setattr(app.privilege, "require_root", _require_root)
+
+    predicate = lambda argv: "--service-exec" not in argv  # noqa: E731
+    app.register_subcommand("pipeline", lambda argv, ctx: 0, requires_root=predicate)
+
+    with pytest.raises(SystemExit):
+        app.main(
+            ["pipeline", "--project-slug", "north-lobby", "--stop"],
+            state_path=tmp_path / "state.json",
+        )
+
+    assert called["count"] == 1
+
+
+def test_main_subcommand_requires_root_predicate_false_for_service_exec_mode(
+    tmp_path, monkeypatch
+):
+    """`--service-exec` -- the mode `mv3dt-pipeline@.service.in`'s own
+    non-root `ExecStart=` invokes -- must NOT hit `privilege.require_root()`."""
+    monkeypatch.setattr(app.privilege, "require_root", _boom_require_root)
+    _bypass_onboarding(monkeypatch, tmp_path)
+
+    captured = {}
+
+    def _handler(argv, ctx):
+        captured["ctx"] = ctx
+        return 0
+
+    predicate = lambda argv: "--service-exec" not in argv  # noqa: E731
+    app.register_subcommand("pipeline", _handler, requires_root=predicate)
+
+    install_dir = tmp_path / "install"
+    rc = app.main(
+        [
+            "pipeline",
+            "--project-slug",
+            "north-lobby",
+            "--service-exec",
+            "--install-dir",
+            str(install_dir),
+        ],
+        state_path=tmp_path / "state.json",
+    )
+
+    assert rc == 0
+    assert isinstance(captured["ctx"], app.Context)
 
 
 def test_main_unregistered_first_token_falls_through_to_normal_parsing(tmp_path):

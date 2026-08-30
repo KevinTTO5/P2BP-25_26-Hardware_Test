@@ -226,7 +226,12 @@ def test_registers_itself_with_the_expected_identity():
 
 
 def test_registers_the_ingest_subcommand():
-    assert app.SUBCOMMAND_REGISTRY.get("ingest") is step4.handle_ingest_subcommand
+    registration = app.SUBCOMMAND_REGISTRY.get("ingest")
+    assert registration is not None
+    assert registration.handler is step4.handle_ingest_subcommand
+    # unit U6's fix: `ingest` never opted out, so it keeps the default
+    # `requires_root=True` unchanged.
+    assert registration.requires_root is True
 
 
 # ---------------------------------------------------------------------------
