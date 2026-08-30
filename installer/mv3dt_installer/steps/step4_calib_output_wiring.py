@@ -1079,6 +1079,29 @@ def handle_ingest_subcommand(argv: list, ctx: "Context") -> int:
     else:
         ctx.report_installed("calibration-export", label)
 
+    # section 8.1's "poor calibration (bad RMSE)" guard applies here too --
+    # arguably *more* so than in `run()`. The dispatch loop only ever calls
+    # `run()` once (a `COMPLETE` step is skipped on every later launch), so
+    # this subcommand -- triggered by the mv3dt-ingest-<slug>.path unit on
+    # every LATER recalibration -- is the only enforcement point that
+    # actually executes during steady-state operation. There is no
+    # `StepResult`/USER_ACTION_REQUIRED channel here (this does not go
+    # through the Step lifecycle, and nothing is watching stdin for a
+    # systemd-triggered process), so this logs an error and exits non-zero
+    # instead -- visible in `journalctl -u mv3dt-ingest-<slug>.service` --
+    # and, critically, returns before persisting CALIBRATION_DIR or
+    # re-rendering the configs, so an incomplete recalibration never
+    # silently overwrites a working setup.
+    enabled_count = _enabled_camera_count(ctx)
+    file_count = _calibration_file_count(dest)
+    if enabled_count is not None and file_count < enabled_count:
+        ctx.log.error(
+            f"ingest: {INCOMPLETE_CALIBRATION_MESSAGE} "
+            f"({file_count} file(s) in {dest} for {enabled_count} enabled "
+            "camera(s); not wiring up this recalibration)"
+        )
+        return 1
+
     config_mod.persist_value(ctx.install_dir, CONF_CALIBRATION_DIR_KEY, str(dest))
     ctx.conf[CONF_CALIBRATION_DIR_KEY] = str(dest)
     _render_configs(ctx, inputs=inputs, calibration_dir=dest)

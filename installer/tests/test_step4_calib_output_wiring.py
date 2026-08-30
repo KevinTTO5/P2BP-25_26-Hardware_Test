@@ -945,6 +945,30 @@ def test_handle_ingest_subcommand_uses_persisted_calibration_dir(tmp_path, deeps
     assert (persisted / "camInfo-01.yml").is_file()
 
 
+def test_handle_ingest_subcommand_rejects_incomplete_recalibration(tmp_path, deepstream_templates_dir):
+    """section 8.1: a LATER recalibration (this subcommand, triggered by the
+    mv3dt-ingest-<slug>.path unit -- run() only ever runs once, since the
+    dispatch loop skips a COMPLETE step) must not silently wire up an
+    incomplete export as if it were a working setup."""
+    # Two enabled cameras (via `_cameras_file_set`'s default), but only one
+    # camInfo file in the export this pass -- the ingest subcommand is the
+    # only enforcement point that actually runs during steady-state
+    # operation, so its own guard must catch this independently of run()'s.
+    amc_root = _stub_amc_root(tmp_path, export_files=("camInfo-01.yml",))
+    conf = _default_conf(tmp_path, AMC_ROOT=str(amc_root))
+    ctx = FakeContext(tmp_path, conf=conf, asset_dir=deepstream_templates_dir, non_interactive=True)
+    _amc_wrapper_present(ctx)
+    _cameras_file_set(ctx, tmp_path, enabled_ips=("10.0.0.1", "10.0.0.2"))
+
+    exit_code = step4.handle_ingest_subcommand(["--project", "test-lab-01"], ctx)
+
+    assert exit_code == 1
+    # Nothing gets wired up: no CALIBRATION_DIR persisted, no rendered
+    # config written for this incomplete recalibration.
+    assert step4.CONF_CALIBRATION_DIR_KEY not in ctx.conf
+    assert not (ctx.install_dir / "deepstream" / step4.RENDERED_APP_CONFIG_NAME).exists()
+
+
 def test_handle_ingest_subcommand_missing_conf_returns_error(tmp_path, deepstream_templates_dir):
     ctx = FakeContext(tmp_path, conf={}, asset_dir=deepstream_templates_dir)
     exit_code = step4.handle_ingest_subcommand(["--project", "x"], ctx)
