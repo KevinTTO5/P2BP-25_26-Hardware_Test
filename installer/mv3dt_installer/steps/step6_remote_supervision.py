@@ -24,21 +24,16 @@ behavior unchanged; once this step is COMPLETE and its gate is not "off",
 instead. This module owns installing/enabling that unit and the agent unit;
 it does not re-implement Step 5's dispatch.
 
-**Bootstrap caveat (flagged, not fixed here -- out of this unit's touch
-zone).** `app._bootstrap_subcommand_context()` calls
-`privilege.require_root()` unconditionally for every registered
-subcommand, including this module's `agent` handler. `mv3dt-agent.service`
+**Bootstrap caveat (fixed by plan unit U6, a later fix on top of this
+step).** `mv3dt-agent.service`
 (section B.1) deliberately runs as `User=@USER@` (the whole point of the
 scoped polkit rule in section B.1.1 is letting a *non-root* agent drive
-`systemctl` on exactly the units it needs) -- so a real
-`mv3dt-installer agent` invocation under that unit will hit
-`require_root()`'s root check as a non-root process and exit before this
-module's own code ever runs. Fixing that is a change to `app.py`'s shared
-subcommand bootstrap, out of scope for this unit (see its own "do NOT
-touch app.py" instruction). Every function in this module is written and
-tested independently of that bootstrap path, so the gap is isolated to
-"how does the frozen binary launch `agent` in production", not to any
-logic here.
+`systemctl` on exactly the units it needs), so this module registers
+`agent` with `app.register_subcommand(..., requires_root=False)`:
+`app._bootstrap_subcommand_context()` skips `privilege.require_root()` for
+it and builds its `Context` from a read-only config resolution instead of
+`config.load()`'s root-owned side effects. See `app.register_subcommand()`
+and `app._bootstrap_subcommand_context()` for the full mechanism.
 
 Every subprocess call goes through `ctx.run_root`/`ctx.run_as_user`, or an
 explicitly injected `runner` callable with the same
@@ -1203,5 +1198,5 @@ class Step6RemoteSupervision:
 
 
 register(Step6RemoteSupervision())
-app_mod.register_subcommand("agent", handle_agent_subcommand)
+app_mod.register_subcommand("agent", handle_agent_subcommand, requires_root=False)
 step5_mod.register_removal_hook(_disable_pipeline_unit_before_remove)

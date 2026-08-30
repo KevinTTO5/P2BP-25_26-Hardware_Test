@@ -379,15 +379,30 @@ def build_context(
 #: code, exactly like `main()` itself.
 SubcommandHandler = Callable[[list, Context], int]
 
+
+@dataclass(frozen=True)
+class _SubcommandRegistration:
+    """One `SUBCOMMAND_REGISTRY` entry: a handler plus its root requirement
+    (unit U6's fix -- see `register_subcommand`'s docstring)."""
+
+    handler: SubcommandHandler
+    requires_root: Any = True
+
+
 #: Populated at import time by each owning step module (`step3_amc_launcher
 #: .register_subcommand("amc", ...)`), the same "import side effect"
 #: pattern `steps.STEP_REGISTRY` uses. Empty until that module is actually
 #: imported -- see `register_subcommand`'s docstring for the pre-existing
 #: gap this shares with `STEP_REGISTRY`.
-SUBCOMMAND_REGISTRY: dict[str, SubcommandHandler] = {}
+SUBCOMMAND_REGISTRY: dict[str, _SubcommandRegistration] = {}
 
 
-def register_subcommand(name: str, handler: SubcommandHandler) -> None:
+def register_subcommand(
+    name: str,
+    handler: SubcommandHandler,
+    *,
+    requires_root: Any = True,
+) -> None:
     """Register a top-level subcommand (STEP-3 §6.2).
 
     Call this once at module scope in the owning step module, mirroring
@@ -409,33 +424,128 @@ def register_subcommand(name: str, handler: SubcommandHandler) -> None:
     exist as importable modules; wiring that up is a pre-existing gap
     shared with `STEP_REGISTRY` (see that registry's own docstring) and is
     out of scope for this extension point itself.
+
+    `requires_root` (unit U6's fix for a cross-cutting defect PR #50's
+    review surfaced): whether `_bootstrap_subcommand_context()` must call
+    `privilege.require_root()` before this subcommand's handler runs (doc
+    00 §9.1). Defaults to `True`, matching every registration that existed
+    before this parameter did (`amc`, `ingest`, `reporter`, `uploader`, and
+    -- pre-STEP-6 -- `pipeline`), so this is a strictly additive change:
+    nothing about an existing registration's behavior changes unless it
+    opts out.
+
+    Two shapes are accepted, for the two ways a subcommand can be
+    non-root:
+
+    - A plain `bool`, for a subcommand whose *entire* process runs as the
+      non-root invoking user (STEP-6's `agent`, per its
+      `mv3dt-agent.service.in`'s `User=@USER@` -- the whole point of its
+      scoped polkit rule is that the agent is never root).
+    - A `Callable[[list[str]], bool]` -- handed the subcommand's own argv,
+      the exact list its handler also receives -- for a subcommand where
+      only SOME modes run non-root. STEP-5's `pipeline` is the only
+      example today: its `--service-exec` mode is what
+      `mv3dt-pipeline@.service.in`'s own non-root `ExecStart=` invokes, but
+      its default/`--stop`/`--stop-all`/`--foreground`/`--dry-run` modes
+      still call `ctx.run_root`/expect to run under `sudo`, unchanged.
     """
-    SUBCOMMAND_REGISTRY[name] = handler
+    SUBCOMMAND_REGISTRY[name] = _SubcommandRegistration(
+        handler=handler, requires_root=requires_root
+    )
+
+
+def _read_only_subcommand_config(
+    known: argparse.Namespace, sm: StateMachine
+) -> config_mod.Config:
+    """Read-only counterpart to `config.load()`, for a `requires_root=False`
+    subcommand (unit U6's fix).
+
+    `config.load()` (module docstring: "Side effects: creates `install_dir`
+    if missing, reads-or-writes `installer.conf` under it, and ... writes it
+    back into `state.json`") assumes root the same way `require_root()`
+    does: `install_dir` (default `/opt/mv3dt`) and the canonical
+    `state.json` (`state.CANONICAL_STATE_PATH`, root-owned, its `save()`
+    unconditionally `chmod`s both the file and its parent dir) were created
+    by a *root* install run. A non-root subcommand -- STEP-6's `agent`,
+    STEP-5's `pipeline --service-exec` -- only ever runs long after that
+    install completed, so it has no business creating or mutating either:
+    it just needs to read back the `install_dir`/`installer.conf` that
+    install already resolved and persisted.
+
+    This reimplements `config.load()`'s precedence chain (`--install-dir` >
+    `state.json` > `installer.conf`'s own record > the hardcoded default,
+    doc 00 §11.2) using `config`'s own resolution/parsing helpers, but never
+    prompts, never creates `install_dir`, never writes `installer.conf`, and
+    never touches `state.json`.
+    """
+    resolved, _source = config_mod._resolve_install_dir(
+        known.install_dir, sm, config_mod.DEFAULT_INSTALL_DIR
+    )
+    values = config_mod._read_conf(resolved / config_mod.CONF_FILENAME)
+    return config_mod.Config(
+        install_dir=resolved,
+        remote_supervision=values.get(
+            config_mod.GATE_REMOTE_SUPERVISION,
+            config_mod.GATE_DEFAULTS[config_mod.GATE_REMOTE_SUPERVISION],
+        ),
+        webapp_integration=values.get(
+            config_mod.GATE_WEBAPP_INTEGRATION,
+            config_mod.GATE_DEFAULTS[config_mod.GATE_WEBAPP_INTEGRATION],
+        ),
+        values=values,
+    )
 
 
 def _bootstrap_subcommand_context(
-    argv: list, *, state_path: Optional[pathlib.Path] = None
+    argv: list,
+    *,
+    state_path: Optional[pathlib.Path] = None,
+    requires_root: bool = True,
 ) -> Context:
     """Bootstrap the subset of `main()`'s startup sequence a standalone
     subcommand needs, without re-entering `_dispatch()` (STEP-3 §6.2).
 
     **Reused** from `main()`'s own ordering (module docstring, steps
-    1/2/4/7/... above):
+    1/2/4/7/... above), when `requires_root` is `True` (the default -- every
+    subcommand registered without a `requires_root=` argument, unit U6):
 
     - `privilege.require_root()` -- a subcommand still touches docker,
       root-owned package state, and files under the install root (STEP-3
       §3-§4), so it needs the same privilege the install flow does.
-    - `onboarding.run_platform_preflight()` -- the same Ubuntu 24.04 /
-      x86_64 + real-`$SUDO_USER` gate `main()` applies, and the source of
-      the `InvokingUser` a subcommand's `ctx.run_as_user(...)` calls need
-      (doc 00 §9.2). Cheap, and a subcommand run standalone long after
-      install deserves the same guarantee every other root-owned artifact
-      relies on.
     - `config.load(...)` -- the only way to get a real `install_dir` /
       `Config` to build a `Context` from.
     - `logs.open_transcript(...)` -- doc 00 §8.2's auditable-record
       contract applies just as much to a subcommand's docker/clone/compose
       calls as to anything a step does during install.
+
+    **When `requires_root` is `False`** (unit U6's fix: STEP-6's `agent`,
+    and STEP-5's `pipeline` in its `--service-exec` mode -- both run as the
+    non-root invoking user by design, per their `.service.in` units'
+    `User=@USER@`):
+
+    - `privilege.require_root()` is skipped entirely -- calling it would
+      exit the process immediately, before the subcommand's own code ever
+      runs, which is precisely the defect this fix addresses.
+    - `config.load(...)` is replaced by `_read_only_subcommand_config(...)`,
+      above -- `config.load()`'s own side effects (creating `install_dir`,
+      writing `installer.conf`, writing/`chmod`ing `state.json`) all assume
+      root ownership of paths a root install run already created, so a
+      non-root process cannot safely perform them (and does not need to --
+      it only ever reads back what install already resolved).
+    - `logs.open_transcript(...)` is skipped -- `DEFAULT_LOG_DIR`
+      (`/var/lib/mv3dt-installer/logs/`) is root-owned, so a non-root
+      process cannot create the per-run transcript file there either. This
+      loses nothing operationally: `logs.py`'s `log.info/warn/error()`
+      always print to stderr regardless of whether a transcript is open
+      (`logs.py` `_emit()`), and both non-root units set
+      `StandardOutput=journal`/`StandardError=journal`, so systemd already
+      captures every line in the journal.
+
+    `onboarding.run_platform_preflight()` is always reused, root or not --
+    it is cheap, does not itself require root (only a bare-root-shell
+    invoking user is rejected, doc 00 §9.2), and is the source of the
+    `InvokingUser` a subcommand's `ctx.run_as_user(...)` calls need either
+    way.
 
     **Deliberately NOT reused** (both are install-flow-specific, per this
     unit's own scope note -- see this function's call site in `main()`):
@@ -466,17 +576,21 @@ def _bootstrap_subcommand_context(
     peek.add_argument("--log-dir", default=None)
     known, _unused = peek.parse_known_args(argv)
 
-    privilege.require_root()
+    if requires_root:
+        privilege.require_root()
     user = onboarding.run_platform_preflight()
 
     sm_path = state_path if state_path is not None else CANONICAL_STATE_PATH
     sm = StateMachine(path=sm_path)
-    cfg = config_mod.load(
-        known.install_dir, sm, non_interactive=known.non_interactive
-    )
 
-    log_dir = pathlib.Path(known.log_dir) if known.log_dir else None
-    open_transcript(log_dir)
+    if requires_root:
+        cfg = config_mod.load(
+            known.install_dir, sm, non_interactive=known.non_interactive
+        )
+        log_dir = pathlib.Path(known.log_dir) if known.log_dir else None
+        open_transcript(log_dir)
+    else:
+        cfg = _read_only_subcommand_config(known, sm)
 
     return build_context(cfg, user, known.non_interactive)
 
@@ -820,9 +934,16 @@ def main(
     effective_argv = argv if argv is not None else sys.argv[1:]
     if effective_argv and effective_argv[0] in SUBCOMMAND_REGISTRY:
         name, rest = effective_argv[0], effective_argv[1:]
-        handler = SUBCOMMAND_REGISTRY[name]
-        ctx = _bootstrap_subcommand_context(rest, state_path=state_path)
-        return handler(rest, ctx)
+        registration = SUBCOMMAND_REGISTRY[name]
+        needs_root = (
+            registration.requires_root(rest)
+            if callable(registration.requires_root)
+            else registration.requires_root
+        )
+        ctx = _bootstrap_subcommand_context(
+            rest, state_path=state_path, requires_root=needs_root
+        )
+        return registration.handler(rest, ctx)
 
     args = parse_args(argv)
 

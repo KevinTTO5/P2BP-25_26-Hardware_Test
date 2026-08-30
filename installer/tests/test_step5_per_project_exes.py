@@ -153,9 +153,20 @@ def test_registers_itself_with_the_expected_identity():
 
 
 def test_registers_the_pipeline_record_and_projects_subcommands():
-    assert app.SUBCOMMAND_REGISTRY.get("pipeline") is step5.handle_pipeline_subcommand
-    assert app.SUBCOMMAND_REGISTRY.get("record") is step5.handle_record_subcommand
-    assert app.SUBCOMMAND_REGISTRY.get("projects") is step5.handle_projects_subcommand
+    pipeline_reg = app.SUBCOMMAND_REGISTRY.get("pipeline")
+    record_reg = app.SUBCOMMAND_REGISTRY.get("record")
+    projects_reg = app.SUBCOMMAND_REGISTRY.get("projects")
+    assert pipeline_reg is not None
+    assert record_reg is not None
+    assert projects_reg is not None
+    assert pipeline_reg.handler is step5.handle_pipeline_subcommand
+    assert record_reg.handler is step5.handle_record_subcommand
+    assert projects_reg.handler is step5.handle_projects_subcommand
+    # `record`/`projects` are unaffected by unit U6's fix -- unchanged
+    # `requires_root=True` default. `pipeline` alone gets the mode-dependent
+    # predicate (see the dedicated tests below).
+    assert record_reg.requires_root is True
+    assert projects_reg.requires_root is True
 
 
 # ---------------------------------------------------------------------------
@@ -911,6 +922,30 @@ def test_pipeline_service_exec_mode_skips_ping_sweep(tmp_path, monkeypatch):
     )
     assert rc == 0
     assert "called" not in ping_called
+
+
+def test_pipeline_registration_requires_root_predicate_false_for_service_exec():
+    """unit U6's fix: `pipeline` is registered with a `requires_root`
+    predicate (not a plain bool), and `--service-exec` -- the mode
+    `mv3dt-pipeline@.service.in`'s own non-root `ExecStart=` invokes -- must
+    resolve to `False` so `app._bootstrap_subcommand_context()` skips
+    `privilege.require_root()` for it."""
+    registration = app.SUBCOMMAND_REGISTRY["pipeline"]
+    assert callable(registration.requires_root)
+    assert registration.requires_root(["--project-slug", "north-lobby", "--service-exec"]) is False
+
+
+def test_pipeline_registration_requires_root_predicate_true_for_other_modes():
+    """Every other mode -- default start, `--stop`, `--stop-all`,
+    `--foreground`, `--dry-run` -- must keep requiring root, unchanged from
+    Step 5's original behavior (STEP-6's `--stop` still shells out to
+    `systemctl stop` via `ctx.run_root`)."""
+    registration = app.SUBCOMMAND_REGISTRY["pipeline"]
+    assert registration.requires_root(["--project", "north-lobby"]) is True
+    assert registration.requires_root(["--project", "north-lobby", "--stop"]) is True
+    assert registration.requires_root(["--project", "north-lobby", "--stop-all"]) is True
+    assert registration.requires_root(["--project", "north-lobby", "--foreground"]) is True
+    assert registration.requires_root(["--project", "north-lobby", "--dry-run"]) is True
 
 
 def test_pipeline_project_slug_resolves_via_registry(tmp_path):

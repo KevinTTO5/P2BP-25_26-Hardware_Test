@@ -1534,7 +1534,30 @@ class Step5PerProjectExes:
         )
 
 
+def _pipeline_requires_root(argv: list) -> bool:
+    """`pipeline`'s root requirement is mode-dependent (unit U6's fix for a
+    PR #50 review defect): `--service-exec` is the one mode
+    `mv3dt-pipeline@.service.in`'s own `ExecStart=` invokes, as the unit's
+    non-root `User=@USER@` process (STEP-6 doc section A.2) -- so it must
+    NOT require root. Every other mode (the default start path, `--stop`,
+    `--stop-all`, `--foreground`, `--dry-run`) still calls
+    `ctx.run_root`/expects to run under `sudo`, exactly as before Step 6
+    existed, so it still requires root.
+
+    A plain substring check on the raw argv (mirroring
+    `app._bootstrap_subcommand_context()`'s own lightweight
+    `parse_known_args` peek, rather than a full
+    `_build_pipeline_arg_parser().parse_args(argv)`) is deliberate: this
+    predicate runs before a `Context` exists, so `handle_pipeline_subcommand`
+    itself is untouched -- this is purely a root-check seam in the
+    registration, not a change to the subcommand's own dispatch logic.
+    """
+    return "--service-exec" not in argv
+
+
 register(Step5PerProjectExes())
-app_mod.register_subcommand("pipeline", handle_pipeline_subcommand)
+app_mod.register_subcommand(
+    "pipeline", handle_pipeline_subcommand, requires_root=_pipeline_requires_root
+)
 app_mod.register_subcommand("record", handle_record_subcommand)
 app_mod.register_subcommand("projects", handle_projects_subcommand)
