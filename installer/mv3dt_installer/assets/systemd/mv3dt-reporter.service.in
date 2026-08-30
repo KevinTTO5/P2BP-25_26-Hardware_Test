@@ -1,0 +1,31 @@
+# Template for /etc/systemd/system/mv3dt-reporter.service
+#
+# Rendered by mv3dt_installer.steps.step7_webapp_integration via
+# systemd.render_unit(). STEP-7 section D: the registration/status reporter
+# -- the HTTP sibling of STEP-6's MQTT status publisher (STEP-6 section
+# C.5). ExecStart runs `mv3dt-installer reporter`, the subcommand
+# step7_webapp_integration.py registers via app.register_subcommand.
+#
+# Runs as @USER@ (not root, not nobody): it loads secrets/webapp.env via
+# EnvironmentFile=, which is chmod 600 and owned by the invoking user (doc
+# 00 section 9.2), and only that user can read it.
+[Unit]
+Description=mv3dt web-app status reporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+EnvironmentFile=@INSTALL_DIR@/installer.conf
+EnvironmentFile=@INSTALL_DIR@/secrets/webapp.env
+ExecStart="@INSTALLER_BIN@" reporter --install-dir "@INSTALL_DIR@" --non-interactive
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=30s
+
+[Install]
+WantedBy=multi-user.target
