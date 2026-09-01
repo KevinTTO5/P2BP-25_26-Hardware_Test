@@ -266,6 +266,49 @@ otherwise orthogonal to method — each method needs its own artifact fetched
 On re-run, preflight/`run()` detect the placed artifact (or successful docker
 login) and continue without re-prompting.
 
+### 5.4 PeopleNet model acquisition (RESOLVED)
+
+**RESOLVED.** [§11](#11-ds-91-breaking-changes-relevant-to-installverify)
+previously flagged "Step 2 owns the PeopleNet model fetch" as aspirational —
+no code path existed. It is now implemented, ported from
+`laptop/scripts/00_bootstrap.sh` Phase 10 (`ngc registry model
+download-version`), and runs unconditionally at the end of `run()` after
+whichever install-method branch (§3.1–§3.3) completes — the model Step 5's
+`deepstream-app` needs at runtime does not depend on which DS SDK install
+method was chosen.
+
+- **Target location:** `<install_dir>/deepstream/models/peoplenet/` — where
+  [`config_infer_primary.txt`](../../laptop/deepstream/config_infer_primary.txt)'s
+  relative `onnx-file=models/peoplenet/resnet34_peoplenet.onnx` and
+  `labelfile-path=models/peoplenet/labels.txt` resolve once Step 5 execs
+  `deepstream-app` with `cwd=<install_dir>/deepstream`
+  ([`STEP-4` §6.3](STEP-4-CALIB-OUTPUT-WIRING.md#63-config_infer_primarytxt-peoplenet--reference-only)/[§6.5](STEP-4-CALIB-OUTPUT-WIRING.md#65-output-tree)).
+- **Tag:** `installer.conf`'s `peoplenet_ngc_tag` key, defaulting to
+  `nvidia/tao/peoplenet:deployable_quantized_onnx_v2.6.3` — the same value
+  `laptop/config/laptop.env.example`'s `PEOPLENET_NGC_TAG` pins.
+- **Idempotency:** skipped entirely if `resnet34_peoplenet.onnx` already
+  exists non-empty at the target location.
+- **Procedure, as the invoking user (doc 00 §9.2 — `ngc`, like `docker` and
+  the AMC clone, must never run unwrapped as root):**
+  1. `which ngc` — if absent, `USER_ACTION_REQUIRED` with manual NGC CLI
+     install instructions (mirrors `00_bootstrap.sh` Phase 5's banner; this
+     installer does not auto-install the NGC CLI itself).
+  2. `ctx.ngc.configure_ngc_cli()` (doc 00 §10.2) writes `~/.ngc/config`.
+  3. `ngc registry model download-version <tag> --dest <tmp>` into a
+     throwaway directory chowned to the invoking user, then copy every file
+     under the one versioned subdirectory NGC creates into the target
+     location.
+  4. Write the fixed 3-class `labels.txt` (`person`/`bag`/`face`) if
+     missing — not downloaded, matching Phase 10's own heredoc.
+  5. Chown the whole tree to the invoking user (doc 00 §9.2).
+- **Failure modes:** a nonzero `download-version` exit (bad tag, auth) is
+  `USER_ACTION_REQUIRED`; a zero exit with no versioned subdirectory
+  produced (unexpected NGC output shape) is `FAILED` — not
+  operator-actionable the way a bad tag or missing login is.
+- **`verify()`:** fails if the ONNX file is missing under the target
+  location, independent of and in addition to the method-specific checks in
+  [§7](#7-verification-verifyctx).
+
 ---
 
 ## 6. Install location: what the path prompt governs
@@ -437,10 +480,13 @@ touched, so the transcript is uniform/greppable:
   version from the SDK `version` file).
 - docker: `report_installed("deepstream-image", "9.1-triton-multiarch")` after
   pull; `report_already_installed(...)` if the image tag is already local.
+- `report_installed("peoplenet-model", "<tag>")` after a fresh PeopleNet
+  download (§5.4); no `report_already_installed` counterpart — an
+  already-present model logs inline instead.
 
 `report()` prints a human summary block: chosen method + reason, artifact
-source (NGC-auto vs manual), DS SDK path, post-install actions performed, and
-smoke-test result. No side effects.
+source (NGC-auto vs manual), DS SDK path, post-install actions performed,
+smoke-test result, and PeopleNet model path (or `MISSING`). No side effects.
 
 ---
 
@@ -466,14 +512,11 @@ editing inference-graph config), which stays with
 [`STEP-4` §6.3](STEP-4-CALIB-OUTPUT-WIRING.md#63-config_infer_primarytxt-peoplenet--reference-only)
 and later steps.
 
-> **Open gap, not yet resolved here.** [`00` §10](00-FRAMEWORK-AND-BOOTSTRAP.md#10-ngc-api-key-capture--local-secure-storage)
+> **Resolved:** see
+> [§5.4](#54-peoplenet-model-acquisition-resolved). [`00` §10](00-FRAMEWORK-AND-BOOTSTRAP.md#10-ngc-api-key-capture--local-secure-storage)
 > and [`STEP-4` §1](STEP-4-CALIB-OUTPUT-WIRING.md#1-scope)/[§6.3](STEP-4-CALIB-OUTPUT-WIRING.md#63-config_infer_primarytxt-peoplenet--reference-only)
-> both state that Step 2 places the PeopleNet model artifacts, but §5 above
-> (Acquisition) specifies only the DS SDK artifact itself — deb/tar via
-> public GitHub Release, or the DS docker image via NGC — with no step that
-> fetches or places a PeopleNet model file anywhere. Until that acquisition
-> is actually specified (here, or explicitly reassigned elsewhere), treat
-> "Step 2 owns the PeopleNet model fetch" as aspirational, not implemented.
+> both state that Step 2 places the PeopleNet model artifacts; that
+> acquisition is now specified and implemented in §5.4.
 
 ---
 
@@ -488,6 +531,10 @@ and later steps.
 | Ambiguous method, `--non-interactive` | proceed with **deb** default |
 | deb/tar/docker install + post-install + smoke all pass | `COMPLETE` |
 | Smoke test or version pin fails | `FAILED` (with captured stderr tail) |
+| NGC CLI (`ngc`) not on `PATH` | `USER_ACTION_REQUIRED` (manual NGC CLI install, §5.4) |
+| `ngc registry model download-version` fails (bad tag, auth) | `USER_ACTION_REQUIRED` (§5.4) |
+| Download succeeds but produces no versioned subdirectory | `FAILED` (unexpected NGC output shape, not operator-actionable, §5.4) |
+| PeopleNet model missing at `verify()` | `FAILED` (re-run Step 2, §5.4) |
 
 Step 2 does **not** request a reboot (`REBOOT_REQUIRED` is unused here); the DS
 SDK install needs no reboot on top of Step 1's driver reboot.
@@ -504,6 +551,11 @@ SDK install needs no reboot on top of Step 1's driver reboot.
   to `nvcr.io` by hand, re-run (§5.2).
 - **Method choice** (ambiguous auto-detect, interactive) — pick deb/tar/docker
   from the three descriptions (§4).
+- **Manual NGC CLI install** (`ngc` not on `PATH`) — install it as the
+  invoking user, run `ngc config set`, re-run (§5.4).
+- **Check `peoplenet_ngc_tag` / NGC auth** (`ngc registry model
+  download-version` failed) — re-run once the tag/auth issue is fixed
+  (§5.4).
 
 All rendered through the framework `USER_ACTION_REQUIRED` block ending with
 "Then run the installer again to continue." (doc 00 §9.3).

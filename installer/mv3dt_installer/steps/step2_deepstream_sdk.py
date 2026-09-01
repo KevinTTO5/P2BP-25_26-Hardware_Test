@@ -47,6 +47,7 @@ import pathlib
 import platform
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Optional
@@ -147,6 +148,26 @@ _METHOD_DESCRIPTIONS: dict[Method, tuple[str, str]] = {
 CONF_METHOD_KEY = "ds_install_method"
 CONF_RELOCATABLE_KEY = "ds_relocatable"
 CONF_HOST_PIPELINE_KEY = "ds_host_pipeline_required"
+
+# doc STEP-4 section 6.3's "Step 2 owns the PeopleNet model fetch" --
+# originally Phase 10 of laptop/scripts/00_bootstrap.sh, never ported when
+# Step 1/2 replaced that script (STEP-2-DEEPSTREAM-SDK.md section 11's
+# "Open gap, not yet resolved" callout). Same default tag laptop.env.example
+# pins (laptop/config/laptop.env.example's PEOPLENET_NGC_TAG), just an
+# installer.conf key here rather than a laptop/-only env var.
+CONF_PEOPLENET_TAG_KEY = "peoplenet_ngc_tag"
+PEOPLENET_NGC_TAG_DEFAULT = "nvidia/tao/peoplenet:deployable_quantized_onnx_v2.6.3"
+
+# Relative to `ctx.install_dir` -- where `config_infer_primary.txt`'s
+# relative `onnx-file=models/peoplenet/...` / `labelfile-path=...` resolve
+# once Step 5 execs `deepstream-app` with `cwd=<install_dir>/deepstream`
+# (doc STEP-4 section 6.3/6.5's output tree).
+PEOPLENET_RELATIVE_DIR = pathlib.Path("deepstream") / "models" / "peoplenet"
+PEOPLENET_ONNX_NAME = "resnet34_peoplenet.onnx"
+PEOPLENET_LABELS_NAME = "labels.txt"
+# Fixed PeopleNet 3-class label set -- not downloaded, just written verbatim
+# (laptop/scripts/00_bootstrap.sh Phase 10, lines ~1006-1011).
+_PEOPLENET_LABELS_CONTENT = "person\nbag\nface\n"
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +472,175 @@ def _docker_login(ctx: "Context"):
 
 
 # ---------------------------------------------------------------------------
+# doc STEP-4 section 6.3 -- PeopleNet model acquisition
+#
+# Ported from laptop/scripts/00_bootstrap.sh Phase 10 (lines ~942-1014):
+# `ngc registry model download-version <tag> --dest <tmp>`, copy the one
+# versioned subdirectory NGC creates into place, write the fixed 3-class
+# labels.txt. Runs as the invoking user (doc 00 section 9.2 -- `ngc`, like
+# `docker` and the AMC clone, must never run unwrapped as root), same as
+# `ngc.configure_ngc_cli()`.
+# ---------------------------------------------------------------------------
+
+
+def _peoplenet_dir(ctx: "Context") -> pathlib.Path:
+    return ctx.install_dir / PEOPLENET_RELATIVE_DIR
+
+
+def _peoplenet_tag(ctx: "Context") -> str:
+    return (ctx.conf.get(CONF_PEOPLENET_TAG_KEY) or "").strip() or PEOPLENET_NGC_TAG_DEFAULT
+
+
+def _peoplenet_model_present(ctx: "Context") -> bool:
+    onnx_path = _peoplenet_dir(ctx) / PEOPLENET_ONNX_NAME
+    return onnx_path.is_file() and onnx_path.stat().st_size > 0
+
+
+def _write_peoplenet_labels(ctx: "Context") -> None:
+    labels_path = _peoplenet_dir(ctx) / PEOPLENET_LABELS_NAME
+    if labels_path.is_file():
+        return
+    labels_path.write_text(_PEOPLENET_LABELS_CONTENT, encoding="utf-8")
+    try:
+        os.chown(labels_path, ctx.user.uid, ctx.user.gid)
+    except OSError:
+        pass  # best-effort, e.g. under a non-root test process
+
+
+def _ngc_cli_missing_action(ctx: "Context") -> UserAction:
+    """Mirrors 00_bootstrap.sh Phase 5's manual-install banner -- this
+    installer does not attempt to fetch/install the NGC CLI itself, the
+    same way it never auto-installs Docker or the NVIDIA driver."""
+    return UserAction(
+        text=(
+            "Install the NGC CLI as your regular user, run 'ngc config "
+            "set' (API key, ascii, your NGC org -- see "
+            "https://ngc.nvidia.com/setup), then re-run this step."
+        ),
+        command=(
+            "cd ~ && mkdir -p ngc-cli && cd ngc-cli && "
+            "curl -LO https://ngc.nvidia.com/downloads/ngccli_linux.zip && "
+            "unzip -o ngccli_linux.zip && chmod u+x ngc-cli/ngc && "
+            'echo \'export PATH="$HOME/ngc-cli/ngc-cli:$PATH"\' >> ~/.bashrc'
+        ),
+        path=str(ctx.user.home / "ngc-cli"),
+    )
+
+
+def _download_peoplenet(
+    ctx: "Context", target_dir: pathlib.Path, tag: str
+) -> Optional[tuple[str, StepStatus]]:
+    """Runs `ngc registry model download-version` into a throwaway tmp dir
+    (chowned to the invoking user so `ngc`, run as that user, can write
+    into it) and copies every file under the one versioned subdirectory NGC
+    creates into `target_dir`. Returns `(error_message, status)` on failure
+    -- `USER_ACTION_REQUIRED` for a command failure the operator can act on
+    (bad tag, auth), `FAILED` for an unexpected NGC output shape -- or
+    `None` on success."""
+    tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="mv3dt-peoplenet-"))
+    try:
+        os.chown(tmp_dir, ctx.user.uid, ctx.user.gid)
+    except OSError:
+        pass
+
+    try:
+        result = _run_as_user(
+            ctx, "ngc", "registry", "model", "download-version", tag, "--dest", str(tmp_dir)
+        )
+        if result.returncode != 0:
+            return (
+                f"ngc registry model download-version {tag} failed "
+                f"(exit {result.returncode}): {(result.stderr or '').strip()[-2000:]}",
+                StepStatus.USER_ACTION_REQUIRED,
+            )
+
+        version_dirs = [p for p in tmp_dir.iterdir() if p.is_dir()]
+        if not version_dirs:
+            return (
+                f"ngc registry model download-version {tag} produced no "
+                f"versioned subdirectory under its --dest",
+                StepStatus.FAILED,
+            )
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for version_dir in version_dirs:
+            for entry in version_dir.rglob("*"):
+                if not entry.is_file():
+                    continue
+                dest = target_dir / entry.relative_to(version_dir)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(entry, dest)
+
+        return None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _ensure_peoplenet_model(ctx: "Context") -> Optional[StepResult]:
+    """Ensure the PeopleNet ONNX + labels.txt exist under
+    `_peoplenet_dir(ctx)`. Returns `None` on success (already present, or
+    freshly downloaded), else the `StepResult` `run()` should return as-is.
+    """
+    target_dir = _peoplenet_dir(ctx)
+
+    if _peoplenet_model_present(ctx):
+        log.info(f"PeopleNet model already present: {target_dir / PEOPLENET_ONNX_NAME}")
+        _write_peoplenet_labels(ctx)
+        return None
+
+    which_ngc = _run_as_user(ctx, "which", "ngc")
+    if which_ngc.returncode != 0:
+        return StepResult(
+            status=StepStatus.USER_ACTION_REQUIRED,
+            message="NGC CLI ('ngc') not found; cannot download the PeopleNet model",
+            user_actions=[_ngc_cli_missing_action(ctx)],
+        )
+
+    ctx.ngc.configure_ngc_cli()
+
+    tag = _peoplenet_tag(ctx)
+    failure = _download_peoplenet(ctx, target_dir, tag)
+    if failure is not None:
+        message, status = failure
+        user_actions = (
+            [
+                UserAction(
+                    text=(
+                        f"Check {CONF_PEOPLENET_TAG_KEY} and that 'ngc config "
+                        "set' has run for this user, then re-run this step."
+                    ),
+                    command=f"ngc registry model download-version {tag} --dest <dir>",
+                    path=str(target_dir),
+                )
+            ]
+            if status is StepStatus.USER_ACTION_REQUIRED
+            else []
+        )
+        return StepResult(status=status, message=message, user_actions=user_actions)
+
+    if not _peoplenet_model_present(ctx):
+        return StepResult(
+            status=StepStatus.FAILED,
+            message=(
+                f"ngc download completed but {PEOPLENET_ONNX_NAME} still "
+                f"not found under {target_dir}"
+            ),
+        )
+
+    try:
+        os.chown(target_dir, ctx.user.uid, ctx.user.gid)
+        for entry in target_dir.rglob("*"):
+            os.chown(entry, ctx.user.uid, ctx.user.gid)
+    except OSError:
+        pass  # best-effort, e.g. under a non-root test process
+
+    _write_peoplenet_labels(ctx)
+    ctx.report_installed("peoplenet-model", tag)
+    log.info(f"PeopleNet model downloaded to {target_dir}")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # doc section 9 -- post-install tail (host installs only)
 # ---------------------------------------------------------------------------
 
@@ -709,10 +899,22 @@ class Step2DeepStreamSdk:
         self._smoke_passed = None
 
         if method is Method.DEB:
-            return self._run_deb(ctx)
-        if method is Method.TAR:
-            return self._run_tar(ctx)
-        return self._run_docker(ctx)
+            result = self._run_deb(ctx)
+        elif method is Method.TAR:
+            result = self._run_tar(ctx)
+        else:
+            result = self._run_docker(ctx)
+
+        if result.status is not StepStatus.COMPLETE:
+            return result
+
+        # doc STEP-4 section 6.3: Step 2 owns the PeopleNet model fetch,
+        # independent of which DS SDK install method was chosen -- Step 5
+        # execs deepstream-app against `<install_dir>/deepstream` regardless.
+        peoplenet_result = _ensure_peoplenet_model(ctx)
+        if peoplenet_result is not None:
+            return peoplenet_result
+        return result
 
     def _run_deb(self, ctx: "Context") -> StepResult:
         existing = _dpkg_version(ctx)
@@ -846,8 +1048,23 @@ class Step2DeepStreamSdk:
             )
 
         if method is Method.DOCKER:
-            return self._verify_docker(ctx)
-        return self._verify_host(ctx, method)
+            result = self._verify_docker(ctx)
+        else:
+            result = self._verify_host(ctx, method)
+
+        if result.status is not StepStatus.COMPLETE:
+            return result
+
+        if not _peoplenet_model_present(ctx):
+            return StepResult(
+                status=StepStatus.FAILED,
+                message=(
+                    f"PeopleNet model not found under {_peoplenet_dir(ctx)}; "
+                    "re-run Step 2 (--reset-step 2)"
+                ),
+            )
+
+        return result
 
     def _verify_host(self, ctx: "Context", method: Method) -> StepResult:
         pin_failure = _check_prereq_pins(ctx)
@@ -1009,6 +1226,12 @@ class Step2DeepStreamSdk:
             "  post-install actions: "
             + (", ".join(actions) if actions else "none (already installed)")
         )
+        peoplenet_status = (
+            f"present at {_peoplenet_dir(ctx) / PEOPLENET_ONNX_NAME}"
+            if _peoplenet_model_present(ctx)
+            else "MISSING"
+        )
+        log.info(f"  PeopleNet model: {peoplenet_status}")
         # doc section 9 point 1: a non-zero update_rtpmanager.sh exit is
         # only a warning, but it must be surfaced here. Host installs only
         # -- docker skips the host post-install tail entirely (doc

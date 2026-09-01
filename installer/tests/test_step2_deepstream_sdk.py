@@ -324,6 +324,7 @@ def test_run_deb_already_installed_skips_download(tmp_path):
     runner_root.when(lambda a: a[:2] == ("dpkg", "-s"), stdout="Version: 9.1.0-1\n")
     runner_user = ScriptedRunner()
     ctx = FakeContext(tmp_path, runner_root=runner_root, runner_user=runner_user)
+    _peoplenet_ready(ctx)
 
     step = step2.Step2DeepStreamSdk()
     result = step.run(ctx)
@@ -379,6 +380,7 @@ def test_run_deb_fresh_install_reports_installed_and_completes(tmp_path):
         returncode=0,
         side_effect=lambda: artifact_path.write_bytes(b"stub"),
     )
+    _peoplenet_ready(ctx)
 
     step = step2.Step2DeepStreamSdk()
     result = step.run(ctx)
@@ -403,6 +405,7 @@ def test_run_docker_already_local_skips_login_and_pull(tmp_path):
     runner_user = ScriptedRunner()
     runner_user.when(lambda a: a[:3] == ("docker", "image", "inspect"), returncode=0)
     ctx = FakeContext(tmp_path, conf={"ds_install_method": "docker"}, runner_user=runner_user)
+    _peoplenet_ready(ctx)
 
     step = step2.Step2DeepStreamSdk()
     result = step.run(ctx)
@@ -446,6 +449,7 @@ def test_run_docker_success_reports_installed(tmp_path):
     runner_user.when(lambda a: a[:2] == ("docker", "pull"), returncode=0)
     ngc = FakeNgc()
     ctx = FakeContext(tmp_path, conf={"ds_install_method": "docker"}, runner_user=runner_user, ngc=ngc)
+    _peoplenet_ready(ctx)
 
     step = step2.Step2DeepStreamSdk()
     result = step.run(ctx)
@@ -540,17 +544,28 @@ def test_verify_host_fails_when_sdk_dir_missing(tmp_path, _sdk_paths):
     assert "not found after install" in result.message
 
 
+def _peoplenet_ready(ctx) -> pathlib.Path:
+    """Pre-place the PeopleNet ONNX (doc STEP-4 section 6.3) so a test
+    about DS SDK install/verify -- not about PeopleNet acquisition itself
+    -- doesn't also have to stub the `ngc` CLI."""
+    onnx_path = step2._peoplenet_dir(ctx) / step2.PEOPLENET_ONNX_NAME
+    onnx_path.parent.mkdir(parents=True, exist_ok=True)
+    onnx_path.write_bytes(b"stub-onnx")
+    return onnx_path
+
+
 def _make_sdk_tree(ctx, sdk_dir, symlink, profile, *, version_text="DeepStream 9.1.0\n"):
-    """Simulate a completed `run()`: SDK tree, symlink, profile.d, and the
-    doc section 7.1 item 4 rtpmanager marker all present. Requires `ctx`
-    (not just paths) since the marker lives under `ctx.install_dir`, not a
-    fixed path."""
+    """Simulate a completed `run()`: SDK tree, symlink, profile.d, the
+    doc section 7.1 item 4 rtpmanager marker, and the PeopleNet model all
+    present. Requires `ctx` (not just paths) since the marker and the
+    PeopleNet dir both live under `ctx.install_dir`, not a fixed path."""
     sdk_dir.mkdir(parents=True)
     (sdk_dir / "version").write_text(version_text)
     symlink.symlink_to(sdk_dir)
     profile.parent.mkdir(parents=True, exist_ok=True)
     profile.write_text(step2._PROFILE_D_CONTENT)
     step2._write_rtpmanager_marker(ctx, "ok", 0)
+    _peoplenet_ready(ctx)
 
 
 def test_verify_host_fails_on_version_mismatch(tmp_path, _sdk_paths):
@@ -696,6 +711,7 @@ def test_verify_docker_passes_end_to_end(tmp_path):
         runner_root=_passing_pin_runner(),
         runner_user=runner_user,
     )
+    _peoplenet_ready(ctx)
 
     step = step2.Step2DeepStreamSdk()
     result = step.verify(ctx)
@@ -808,6 +824,7 @@ def test_full_lifecycle_all_pass_is_complete(tmp_path, _sdk_paths):
     # 7.1 item 4 requires must have been left by a prior real run. Seed it
     # the same way `_make_sdk_tree` does for the standalone verify() tests.
     step2._write_rtpmanager_marker(ctx, "ok", 0)
+    _peoplenet_ready(ctx)
 
     step = step2.Step2DeepStreamSdk()
 
@@ -819,3 +836,217 @@ def test_full_lifecycle_all_pass_is_complete(tmp_path, _sdk_paths):
 
     verify_result = step.verify(ctx)
     assert verify_result.status is StepStatus.COMPLETE
+
+
+# ---------------------------------------------------------------------------
+# PeopleNet model acquisition -- doc STEP-4 section 6.3 (ported from
+# laptop/scripts/00_bootstrap.sh Phase 10, previously never implemented --
+# see STEP-2-DEEPSTREAM-SDK.md section 11's "Open gap, not yet resolved").
+# ---------------------------------------------------------------------------
+
+
+def _ngc_download_side_effect(runner):
+    """Simulates `ngc registry model download-version`: writes a stub ONNX
+    + labels.txt under a versioned subdirectory of whatever `--dest` the
+    call under test used (read back from `runner.calls[-1]`, appended by
+    `ScriptedRunner.__call__` before rules are matched)."""
+
+    def _write():
+        args = runner.calls[-1]
+        dest = pathlib.Path(args[-1])
+        version_dir = dest / "peoplenet_vdeployable_quantized_onnx_v2.6.3"
+        version_dir.mkdir(parents=True)
+        (version_dir / step2.PEOPLENET_ONNX_NAME).write_bytes(b"onnx-bytes")
+        (version_dir / "labels.txt").write_text("person\nbag\nface\n")
+
+    return _write
+
+
+def test_ensure_peoplenet_skips_when_already_present(tmp_path):
+    runner_user = ScriptedRunner()  # unconfigured: any real call would fail
+    ctx = FakeContext(tmp_path, runner_user=runner_user)
+    _peoplenet_ready(ctx)
+
+    result = step2._ensure_peoplenet_model(ctx)
+
+    assert result is None
+    assert not runner_user.calls  # never even checked for the ngc CLI
+
+
+def test_ensure_peoplenet_writes_labels_when_onnx_present_but_labels_missing(tmp_path):
+    ctx = FakeContext(tmp_path)
+    onnx_path = _peoplenet_ready(ctx)
+
+    result = step2._ensure_peoplenet_model(ctx)
+
+    assert result is None
+    labels_path = onnx_path.parent / step2.PEOPLENET_LABELS_NAME
+    assert labels_path.read_text(encoding="utf-8") == "person\nbag\nface\n"
+
+
+def test_ensure_peoplenet_user_action_required_when_ngc_cli_missing(tmp_path):
+    runner_user = ScriptedRunner(default_returncode=1)  # `which ngc` -> not found
+    ctx = FakeContext(tmp_path, runner_user=runner_user)
+
+    result = step2._ensure_peoplenet_model(ctx)
+
+    assert result is not None
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert "NGC CLI" in result.message
+    assert result.user_actions
+    assert "ngc config set" in result.user_actions[0].text
+
+
+def test_ensure_peoplenet_downloads_and_places_model(tmp_path):
+    runner_user = ScriptedRunner(default_returncode=0)
+    runner_user.when(lambda a: a == ("which", "ngc"), returncode=0)
+    runner_user.when(
+        lambda a: a[:4] == ("ngc", "registry", "model", "download-version"),
+        returncode=0,
+        side_effect=_ngc_download_side_effect(runner_user),
+    )
+    ngc = FakeNgc()
+    ctx = FakeContext(tmp_path, runner_user=runner_user, ngc=ngc)
+
+    result = step2._ensure_peoplenet_model(ctx)
+
+    assert result is None
+    assert ngc.configure_calls == 1
+    target_dir = step2._peoplenet_dir(ctx)
+    assert (target_dir / step2.PEOPLENET_ONNX_NAME).read_bytes() == b"onnx-bytes"
+    assert (target_dir / step2.PEOPLENET_LABELS_NAME).is_file()
+    assert runner_user.called_with_prefix(
+        "ngc", "registry", "model", "download-version", step2.PEOPLENET_NGC_TAG_DEFAULT
+    )
+
+
+def test_ensure_peoplenet_uses_conf_override_tag(tmp_path):
+    custom_tag = "nvidia/tao/peoplenet:custom_tag"
+    runner_user = ScriptedRunner(default_returncode=0)
+    runner_user.when(lambda a: a == ("which", "ngc"), returncode=0)
+    runner_user.when(
+        lambda a: a[:4] == ("ngc", "registry", "model", "download-version"),
+        returncode=0,
+        side_effect=_ngc_download_side_effect(runner_user),
+    )
+    ctx = FakeContext(
+        tmp_path, conf={step2.CONF_PEOPLENET_TAG_KEY: custom_tag}, runner_user=runner_user
+    )
+
+    result = step2._ensure_peoplenet_model(ctx)
+
+    assert result is None
+    assert runner_user.called_with_prefix(
+        "ngc", "registry", "model", "download-version", custom_tag
+    )
+
+
+def test_ensure_peoplenet_download_failure_is_user_action_required(tmp_path):
+    runner_user = ScriptedRunner(default_returncode=0)
+    runner_user.when(lambda a: a == ("which", "ngc"), returncode=0)
+    runner_user.when(
+        lambda a: a[:4] == ("ngc", "registry", "model", "download-version"),
+        returncode=1,
+        stderr="unauthorized",
+    )
+    ctx = FakeContext(tmp_path, runner_user=runner_user)
+
+    result = step2._ensure_peoplenet_model(ctx)
+
+    assert result is not None
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert "download-version" in result.message
+    assert "unauthorized" in result.message
+
+
+def test_ensure_peoplenet_no_versioned_subdir_is_failed(tmp_path):
+    runner_user = ScriptedRunner(default_returncode=0)
+    runner_user.when(lambda a: a == ("which", "ngc"), returncode=0)
+    # download-version "succeeds" but writes nothing under --dest.
+    runner_user.when(
+        lambda a: a[:4] == ("ngc", "registry", "model", "download-version"), returncode=0
+    )
+    ctx = FakeContext(tmp_path, runner_user=runner_user)
+
+    result = step2._ensure_peoplenet_model(ctx)
+
+    assert result is not None
+    assert result.status is StepStatus.FAILED
+    assert "no versioned subdirectory" in result.message
+
+
+def test_run_deb_already_installed_still_fetches_peoplenet(tmp_path):
+    """run()'s DS-install shortcut (already-installed deb) must not skip
+    the PeopleNet fetch -- doc STEP-4 section 6.3 makes it Step 2's job
+    independent of which install-method branch ran."""
+    runner_root = ScriptedRunner()
+    runner_root.when(lambda a: a[:2] == ("dpkg", "-s"), stdout="Version: 9.1.0-1\n")
+    runner_user = ScriptedRunner(default_returncode=0)
+    runner_user.when(lambda a: a == ("which", "ngc"), returncode=0)
+    runner_user.when(
+        lambda a: a[:4] == ("ngc", "registry", "model", "download-version"),
+        returncode=0,
+        side_effect=_ngc_download_side_effect(runner_user),
+    )
+    ctx = FakeContext(tmp_path, runner_root=runner_root, runner_user=runner_user)
+
+    step = step2.Step2DeepStreamSdk()
+    result = step.run(ctx)
+
+    assert result.status is StepStatus.COMPLETE
+    assert (step2._peoplenet_dir(ctx) / step2.PEOPLENET_ONNX_NAME).is_file()
+
+
+def test_run_deb_already_installed_peoplenet_failure_overrides_complete(tmp_path):
+    runner_root = ScriptedRunner()
+    runner_root.when(lambda a: a[:2] == ("dpkg", "-s"), stdout="Version: 9.1.0-1\n")
+    runner_user = ScriptedRunner(default_returncode=1)  # `which ngc` -> not found
+    ctx = FakeContext(tmp_path, runner_root=runner_root, runner_user=runner_user)
+
+    step = step2.Step2DeepStreamSdk()
+    result = step.run(ctx)
+
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert "NGC CLI" in result.message
+
+
+def test_verify_host_fails_when_peoplenet_model_missing(tmp_path, _sdk_paths):
+    """verify() must fail even when the DS SDK itself verifies clean, if
+    the PeopleNet model Step 5 needs at runtime was never fetched."""
+    sdk_dir, symlink, profile = _sdk_paths
+    runner = _host_ready_runner()
+    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
+    sdk_dir.mkdir(parents=True)
+    (sdk_dir / "version").write_text("DeepStream 9.1.0\n")
+    symlink.symlink_to(sdk_dir)
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    profile.write_text(step2._PROFILE_D_CONTENT)
+    step2._write_rtpmanager_marker(ctx, "ok", 0)
+    # Deliberately no _peoplenet_ready(ctx) call.
+
+    step = step2.Step2DeepStreamSdk()
+    result = step.verify(ctx)
+
+    assert result.status is StepStatus.FAILED
+    assert "PeopleNet model not found" in result.message
+
+
+def test_report_logs_peoplenet_present(tmp_path, capsys):
+    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"})
+    onnx_path = _peoplenet_ready(ctx)
+
+    step = step2.Step2DeepStreamSdk()
+    step.report(ctx)
+
+    captured = capsys.readouterr()
+    assert str(onnx_path) in captured.err
+
+
+def test_report_logs_peoplenet_missing(tmp_path, capsys):
+    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"})
+
+    step = step2.Step2DeepStreamSdk()
+    step.report(ctx)
+
+    captured = capsys.readouterr()
+    assert "PeopleNet model: MISSING" in captured.err
