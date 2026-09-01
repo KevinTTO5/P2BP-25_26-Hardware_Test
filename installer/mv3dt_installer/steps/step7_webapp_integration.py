@@ -1293,7 +1293,10 @@ class Step7WebappIntegration:
         run_dir = pathlib.Path(ctx.install_dir) / "run"
         for directory in (webapp_dir, run_dir):
             directory.mkdir(parents=True, exist_ok=True)
-            os.chown(directory, ctx.user.uid, ctx.user.gid)
+            try:
+                os.chown(directory, ctx.user.uid, ctx.user.gid)
+            except OSError:
+                pass  # best-effort, e.g. under a non-root test process
 
         reporter_changed, uploader_changed = _install_units(ctx)
 

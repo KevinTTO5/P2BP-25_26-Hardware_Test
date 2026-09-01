@@ -418,6 +418,13 @@ def test_confirmed_reboot_still_lets_launch_b_run_on_next_dispatch(tmp_path, mon
     sm = StateMachine(path=tmp_path / "state.json")
     step = s1.Step1Prerequisites()
 
+    # Isolate the registry to just this step: `_dispatch()` walks the real
+    # module-global `STEP_REGISTRY`, which in a full test-suite run also
+    # holds every other step registered by sibling test modules' imports.
+    # Without this, Launch B's dispatch would also run step2's verify()
+    # against a ctx that was only ever set up to satisfy step1's pins.
+    monkeypatch.setattr(app_mod, "STEP_REGISTRY", [step])
+
     # -- Launch A: driver not loaded, .run staged -> reboot instructions.
     ctx_a, runner_a = _make_ctx(tmp_path, driver_version="")
     _stage_driver_run(ctx_a)

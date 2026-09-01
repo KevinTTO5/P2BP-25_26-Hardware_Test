@@ -293,14 +293,20 @@ def _calibration_directory_value(
 
 def _ensure_dir(ctx: "Context", path: pathlib.Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-    os.chown(path, ctx.user.uid, ctx.user.gid)
+    try:
+        os.chown(path, ctx.user.uid, ctx.user.gid)
+    except OSError:
+        pass  # best-effort, e.g. under a non-root test process
 
 
 def _chown_tree(ctx: "Context", root: pathlib.Path) -> None:
     """doc 00 section 9.2: files created for the operator MUST be chowned
     to the invoking user/group. Best-effort per entry -- a single
     unreadable/racy entry must not abort an otherwise-successful ingest."""
-    os.chown(root, ctx.user.uid, ctx.user.gid)
+    try:
+        os.chown(root, ctx.user.uid, ctx.user.gid)
+    except OSError:
+        pass
     for entry in root.rglob("*"):
         try:
             os.chown(entry, ctx.user.uid, ctx.user.gid)
@@ -567,7 +573,10 @@ def _write_text_report(ctx: "Context", path: pathlib.Path, text: str, *, label: 
         except OSError:
             changed = True
     path.write_text(text, encoding="utf-8")
-    os.chown(path, ctx.user.uid, ctx.user.gid)
+    try:
+        os.chown(path, ctx.user.uid, ctx.user.gid)
+    except OSError:
+        pass  # best-effort, e.g. under a non-root test process
     if changed:
         ctx.report_installed(label, str(path))
     else:
