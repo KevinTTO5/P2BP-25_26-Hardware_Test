@@ -71,6 +71,10 @@ P2BP Senior Design (Fall '25 – Spring '26) hardware stack for a multi-camera
   (operator secrets) is not committed — only `laptop.env.example` is.
 - Line endings are enforced LF via `.gitattributes`; images/weights/binaries
   are marked binary there — don't hand-edit or re-encode those.
+- Whenever creating a git commit in this repo — a plain commit, a
+  `parallel-worktree-dev` unit's commit, or a `merge-prs` squash-merge — use
+  the `git-commits` skill. Commits carry no `Co-Authored-By` trailer, no
+  `Claude-Session` link, no agent-authorship footer of any kind.
 
 ## Documentation
 
