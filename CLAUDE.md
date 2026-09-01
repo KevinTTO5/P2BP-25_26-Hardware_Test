@@ -42,16 +42,13 @@ P2BP Senior Design (Fall '25 – Spring '26) hardware stack for a multi-camera
   run in order from a clone, each idempotent. It is how this repo is exercised
   by hand, not how an operator installs anything. See the script table in
   [`laptop/docs/SCRIPTED-WORKFLOW.md`](laptop/docs/SCRIPTED-WORKFLOW.md).
-- **Exactly two `laptop/scripts/` entries are meant to be bundled into the
-  binary (PLANNED):** `10_setup_mosquitto.sh` (owned by `STEP-1` §3.2) and
-  `60_record_tracking.sh` (producer of the `tracks.jsonl` / `tracks.csv` /
-  `summary.json` artifacts `STEP-7` §E.1 uploads). Their **authoritative
-  copies will live under `installer/mv3dt_installer/assets/scripts/`**, but
-  that directory currently holds only a `.gitkeep` — the real copies land
-  with the sibling unit that bundles the scripts (U12,
-  `feat/installer-bundled-scripts`), not yet merged. Once they land, the
-  `laptop/` originals stay developer-only and are not kept in sync
-  automatically. Everything else is
+- **Exactly two `laptop/scripts/` entries are bundled into the binary:**
+  `10_setup_mosquitto.sh` (owned by `STEP-1` §3.2) and `60_record_tracking.sh`
+  (producer of the `tracks.jsonl` / `tracks.csv` / `summary.json` artifacts
+  `STEP-7` §E.1 uploads). Their **authoritative copies live under
+  `installer/mv3dt_installer/assets/scripts/`** (landed by U12,
+  `feat/installer-bundled-scripts`); the `laptop/` originals stay
+  developer-only and are not kept in sync automatically. Everything else is
   either superseded by a step or dropped from the binary —
   `70_plot_floorplan.py` (matplotlib bloat; the web app visualizes),
   `record_cameras_mp4.sh`, `view_cameras.sh`, and `20_verify_cameras.sh` as an

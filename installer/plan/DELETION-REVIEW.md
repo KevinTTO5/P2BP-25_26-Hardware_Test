@@ -332,10 +332,11 @@ deletion in this document is destructive to the object store.
 repo's GitHub Releases page** ([`00` §5](00-FRAMEWORK-AND-BOOTSTRAP.md#5-distribution-the-github-release-binary)).
 Nothing clones this repo onto a workstation, so no numbered script under
 [`laptop/scripts/`](../../laptop/scripts/) is reachable by an operator unless
-it is **bundled into the binary**. Exactly two are meant to be, but this is
-still **PLANNED**: `installer/mv3dt_installer/assets/scripts/` currently holds
-only a `.gitkeep`, and the real copies land in the sibling unit that bundles
-the scripts (U12, `feat/installer-bundled-scripts`), not yet merged.
+it is **bundled into the binary**. Exactly two are: `installer/mv3dt_installer/assets/scripts/`
+holds `10_setup_mosquitto.sh`, `60_record_tracking.sh`, and a purpose-written
+`lib/common.sh` sibling, landed by U12 (`feat/installer-bundled-scripts`,
+commit `8157dfc`) and shell-linted (`bash -n`) on every push/PR by
+`installer-tests.yml`.
 
 Everything else stays in git — deleting a script that no longer ships is not
 the same decision as deleting one nothing needs, and the developer harness is
@@ -358,12 +359,8 @@ still how this repo is exercised from a clone.
 
 ### 8.1 Which copy do I edit?
 
-**REQUIRED (PLANNED).** Two of these scripts are meant to exist in two
-places, and the answer is not "whichever one you opened" — but the second
-place does not exist yet. `installer/mv3dt_installer/assets/scripts/`
-currently holds only a `.gitkeep`; the real `assets/scripts/` copies land
-with U12 (`feat/installer-bundled-scripts`), not yet merged. This section
-records the rule those copies must follow once they land.
+**REQUIRED.** Two of these scripts exist in two places, and the answer is
+not "whichever one you opened".
 
 | You are changing… | Edit | Do **not** edit |
 |---|---|---|

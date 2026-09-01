@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pathlib
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -575,3 +576,85 @@ def test_exec_start_lookup_does_not_follow_more_than_one_unit_hop(
 )
 def test_templates_are_bundled_under_assets_systemd(name):
     assert shellout.asset_path("systemd", name).is_file()
+
+
+# ---------------------------------------------------------------------------
+# Every bundled template renders to a unit systemd itself accepts as valid.
+#
+# render_unit()'s own marker-survival check (test_render_unit_raises_when_a_
+# marker_survives, above) only catches an unsubstituted @MARKER@ -- it says
+# nothing about whether the *substituted* text is a well-formed unit file.
+# A directive misplaced between [Unit]/[Service]/[Install] (e.g.
+# StartLimitIntervalSec landing in [Service], where systemd silently drops
+# it instead of erroring) renders cleanly and passes every other test here,
+# but is still wrong. `systemd-analyze verify` is the only thing that
+# actually parses the file the way systemd will.
+# ---------------------------------------------------------------------------
+
+#: Realistic substitutions for every marker `render_unit` requires per
+#: template. Values don't need to resolve to anything real on disk --
+#: `systemd-analyze verify` only complains about the ExecStart *binary*
+#: being unexecutable, which every case here still triggers (there is no
+#: real /opt/mv3dt on a CI runner or dev box); that specific complaint is
+#: filtered out below since it's a "not installed yet" fact, not a unit
+#: syntax/section problem.
+_TEMPLATE_CASES = {
+    "mv3dt-agent.service.in": {"USER": "mv3dt"},
+    "mv3dt-pipeline@.service.in": {"USER": "mv3dt"},
+    "mv3dt-reporter.service.in": {
+        "USER": "mv3dt",
+        "INSTALL_DIR": "/opt/mv3dt",
+        "INSTALLER_BIN": "/opt/mv3dt/bin/mv3dt-installer",
+    },
+    "mv3dt-uploader.service.in": {
+        "USER": "mv3dt",
+        "INSTALL_DIR": "/opt/mv3dt",
+        "INSTALLER_BIN": "/opt/mv3dt/bin/mv3dt-installer",
+    },
+    "mv3dt-ingest.path.in": {
+        "EXPORT_DIR": "/home/mv3dt/exports",
+        "PROJECT": "test-lab-01",
+        "SLUG": "test-lab-01",
+    },
+    "mv3dt-ingest.service.in": {
+        "EXPORT_DIR": "/home/mv3dt/exports",
+        "PROJECT": "test-lab-01",
+        "SLUG": "test-lab-01",
+        "INSTALL_DIR": "/opt/mv3dt",
+        "INSTALLER_BIN": "/opt/mv3dt/bin/mv3dt-installer",
+    },
+}
+
+
+@pytest.mark.parametrize("name", sorted(_TEMPLATE_CASES))
+def test_rendered_template_passes_systemd_analyze_verify(name, tmp_path):
+    systemd_analyze = shutil.which("systemd-analyze")
+    if systemd_analyze is None:
+        pytest.skip("systemd-analyze not on PATH (non-systemd dev environment)")
+
+    rendered = systemd.render_unit(("systemd", name), _TEMPLATE_CASES[name])
+
+    # `mv3dt-pipeline@.service.in` is a genuine systemd template unit --
+    # `systemd-analyze verify` needs an instantiated `@<instance>.service`
+    # filename (not the bare `@.service` template name) to load it at all.
+    unit_name = name.removesuffix(".in")
+    if unit_name.endswith("@.service"):
+        unit_name = unit_name.replace("@.service", "@test-instance.service")
+    unit_path = tmp_path / unit_name
+    unit_path.write_text(rendered, encoding="utf-8")
+
+    result = subprocess.run(
+        [systemd_analyze, "verify", "--recursive-errors=no", str(unit_path)],
+        capture_output=True,
+        text=True,
+    )
+    problems = [
+        line
+        for line in (result.stdout + result.stderr).splitlines()
+        # The only expected complaint on a box without a real
+        # /opt/mv3dt/bin/mv3dt-installer: not a unit-syntax/section problem.
+        if "is not executable" not in line
+    ]
+    assert not problems, (
+        f"systemd-analyze verify flagged {name}:\n" + "\n".join(problems)
+    )

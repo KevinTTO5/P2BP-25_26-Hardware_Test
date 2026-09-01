@@ -45,6 +45,12 @@ jobs:
           bash -n installer/mv3dt_installer/assets/scripts/lib/common.sh
           echo "bundled scripts parse OK"
 
+      # ubuntu-latest ships systemd-analyze; fail loudly rather than let
+      # test_systemd.py's systemd-analyze-verify tests silently skip if a
+      # future runner image ever drops it.
+      - name: Confirm systemd-analyze is available
+        run: command -v systemd-analyze
+
       - name: Run pytest
         working-directory: installer
         run: python -m pytest tests/ -v

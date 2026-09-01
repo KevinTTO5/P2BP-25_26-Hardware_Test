@@ -7,6 +7,8 @@
 Description=MV3DT remote control agent (MQTT command consumer)
 After=network-online.target mosquitto.service
 Wants=network-online.target mosquitto.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -16,8 +18,6 @@ WorkingDirectory=/opt/mv3dt
 
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 EnvironmentFile=/opt/mv3dt/installer.conf
 EnvironmentFile=-/opt/mv3dt/agent/agent.env

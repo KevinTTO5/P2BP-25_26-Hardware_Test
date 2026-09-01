@@ -7,14 +7,16 @@
 # slug), resolved natively at `systemctl start mv3dt-pipeline@<slug>` time and
 # never touched by the installer. The one installer-time substitution is
 # `@USER@` -- there is no systemd specifier for "the invoking user of the
-# installer" -- filled in once via render_unit()'s @MARKER@ convention, the
-# same mechanism mv3dt-ingest.*.in uses (STEP-6-REMOTE-SUPERVISION.md section
-# A.1).
+# installer" -- filled in once via render_unit()'s at-sign-delimited-marker
+# convention, the same mechanism mv3dt-ingest.*.in uses
+# (STEP-6-REMOTE-SUPERVISION.md section A.1).
 [Unit]
 Description=MV3DT DeepStream pipeline (%i)
 After=network-online.target mosquitto.service
 Wants=network-online.target
 Requires=mosquitto.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -33,8 +35,6 @@ ExecStop=/opt/mv3dt/bin/mv3dt-installer pipeline --project-slug %i --stop
 # clean --stop / systemctl stop does not trigger a restart loop.
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # Graceful teardown mirrors 99_stop_all.sh: SIGTERM, then SIGKILL after grace.
 KillSignal=SIGTERM
