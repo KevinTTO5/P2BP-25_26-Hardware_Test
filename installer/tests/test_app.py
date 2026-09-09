@@ -515,6 +515,55 @@ def test_build_context_bindings_work(tmp_path, capsys):
     assert result.returncode == 0
 
 
+def test_run_root_missing_executable_returns_127_instead_of_raising(tmp_path):
+    """Regression for the crash seen on a fresh, driver-less workstation:
+    `_driver_loaded()` (step1_prerequisites.py) calls `ctx.run_root("nvidia-
+    smi", ..., check=False, capture_output=True, text=True)` expecting
+    "not installed yet" to look like a nonzero returncode. Before this fix,
+    a genuinely-missing executable raised `FileNotFoundError` straight out
+    of `subprocess.run` -- before `check` is ever consulted -- crashing the
+    installer instead of driving Step 1 into its "install the driver" path.
+    """
+    ctx, _cfg = _minimal_ctx(tmp_path)
+
+    result = ctx.run_root(
+        "this-binary-does-not-exist-on-any-path",
+        "--query-gpu=driver_version",
+        "--format=csv,noheader",
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 127
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_run_root_missing_executable_without_capture_leaves_streams_none(tmp_path):
+    ctx, _cfg = _minimal_ctx(tmp_path)
+
+    result = ctx.run_root(
+        "this-binary-does-not-exist-on-any-path", check=False
+    )
+
+    assert result.returncode == 127
+    assert result.stdout is None
+    assert result.stderr is None
+
+
+def test_run_root_missing_executable_binary_mode_when_not_text(tmp_path):
+    ctx, _cfg = _minimal_ctx(tmp_path)
+
+    result = ctx.run_root(
+        "this-binary-does-not-exist-on-any-path", check=False, capture_output=True
+    )
+
+    assert result.returncode == 127
+    assert result.stdout == b""
+    assert result.stderr == b""
+
+
 def test_context_webapp_enabled_true_with_gate_on_and_stored_credentials(tmp_path):
     from mv3dt_installer import webapp as webapp_mod
 

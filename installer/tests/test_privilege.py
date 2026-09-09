@@ -182,6 +182,66 @@ def test_run_as_user_builds_expected_sudo_command(monkeypatch):
     assert result == "completed-process-sentinel"
 
 
+def test_run_as_user_missing_executable_returns_127_instead_of_raising(monkeypatch):
+    """Regression: a `FileNotFoundError` from `subprocess.run` -- e.g. `sudo`
+    or the wrapped command isn't on `PATH` -- must not propagate. Every
+    caller in this codebase is written `check=False`, expecting "not
+    available" to look like a nonzero returncode, not an exception."""
+    monkeypatch.setenv("SUDO_USER", "alice")
+    monkeypatch.setattr(
+        pwd,
+        "getpwnam",
+        _fake_pwnam(
+            {
+                "alice": SimpleNamespace(
+                    pw_dir="/home/alice", pw_uid=1001, pw_gid=1001
+                ),
+            }
+        ),
+    )
+
+    def _raise_missing(cmd, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", cmd[0])
+
+    monkeypatch.setattr(privilege.subprocess, "run", _raise_missing)
+
+    result = privilege.run_as_user(
+        "ngc", "config", "set", check=False, capture_output=True, text=True
+    )
+
+    assert result.returncode == 127
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_run_as_user_missing_executable_without_capture_leaves_streams_none(
+    monkeypatch,
+):
+    monkeypatch.setenv("SUDO_USER", "alice")
+    monkeypatch.setattr(
+        pwd,
+        "getpwnam",
+        _fake_pwnam(
+            {
+                "alice": SimpleNamespace(
+                    pw_dir="/home/alice", pw_uid=1001, pw_gid=1001
+                ),
+            }
+        ),
+    )
+
+    def _raise_missing(cmd, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", cmd[0])
+
+    monkeypatch.setattr(privilege.subprocess, "run", _raise_missing)
+
+    result = privilege.run_as_user("ngc", "config", "set", check=False)
+
+    assert result.returncode == 127
+    assert result.stdout is None
+    assert result.stderr is None
+
+
 # ---------------------------------------------------------------------------
 # 9.3 -- USER-ACTION display contract
 # ---------------------------------------------------------------------------

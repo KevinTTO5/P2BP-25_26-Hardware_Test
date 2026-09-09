@@ -292,6 +292,33 @@ class RebootHandle:
         return StepStatus.REBOOT_REQUIRED
 
 
+def _missing_executable_result(
+    args: tuple, kwargs: dict
+) -> subprocess.CompletedProcess:
+    """Synthesize the `CompletedProcess` `subprocess.run` never gets to
+    return when the executable itself isn't on `PATH`.
+
+    `subprocess.run` raises `FileNotFoundError` before `check` is ever
+    consulted, so a probe like `nvidia-smi --query-gpu=...` written as
+    `ctx.run_root(..., check=False, capture_output=True, text=True)` -- on
+    the (normal!) assumption that "not installed yet" looks like a nonzero
+    return code -- crashes the whole installer instead. That is exactly the
+    state Step 1 runs into on a fresh, driver-less Ubuntu 24.04 box: the
+    absence of `nvidia-smi` is the signal `_driver_loaded()` is checking
+    for, not an exceptional condition. Returncode 127 is the shell
+    convention for "command not found"; every existing `check=False`
+    call site already handles a nonzero returncode correctly, so routing
+    through this instead of letting the exception propagate fixes every
+    probe in one place.
+    """
+    text_mode = bool(kwargs.get("text") or kwargs.get("universal_newlines"))
+    empty: Any = "" if text_mode else b""
+    captured = bool(kwargs.get("capture_output")) or kwargs.get("stdout") is not None
+    return subprocess.CompletedProcess(
+        args, 127, stdout=empty if captured else None, stderr=empty if captured else None
+    )
+
+
 @dataclass
 class Context:
     """Concrete implementation of the `Context` forward reference used
@@ -322,8 +349,15 @@ class Context:
         whole process already runs as root (`privilege.require_root()`
         gates `main()`, below) -- "running as root" at that point means
         nothing more than a plain `subprocess.run` with no user-switching,
-        so that's exactly what this does."""
-        return subprocess.run(args, **kwargs)
+        so that's exactly what this does.
+
+        A missing executable is treated the same as a `check=False` step
+        already treats a nonzero exit -- see `_missing_executable_result`.
+        """
+        try:
+            return subprocess.run(args, **kwargs)
+        except FileNotFoundError:
+            return _missing_executable_result(args, kwargs)
 
 
 def build_context(

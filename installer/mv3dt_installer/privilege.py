@@ -134,6 +134,29 @@ def resolve() -> InvokingUser:
     )
 
 
+def _missing_executable_result(
+    cmd: list, kwargs: dict
+) -> subprocess.CompletedProcess:
+    """Synthesize the `CompletedProcess` `subprocess.run` never gets to
+    return when `sudo` itself (or, in principle, the wrapped command) isn't
+    on `PATH`.
+
+    `FileNotFoundError` is raised before `check` is ever consulted, so a
+    caller written as `run_as_user(..., check=False, capture_output=True,
+    text=True)` -- expecting "not available" to look like a nonzero return
+    code -- would otherwise crash instead. Mirrors
+    `app._missing_executable_result`, duplicated rather than imported: this
+    module is a deliberately self-contained sibling of app.py (module
+    docstring). 127 is the shell convention for "command not found".
+    """
+    text_mode = bool(kwargs.get("text") or kwargs.get("universal_newlines"))
+    empty: Any = "" if text_mode else b""
+    captured = bool(kwargs.get("capture_output")) or kwargs.get("stdout") is not None
+    return subprocess.CompletedProcess(
+        cmd, 127, stdout=empty if captured else None, stderr=empty if captured else None
+    )
+
+
 def run_as_user(*args: str, **subprocess_kwargs: Any) -> subprocess.CompletedProcess:
     """Run a command as the invoking user (doc 00 §9.2).
 
@@ -147,10 +170,17 @@ def run_as_user(*args: str, **subprocess_kwargs: Any) -> subprocess.CompletedPro
     sudo, files under the user's home, the AMC clone under
     `$HOME/auto-magic-calib` -- MUST go through this function rather than
     running unwrapped as root.
+
+    A missing executable (`sudo`, or the wrapped command itself) is treated
+    the same as a `check=False` caller already treats a nonzero exit -- see
+    `_missing_executable_result`.
     """
     user = resolve()
     cmd = ["sudo", "-u", user.name, "-H", *args]
-    return subprocess.run(cmd, **subprocess_kwargs)
+    try:
+        return subprocess.run(cmd, **subprocess_kwargs)
+    except FileNotFoundError:
+        return _missing_executable_result(cmd, subprocess_kwargs)
 
 
 # ---------------------------------------------------------------------------
