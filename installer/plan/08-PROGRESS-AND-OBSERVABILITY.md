@@ -348,8 +348,9 @@ The seam in §4.1 means no step module has to change for the streaming
 benefit to land. Adoption of §3.1 phases and §9 task naming is then
 per-step and independent.
 
-1. `progress.py` plus the `Context` handle, with no call sites (U1, U3).
-2. `run_root` streaming — every step gains live output at once (U4).
+1. `progress.py` and the phase API, with no call sites (U1, U2).
+2. The tee runner, then `run_root` routed through it — every step gains
+   live output at once (U3, U4).
 3. Step banner and phase rendering in the dispatch loop (U5).
 4. Real bars for downloads and apt (U6, U7).
 5. Per-step `phases` declarations and task naming, one PR per step group
@@ -397,25 +398,33 @@ Open decision for the human:
 | Unit | Branch | Files touched | Depends on | Wave |
 |------|--------|---------------|------------|------|
 | U1 Progress renderer core: bars, spinner, scrolling region, tty and non-tty modes | `feat/installer-progress-core` | `mv3dt_installer/progress.py`, `tests/test_progress.py` | — | 1 |
-| U2 Phase declaration API on the step interface | `feat/installer-progress-phase-api` | `mv3dt_installer/steps/__init__.py`, `tests/test_steps_registry.py` | — | 1 |
-| U3 `Context.progress` handle wiring | `feat/installer-progress-context` | `mv3dt_installer/app.py`, `tests/test_app.py` | U1, U2 | 2 |
-| U4 Streaming `run_root` with tee and redaction | `feat/installer-progress-streaming` | `mv3dt_installer/shellout.py`, `tests/test_shellout.py` | U1 | 2 |
-| U5 Step and phase banner in the dispatch loop | `feat/installer-progress-banner` | `mv3dt_installer/app.py`, `tests/test_app.py` | U3, U4 | 3 |
-| U6 Download byte-progress adapter | `feat/installer-progress-downloads` | `mv3dt_installer/progress.py`, `tests/test_progress.py` | U1, U4 | 3 |
+| U2 Phase declaration API on the step interface | `feat/installer-progress-phase-api` | `mv3dt_installer/steps/__init__.py`, `tests/test_steps_protocol.py` | — | 1 |
+| U3 Tee runner: stream, capture and redact in one pass | `feat/installer-progress-streaming` | `mv3dt_installer/shellout.py`, `tests/test_shellout.py` | U1 | 2 |
+| U4 `Context.progress` handle and streaming `run_root` | `feat/installer-progress-context` | `mv3dt_installer/app.py`, `tests/test_app.py` | U1, U2, U3 | 3 |
+| U5 Step and phase banner in the dispatch loop | `feat/installer-progress-banner` | `mv3dt_installer/app.py`, `tests/test_app.py` | U4 | 4 |
+| U6 Download byte-progress adapter | `feat/installer-progress-downloads` | `mv3dt_installer/progress.py`, `tests/test_progress.py` | U1, U3 | 3 |
 | U7 apt `Status-Fd` percentage adapter | `feat/installer-progress-apt` | `mv3dt_installer/progress.py`, `tests/test_progress.py` | U6 | 4 |
-| U8 Phases and task naming, Steps 1-3 | `feat/installer-progress-steps-1-3` | `mv3dt_installer/steps/step1_prerequisites.py`, `step2_deepstream_sdk.py`, `step3_amc_launcher.py`, their tests | U5, U7 | 5 |
-| U9 Phases and task naming, Steps 4-7 | `feat/installer-progress-steps-4-7` | `mv3dt_installer/steps/step4_calib_output_wiring.py`, `step5_per_project_exes.py`, `step6_remote_supervision.py`, `step7_webapp_integration.py`, their tests | U5, U7 | 5 |
-| U10 Failure context block and inferred-refusal evidence | `feat/installer-progress-failure-context` | `mv3dt_installer/report.py`, `tests/test_report.py` | U5 | 4 |
-| U11 Verbosity flags and doc 00 section 8 update | `feat/installer-progress-verbosity` | `mv3dt_installer/app.py`, `installer/plan/00-FRAMEWORK-AND-BOOTSTRAP.md`, `tests/test_app.py` | U5 | 4 |
+| U8 Phases and task naming, Steps 1-3 | `feat/installer-progress-steps-1-3` | `mv3dt_installer/steps/step1_prerequisites.py`, `step2_deepstream_sdk.py`, `step3_amc_launcher.py`, their tests | U5, U7 | 6 |
+| U9 Phases and task naming, Steps 4-7 | `feat/installer-progress-steps-4-7` | `mv3dt_installer/steps/step4_calib_output_wiring.py`, `step5_per_project_exes.py`, `step6_remote_supervision.py`, `step7_webapp_integration.py`, their tests | U5, U7 | 6 |
+| U10 Failure context block and inferred-refusal evidence | `feat/installer-progress-failure-context` | `mv3dt_installer/report.py`, `tests/test_report.py` | U5 | 5 |
+| U11 Verbosity flag and doc 00 section 8 update | `feat/installer-progress-verbosity` | `mv3dt_installer/app.py`, `installer/plan/00-FRAMEWORK-AND-BOOTSTRAP.md`, `tests/test_app.py` | U5 | 5 |
 
 ### 12.1 Serialization points
 
 Three files force ordering, and the waves above encode it:
 
-- **`app.py`** appears in U3, U5 and U11. Those are in waves 2, 3 and 4
-  respectively and never open concurrently. U3 adds the `Context` field,
-  U5 uses it in the dispatch loop, U11 adds the flags that configure it —
-  a genuine build dependency, not only a file conflict.
+- **`app.py`** appears in U4, U5 and U11, in waves 3, 4 and 5 respectively,
+  so they never open concurrently. U4 adds the `Context` field and routes
+  `run_root` through the tee runner, U5 uses the handle in the dispatch
+  loop, U11 adds the flag that configures it — a genuine build dependency,
+  not only a file conflict.
+
+  `Context.run_root` lives in `app.py`, so the *mechanism* it calls is
+  split out deliberately: U3 builds a reusable tee runner in `shellout.py`
+  (which already owns the `_REDACT_KEYS` scrubbing §4.2 requires) and U4
+  wires `run_root` to it. Putting the streaming implementation in U4
+  alongside the `Context` change would have been one unreviewable PR
+  touching the subprocess path and the progress path at once.
 - **`progress.py`** appears in U1, U6 and U7 (waves 1, 3, 4). The adapters
   extend the renderer's public surface, so they must land after it exists
   and after each other: U7's apt bar reuses the byte-bar primitive U6
