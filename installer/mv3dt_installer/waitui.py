@@ -74,6 +74,7 @@ __all__ = [
     "dir_has_files",
     "render_wait_header",
     "wait_until",
+    "countdown",
 ]
 
 
@@ -317,3 +318,42 @@ def wait_until(
         log.warn(f"cancelled after {waited}: {description}")
 
     return outcome
+
+
+# ---------------------------------------------------------------------------
+# Countdown before a disruptive action
+# ---------------------------------------------------------------------------
+
+
+DEFAULT_COUNTDOWN_S = 5
+
+
+def countdown(
+    seconds: int = DEFAULT_COUNTDOWN_S,
+    *,
+    description: str,
+    non_interactive: bool = False,
+    sleep: Callable[[float], None] = time.sleep,
+    out: Any = sys.stderr,
+) -> None:
+    """Warn, visibly, before something that takes the screen away.
+
+    Stopping the display manager blanks the operator's session with no
+    warning and no way to tell it apart from a crash or a reboot -- the
+    installer is still working, but every signal that says so has just been
+    killed. This prints what is about to happen and ticks down to it, so the
+    black screen is expected rather than alarming.
+
+    On a tty the count rewrites one line; off a tty (a transcript, a pipe)
+    it logs a single line and returns without sleeping, since nobody is
+    watching a countdown in a log file. `--non-interactive` skips the wait
+    for the same reason.
+    """
+    if non_interactive or not _is_tty(out):
+        log.info(f"{description} (continuing immediately)")
+        return
+
+    for remaining in range(int(seconds), 0, -1):
+        _write(out, f"\r{description} in {remaining}s... ")
+        sleep(1.0)
+    _write(out, f"\r{description} now.{' ' * 20}\n")

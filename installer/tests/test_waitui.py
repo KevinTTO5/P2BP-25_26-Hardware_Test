@@ -600,3 +600,57 @@ def test_wait_until_drives_dir_has_files_end_to_end(tmp_path):
 
     assert outcome is WaitOutcome.SATISFIED
     assert clock.sleeps == [2.0, 2.0]
+
+
+# ---------------------------------------------------------------------------
+# countdown()
+# ---------------------------------------------------------------------------
+
+
+class _FakeTty:
+    def __init__(self, tty: bool = True) -> None:
+        self._tty = tty
+        self.text = ""
+
+    def isatty(self) -> bool:
+        return self._tty
+
+    def write(self, text: str) -> None:
+        self.text += text
+
+    def flush(self) -> None:
+        pass
+
+
+def test_countdown_ticks_down_once_per_second_on_a_tty():
+    out = _FakeTty()
+    slept: list[float] = []
+
+    waitui.countdown(3, description="Screen goes black", out=out, sleep=slept.append)
+
+    assert slept == [1.0, 1.0, 1.0]
+    for n in (3, 2, 1):
+        assert f"in {n}s" in out.text
+    assert "Screen goes black now." in out.text
+
+
+def test_countdown_does_not_block_off_a_tty():
+    out = _FakeTty(tty=False)
+    slept: list[float] = []
+
+    waitui.countdown(5, description="Screen goes black", out=out, sleep=slept.append)
+
+    assert slept == []
+    assert out.text == ""
+
+
+def test_countdown_skipped_when_non_interactive():
+    out = _FakeTty()
+    slept: list[float] = []
+
+    waitui.countdown(
+        5, description="Screen goes black", non_interactive=True,
+        out=out, sleep=slept.append,
+    )
+
+    assert slept == []

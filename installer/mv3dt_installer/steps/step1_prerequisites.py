@@ -60,7 +60,7 @@ import pathlib
 import re
 from typing import TYPE_CHECKING, Sequence
 
-from mv3dt_installer import shellout
+from mv3dt_installer import shellout, waitui
 from mv3dt_installer.steps import StepResult, StepStatus, UserAction, register
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -304,7 +304,22 @@ def _secure_boot_enabled(ctx: "Context") -> bool:
 def _stop_display_manager(ctx: "Context") -> bool:
     """STEP-1 section 4, caveat 6: `service gdm stop` (fallback `lightdm`),
     then `pkill -9 Xorg`. Returns whether a display manager was actually
-    stopped (or none was running to begin with)."""
+    stopped (or none was running to begin with).
+
+    Counts down first. This is the only point in the install where the
+    operator's screen goes black, and it is indistinguishable from a crash
+    or a spontaneous reboot unless it is announced: the desktop dies, the
+    driver installer keeps running with its output captured, and nothing
+    on screen says the machine is still working. Announcing it is also what
+    stops an operator power-cycling mid-`.run`.
+    """
+    waitui.countdown(
+        description=(
+            "Stopping the desktop session to install the NVIDIA driver -- "
+            "the screen will go black; do NOT power off"
+        ),
+        non_interactive=bool(getattr(ctx, "non_interactive", False)),
+    )
     result = ctx.run_root(
         "service", "gdm", "stop", check=False, capture_output=True, text=True
     )

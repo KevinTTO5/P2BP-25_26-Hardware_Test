@@ -998,3 +998,19 @@ def test_every_fetch_uses_a_tool_step_1_actually_installs(tmp_path):
         "Step 1 shelled out to wget, which it never installs; use curl "
         "(BASE_TOOLING_PACKAGES) or add wget to that list"
     )
+
+
+def test_display_manager_stop_warns_before_the_screen_goes_black(tmp_path, monkeypatch):
+    """The black screen must never be the first the operator hears of it."""
+    seen: list[str] = []
+    monkeypatch.setattr(
+        s1.waitui, "countdown",
+        lambda *a, **kw: seen.append(kw.get("description", "")),
+    )
+    ctx, _ = _make_ctx(tmp_path)
+
+    s1._stop_display_manager(ctx)
+
+    assert len(seen) == 1
+    assert "screen will go black" in seen[0]
+    assert "do NOT power off" in seen[0]
