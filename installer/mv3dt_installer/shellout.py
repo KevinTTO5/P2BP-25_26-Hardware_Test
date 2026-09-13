@@ -15,10 +15,13 @@ Public API:
     asset_path(*parts)                 -- locate a bundled asset.
     stage_assets(*parts, prefix=...)   -- copy a bundled asset *directory*
         out to a fresh staging dir, preserving its layout.
+    run_streamed(command, renderer=, stream=, verbose=, ...)
+                                       -- run a child and stream, capture and
+        redact its output in one pass (doc 08 section 4.2).
     run_bundled_script(*asset_parts, args=, env=, tree=, inherit_env=,
                        cleanup=)       -- stage and execute a fragment.
 
-Three properties this module owes its callers:
+Four properties this module owes its callers:
 
 1. **Tree staging.** A bundled bash fragment that does
    `source "$SCRIPT_DIR/lib/common.sh"` only works if the whole directory
@@ -32,6 +35,12 @@ Three properties this module owes its callers:
 3. **Transcript capture (§8.2).** The command line, any explicit environment
    overrides, and both output streams of every shelled-out fragment go to
    `logs.log` -- stdout at info level, stderr at warn level.
+4. **One pass over the output (doc 08 §4.2).** `run_streamed` is the single
+   place a child's output is read. It feeds a live renderer, fills the
+   `CompletedProcess` buffers and writes the transcript from the same lines,
+   so live output and captured output can never disagree and no stream is
+   read twice. `run_bundled_script` runs through it rather than keeping a
+   second subprocess path of its own.
 
 Exactly what redaction guarantees, stated precisely because the transcript
 is an audited artifact:
@@ -49,20 +58,31 @@ is an audited artifact:
   held -- one the fragment read from a file or generated itself.
 - **Not covered.** A secret under a key not in `_REDACT_KEYS`, and an empty
   or whitespace-only value (scrubbing those would match everywhere).
+
+Both rules apply to streamed output before it reaches any destination --
+terminal, transcript, or returned buffer. Showing a command live must not be
+how a secret becomes visible that captured output would have hidden (doc 08
+§4.2). `run_bundled_script` is the one documented exception for the returned
+buffer: its callers parse the fragment's real output, so it opts out of
+buffer redaction and keeps handing back what the fragment actually printed.
 """
 
 from __future__ import annotations
 
 import os
 import pathlib
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Mapping, Sequence
+import threading
+import time
+from typing import Any, Mapping, Protocol, Sequence
 
+from . import progress
 from .logs import log
 
 # Default prefix for the run-scoped staging directory created by
@@ -181,10 +201,300 @@ def _env_dump(env: Mapping[str, str], secrets: Sequence[str]) -> str:
     return " ".join(entries)
 
 
-def _log_stream(emit, name: str, text: str, secrets: Sequence[str]) -> None:
-    """Append a captured stream to the transcript, one redacted line each."""
-    for line in text.splitlines():
-        emit(f"[{name}] {_scrub(line, secrets)}")
+# ---------------------------------------------------------------------------
+# Control characters (doc 00 §8.2, doc 08 §7)
+# ---------------------------------------------------------------------------
+
+# A child is free to emit colour, cursor moves and window-title sets -- apt,
+# curl and the NVIDIA runfile all do. None of it may reach the transcript,
+# which `logs.py` cannot enforce on its own because it never sees the raw
+# line. So a streamed line is stripped once, here, and that one stripped form
+# is what the transcript records and what the renderer is handed; the renderer
+# sanitises whatever it is given anyway, and shellout does not compute a
+# second variant for it. The returned buffer keeps the child's text as it
+# was: 72 call sites parse it and are entitled to exactly what
+# `subprocess.run` would have handed them.
+_CONTROL_RE = re.compile(
+    r"\x1b\[[0-9;:?]*[ -/]*[@-~]"          # CSI: colour, cursor moves, erase
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC: window titles, hyperlinks
+    r"|\x1b[@-_]"                          # remaining two-character escapes
+    r"|[\x00-\x08\x0b-\x1f\x7f]"           # bare C0 controls; tab and LF kept
+)
+
+
+def _strip_control(text: str) -> str:
+    """Remove ANSI sequences and stray control characters from one line."""
+    return _CONTROL_RE.sub("", text)
+
+
+# ---------------------------------------------------------------------------
+# The tee runner (doc 08 §4.2)
+# ---------------------------------------------------------------------------
+
+
+class LineSink(Protocol):
+    """What `run_streamed` needs of a live renderer: one line at a time.
+
+    `progress.Progress` satisfies it. The runner is typed against the method
+    rather than the class so it never has to know whether it is feeding a
+    live region, a plain non-tty stream, or a test double.
+    """
+
+    def line(self, text: str) -> None: ...  # pragma: no cover -- structural
+
+
+_STDOUT = "stdout"
+_STDERR = "stderr"
+
+# How long to wait for a reader thread to notice a killed child before giving
+# up on it. The threads are daemons, so a wedged reader can never hold the
+# installer open; this only keeps the ordinary case tidy.
+_REAP_TIMEOUT_S = 5.0
+
+
+def _pump(stream: Any, name: str, lines: "queue.Queue") -> None:
+    """Drain one pipe into `lines` until EOF, then post an end marker.
+
+    **Why a thread per pipe.** Reading `stdout` to EOF before touching
+    `stderr` is the classic two-pipe deadlock: the child blocks writing into
+    a full `stderr` buffer, so it never closes `stdout`, so the parent never
+    stops waiting for it. One reader per pipe means neither buffer can fill
+    while we are blocked on the other. `selectors` would also work, but only
+    on POSIX pipes; threads behave the same everywhere the installer is built
+    and cost nothing at this scale.
+
+    These threads only *produce*. Redaction, rendering and the transcript all
+    happen on the consuming thread, so `Progress` -- which carries mutable
+    cursor state and is not thread-safe -- is only ever touched from one.
+    """
+    try:
+        for raw in iter(stream.readline, ""):
+            lines.put((name, raw))
+    finally:
+        lines.put((name, None))
+        try:
+            stream.close()
+        except Exception:  # pragma: no cover -- already-closed pipe
+            pass
+
+
+def _feed(stream: Any, payload: str) -> None:
+    """Write `input` to the child and close its stdin, from its own thread.
+
+    Same reasoning as `_pump`: a child that writes more than a pipe buffer
+    before reading its input would deadlock a parent that insisted on writing
+    the whole payload before it started reading.
+    """
+    try:
+        if payload:
+            stream.write(payload)
+        stream.flush()
+    except (OSError, ValueError):  # child exited without reading its input
+        pass
+    finally:
+        try:
+            stream.close()
+        except Exception:  # pragma: no cover -- already-closed pipe
+            pass
+
+
+def _resolve_sink(
+    renderer: "LineSink | None", *, stream: bool, verbose: bool, out: Any
+) -> "LineSink | None":
+    """Decide where live lines go (doc 08 §4.3, §8).
+
+    Three outcomes, one per caller intent:
+
+    - `stream=False` -- nothing live at all. The escape hatch for a short
+      probe whose output would be noise, and exactly the behaviour every call
+      site had before streaming existed.
+    - a supplied `renderer` -- it owns the fixed 8-line rolling window and
+      its own verbose mode (doc 08 §4.3). `verbose` here would only fight it,
+      so the renderer wins.
+    - no renderer, `verbose=True` -- `--verbose` still means every line
+      verbatim, so borrow `Progress` in its non-live mode rather than
+      hand-rolling a second writer: plain lines, no escapes, per §7.
+    """
+    if not stream:
+        return None
+    if renderer is not None:
+        return renderer
+    if verbose:
+        return progress.Progress(
+            out=out if out is not None else sys.stderr,
+            verbose=True,
+            non_interactive=True,
+        )
+    return None
+
+
+def run_streamed(
+    command: Sequence[str],
+    *,
+    renderer: "LineSink | None" = None,
+    out: Any = None,
+    stream: bool = True,
+    verbose: bool = False,
+    secrets: Sequence[str] | None = None,
+    label: str | None = None,
+    redact_capture: bool = True,
+    check: bool = False,
+    timeout: float | None = None,
+    input: str | None = None,
+    **popen_kwargs: Any,
+) -> subprocess.CompletedProcess:
+    """Run `command`, streaming, capturing and recording its output in one pass.
+
+    Doc 08 §4.2. Every line the child writes is read as it arrives and lands
+    in three places: the live renderer, the buffer that becomes
+    `CompletedProcess.stdout` / `.stderr`, and the transcript (stdout at info
+    level, stderr at warn, both prefixed with `label`). The return value is a
+    `CompletedProcess` populated exactly as
+    `subprocess.run(..., capture_output=True, text=True)` would populate it,
+    which is what lets `Context.run_root` adopt this without any of its 72
+    call sites changing.
+
+    **Redaction comes first.** Each line is scrubbed by value and by key (see
+    the module docstring) *before* it reaches any of the three destinations.
+    A secret must not become visible merely because output is now shown live.
+    `redact_capture=False` opts the returned buffer -- and only the buffer --
+    back out, for a caller that parses output it knows carries a secret it
+    supplied itself; the terminal and the transcript are scrubbed regardless.
+
+    `secrets=None` derives the secret values from the child's own environment
+    (or from this process's, when the child inherits it), so an inherited
+    `NGC_API_KEY` is covered without the caller having to say so.
+
+    `check`, `timeout` and `input` behave as they do on `subprocess.run`,
+    including raising `CalledProcessError` and `TimeoutExpired` carrying the
+    output collected so far. `stdout=` and `stderr=` are rejected, since the
+    runner owns both pipes; `capture_output`, `text` and `universal_newlines`
+    are accepted and ignored, since both are implied. Every other keyword
+    goes through to `Popen`.
+    """
+    for owned in ("stdout", "stderr"):
+        if owned in popen_kwargs:
+            raise ValueError(
+                f"run_streamed owns the child's {owned} pipe; pass stream=False "
+                "for a command whose output should not be shown"
+            )
+    # Implied by the tee itself rather than rejected, so a call site that
+    # already spells `capture_output=True, text=True` needs no edit.
+    for implied in ("capture_output", "text", "universal_newlines"):
+        popen_kwargs.pop(implied, None)
+
+    if secrets is None:
+        child_env = popen_kwargs.get("env")
+        secrets = _secret_values(child_env if child_env is not None else os.environ)
+    if label is None:
+        label = os.path.basename(str(command[0])) if command else "command"
+
+    sink = _resolve_sink(renderer, stream=stream, verbose=verbose, out=out)
+    stdin = subprocess.PIPE if input is not None else popen_kwargs.pop("stdin", None)
+
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=stdin,
+        text=True,
+        **popen_kwargs,
+    )
+
+    buffers: dict = {_STDOUT: [], _STDERR: []}
+    emit = {_STDOUT: log.info, _STDERR: log.warn}
+    lines: "queue.Queue" = queue.Queue()
+    readers = [
+        threading.Thread(
+            target=_pump,
+            args=(pipe, name, lines),
+            name=f"shellout-{name}",
+            daemon=True,
+        )
+        for pipe, name in ((proc.stdout, _STDOUT), (proc.stderr, _STDERR))
+    ]
+    for reader in readers:
+        reader.start()
+    if input is not None:
+        threading.Thread(
+            target=_feed, args=(proc.stdin, input), name="shellout-stdin", daemon=True
+        ).start()
+
+    def _captured():
+        return "".join(buffers[_STDOUT]), "".join(buffers[_STDERR])
+
+    def _consume(name: str, raw: str) -> None:
+        scrubbed = _scrub(raw, secrets or ())
+        buffers[name].append(scrubbed if redact_capture else raw)
+        rendered = _strip_control(scrubbed).rstrip("\r\n")
+        if sink is not None:
+            sink.line(rendered)
+        emit[name](f"[{label}] {rendered}")
+
+    deadline = None if timeout is None else time.monotonic() + timeout
+    pending = len(readers)
+    try:
+        while pending:
+            if deadline is None:
+                name, raw = lines.get()
+            else:
+                remaining = deadline - time.monotonic()
+                try:
+                    if remaining <= 0:
+                        raise queue.Empty
+                    name, raw = lines.get(timeout=remaining)
+                except queue.Empty:
+                    raise subprocess.TimeoutExpired(command, timeout) from None
+            if raw is None:
+                pending -= 1
+                continue
+            _consume(name, raw)
+
+        # Both pipes are at EOF by here, so the child has closed them and
+        # `wait` is not where this hangs. It still gets the deadline, because
+        # a child that closes its output and then sleeps is a real shape.
+        returncode = proc.wait(
+            timeout=None if deadline is None else max(deadline - time.monotonic(), 0.0)
+        )
+    except subprocess.TimeoutExpired:
+        # Re-raised carrying what the child managed to say, the way
+        # `subprocess.run` does: a wedged command is diagnosable only from the
+        # output it produced before it wedged.
+        _abandon(proc, readers)
+        stdout, stderr = _captured()
+        raise subprocess.TimeoutExpired(
+            command, timeout, output=stdout, stderr=stderr
+        ) from None
+    except BaseException:
+        # Any other non-completion -- a Ctrl-C, a renderer that raised -- must
+        # not leave the child running behind the installer's back.
+        _abandon(proc, readers)
+        raise
+
+    for reader in readers:
+        reader.join(timeout=_REAP_TIMEOUT_S)
+
+    stdout, stderr = _captured()
+    if check and returncode:
+        raise subprocess.CalledProcessError(returncode, command, stdout, stderr)
+    return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+
+def _abandon(proc: subprocess.Popen, readers: Sequence[threading.Thread]) -> None:
+    """Kill a timed-out child and let its readers drain to EOF.
+
+    `subprocess.run` leaves no orphan behind on a timeout and neither does
+    this. Killing the child closes its pipes, which is what lets the reader
+    threads finish rather than linger on a `readline` that would never
+    return.
+    """
+    proc.kill()
+    try:
+        proc.wait(timeout=_REAP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:  # pragma: no cover -- unkillable child
+        pass
+    for reader in readers:
+        reader.join(timeout=_REAP_TIMEOUT_S)
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +589,9 @@ def run_bundled_script(
     inherit_env: bool = True,
     cleanup: bool = True,
     prefix: str = STAGE_PREFIX,
+    renderer: "LineSink | None" = None,
+    stream: bool = True,
+    verbose: bool = False,
 ) -> subprocess.CompletedProcess:
     """Stage a bundled bash fragment out to a temp dir and execute it.
 
@@ -314,7 +627,13 @@ def run_bundled_script(
     ``finally``. Pass ``cleanup=False`` to leave it in place for post-run
     debugging of the executed fragment.
 
-    The command line, the explicit environment overrides, and both captured
+    ``renderer``, ``stream`` and ``verbose`` are handed straight to
+    ``run_streamed``, which is what actually executes the fragment. A
+    fragment is not streamed unless a caller asks for it (``renderer=None``,
+    ``verbose=False``, the defaults), because ``run_bundled_script`` has no
+    ``Context`` and so no progress handle of its own to reach for.
+
+    The command line, the explicit environment overrides, and both output
     streams are written to the transcript per §8.2. Secrets are scrubbed by
     value and by key with the guarantees and limits spelled out in this
     module's docstring; note that transformed output (a base64-encoded key,
@@ -361,15 +680,21 @@ def run_bundled_script(
         log.info(f"shellout: {_command_dump(command, secrets)}")
         if env:
             log.info(f"shellout env: {_env_dump(env, secrets)}")
-        result = subprocess.run(
+        result = run_streamed(
             command,
             env=child_env,
             cwd=cwd,
-            capture_output=True,
-            text=True,
+            renderer=renderer,
+            stream=stream,
+            verbose=verbose,
+            secrets=secrets,
+            label=script.name,
+            # This function's documented contract, older than streaming and
+            # relied on by its callers: the fragment's real output comes back
+            # so it can be parsed. Only the buffer opts out -- the terminal
+            # and the transcript are scrubbed like everything else.
+            redact_capture=False,
         )
-        _log_stream(log.info, script.name, result.stdout, secrets)
-        _log_stream(log.warn, script.name, result.stderr, secrets)
         log.info(f"shellout: {script.name} exited {result.returncode}")
         return result
     finally:
