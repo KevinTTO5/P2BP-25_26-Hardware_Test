@@ -21,6 +21,9 @@ Public API:
     render_step_banner / render_phase_done / render_phase_active /
         render_bar / render_bytes_line / render_spinner_line -- pure line
         renderers, one per row of the section 3.2 banner.
+    content_length / follow_download -- the download byte-progress adapter
+        (section 5.1): poll the `.part` file the installer is writing and
+        drive the bar from `size(.part) / Content-Length`.
 
 Three properties this module owes its callers:
 
@@ -47,9 +50,14 @@ injected so tests get exact elapsed times instead of wall-clock ones.
 
 from __future__ import annotations
 
+import http.client
+import pathlib
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections import deque
+from dataclasses import dataclass
 from typing import Any, Callable, Deque, Iterable, List, Sequence
 
 from .logs import log
@@ -69,6 +77,14 @@ __all__ = [
     "render_phase_active",
     "render_bytes_line",
     "render_spinner_line",
+    "DownloadOutcome",
+    "DEFAULT_DOWNLOAD_POLL_S",
+    "DOWNLOAD_LOG_INTERVAL_S",
+    "part_size",
+    "default_content_length_probe",
+    "content_length",
+    "render_download_log_line",
+    "follow_download",
 ]
 
 
@@ -343,6 +359,17 @@ class Progress:
         self._frame = 0
         self._drawn = 0
 
+    @property
+    def live(self) -> bool:
+        """True when this renderer is actually drawing (section 7).
+
+        Exposed because an adapter driving a long operation has to know
+        whether anything is reaching the operator: off a tty nothing is
+        drawn, so the adapter owes the transcript a periodic plain line
+        instead. Read-only -- the switch is decided once, in `__init__`.
+        """
+        return self._live
+
     # -- step and phase ----------------------------------------------------
 
     def begin_step(
@@ -567,3 +594,239 @@ class Progress:
         if lines:
             _write(self._out, "\n".join(lines) + "\n")
         self._drawn = len(lines)
+
+
+# ---------------------------------------------------------------------------
+# Download byte-progress adapter (section 5.1)
+# ---------------------------------------------------------------------------
+
+
+# Half a second: fast enough that a 14 MB/s transfer visibly moves between
+# redraws, slow enough that the poll itself is a rounding error next to the
+# download. The measurement is one `stat()` on a file the installer is
+# already writing, not a parse of curl's output -- so this works unchanged
+# for every future download whatever tool fetches it.
+DEFAULT_DOWNLOAD_POLL_S = 0.5
+
+# Off a tty nothing is drawn at all (section 7), so the only record of a
+# multi-minute download is the transcript. One plain line this often keeps
+# event 3 in section 2 -- "it has hung, I will interrupt it" -- from coming
+# back on a piped or CI run.
+DOWNLOAD_LOG_INTERVAL_S = 30.0
+
+# Floor on `poll_s`, so a caller passing 0 cannot turn this into a busy loop
+# against a real clock (the `waitui.py` precedent).
+_MIN_DOWNLOAD_POLL_S = 0.01
+
+# HEAD is cheap and the installer only ever wants the header, but a server
+# that is slow to answer must not hold up a download that would have worked
+# without a bar.
+_CONTENT_LENGTH_TIMEOUT_S = 15.0
+
+
+@dataclass(frozen=True)
+class DownloadOutcome:
+    """What the poll loop observed, for the caller that owns the transfer.
+
+    `bytes_done` is the raw final size on disk, deliberately *not* clamped
+    to `total`: the renderer must never show more than 100%, but a caller
+    verifying the fetch needs the real number to notice that the server
+    sent something other than what it declared.
+    """
+
+    bytes_done: int
+    total: int | None
+    elapsed_s: float
+    polls: int
+
+    @property
+    def complete(self) -> bool:
+        """True only when a real denominator existed and was reached."""
+        return self.total is not None and self.bytes_done >= self.total
+
+
+def part_size(path: "pathlib.Path | str") -> int:
+    """Bytes currently on disk at `path`; 0 when it is not there yet.
+
+    A missing file is the normal state for the first poll or two -- the
+    transfer has been started but has not created its `.part` file yet --
+    so it reads as 0 rather than raising. An unreadable or vanished file
+    reads as 0 for the same reason: this is polled in a loop and must
+    never be the thing that fails an install.
+    """
+    try:
+        return max(pathlib.Path(path).stat().st_size, 0)
+    except OSError:
+        return 0
+
+
+def default_content_length_probe(
+    url: str, *, timeout: float = _CONTENT_LENGTH_TIMEOUT_S
+) -> str | None:
+    """Ask `url` for its `Content-Length` header, or None if it will not say.
+
+    Injected as `probe` in `content_length()` so no test reaches the
+    network. Failures are swallowed here rather than raised: a denominator
+    is a nicety, and a download that would have succeeded must not fail
+    because a HEAD request did not.
+
+    The URL is never logged from this module. Some download URLs are
+    signed and carry a credential in their query string; redaction lives
+    in `webapp.py`, and the simplest way to honour it here is to say
+    nothing.
+    """
+    request = urllib.request.Request(url, method="HEAD")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.headers.get("Content-Length")
+    except (OSError, urllib.error.URLError, http.client.HTTPException):
+        return None
+
+
+def content_length(
+    url: str,
+    *,
+    probe: Callable[[str], Any] = default_content_length_probe,
+) -> int | None:
+    """The declared size of `url`, or None when there is no usable one.
+
+    None is the honest answer for every failure mode -- no header, an
+    empty or non-numeric one, a zero or negative one, a probe that raised
+    -- and `follow_download` turns None into the spinner. Section 5.3 is
+    the reason this never falls back to a guess: a denominator that was
+    invented is indistinguishable on screen from one that was measured.
+    """
+    try:
+        raw = probe(url)
+    except Exception:
+        # Any probe failure at all, including one from an injected probe.
+        # See the docstring: no denominator is a supported outcome, an
+        # exception escaping into a step is not.
+        return None
+
+    if raw is None:
+        return None
+    try:
+        declared = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return declared if declared > 0 else None
+
+
+def render_download_log_line(
+    name: str, done: int, total: int | None, elapsed: float
+) -> str:
+    """The off-tty line for a download in flight (section 7).
+
+    Same honesty rule as the drawn row: a percentage appears only when
+    there is a denominator behind it.
+    """
+    if total and total > 0:
+        shown = min(done, total)
+        # The same rounding and the same hold-at-99 as `render_bytes_line`:
+        # the drawn row and the logged line describe one transfer, and a
+        # transcript that disagrees with the screen by a point is a bug
+        # report waiting to happen.
+        percent = min(round(shown * 100 / total), 100)
+        if percent >= 100 and shown < total:
+            percent = 99
+        return (
+            f"{name}: {format_bytes(shown)} / {format_bytes(total)} "
+            f"({percent}%) after {format_duration(elapsed)}"
+        )
+    return f"{name}: {format_bytes(done)} after {format_duration(elapsed)}"
+
+
+def follow_download(
+    path: "pathlib.Path | str",
+    total: int | None,
+    *,
+    is_running: Callable[[], bool],
+    renderer: "Progress | None" = None,
+    task: str | None = None,
+    poll_s: float = DEFAULT_DOWNLOAD_POLL_S,
+    log_interval_s: float = DOWNLOAD_LOG_INTERVAL_S,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    size_of: Callable[[Any], int] = part_size,
+) -> DownloadOutcome:
+    """Watch a download land at `path` and drive the bar from its size.
+
+    Section 5.1, mechanically: the installer already writes every download
+    to a `.part` path (`STEP-1` section 5.2), so percentage is
+    `size(.part) / Content-Length` sampled on an interval. Nothing here
+    parses a downloader's output -- the file is ours, `stat()` reports it
+    identically whatever tool is writing it, and a future download that
+    switches from curl to anything else keeps its bar for free.
+
+    This owns no transfer. The caller starts curl (in a thread, or as a
+    `Popen`) and hands over `is_running`, a predicate that is true while
+    that transfer is still going; the loop returns once it goes false.
+    `clock`, `sleep` and `size_of` are injected on the `waitui.py` pattern
+    so tests drive a whole download without sleeping or downloading.
+
+    `total` of None, 0 or negative is not an error: it means no true
+    denominator exists, and the rendering falls back to the spinner the
+    renderer already provides (section 5.3). That is also what an
+    unavailable `Content-Length` degrades to, via `content_length()`.
+    """
+    denominator = int(total) if total and int(total) > 0 else None
+    interval = max(float(poll_s), _MIN_DOWNLOAD_POLL_S)
+    log_every = max(float(log_interval_s), 0.0)
+    name = task or pathlib.Path(path).name
+
+    if renderer is not None:
+        if task is not None:
+            renderer.task(task)
+        if denominator is None:
+            # Clear any denominator a previous transfer left behind, so
+            # the spinner path is selected from the very first frame
+            # rather than after one stale bar.
+            renderer.bytes(0, None)
+
+    # Off a tty the drawn region does not exist, so the periodic line is
+    # the only signal; on a tty it would fight the live region's cursor
+    # arithmetic, so it is suppressed.
+    speak = renderer is None or not renderer.live
+
+    started = clock()
+    next_log_at = 0.0
+    polls = 0
+    done = 0
+    elapsed = 0.0
+
+    while True:
+        # Sampled before the size, not after: if the transfer has already
+        # stopped, whatever `stat()` reports next cannot grow any further,
+        # so this ordering guarantees the final frame shows the final
+        # size. The other order can end the loop on a stale sample and
+        # leave the bar parked short of 100%.
+        running = bool(is_running())
+        done = max(int(size_of(path)), 0)
+        polls += 1
+        elapsed = clock() - started
+
+        if renderer is not None and denominator is not None:
+            # Clamped, because a mis-declared Content-Length is a real
+            # failure mode and "620 MB / 606 MB  115%" reads as a bug in
+            # the installer rather than in the server.
+            renderer.bytes(min(done, denominator), denominator)
+        elif renderer is not None:
+            # No denominator: the spinner is the whole rendering, and it
+            # needs a frame advance per poll to look alive.
+            renderer.tick()
+
+        if speak and elapsed >= next_log_at:
+            log.info(render_download_log_line(name, done, denominator, elapsed))
+            next_log_at = elapsed + log_every
+
+        if not running:
+            break
+        sleep(interval)
+
+    if speak:
+        log.info(f"{name}: {format_bytes(done)} in {format_duration(elapsed)}")
+
+    return DownloadOutcome(
+        bytes_done=done, total=denominator, elapsed_s=elapsed, polls=polls
+    )
