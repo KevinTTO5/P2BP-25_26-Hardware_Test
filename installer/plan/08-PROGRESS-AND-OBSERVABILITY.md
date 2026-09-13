@@ -120,13 +120,27 @@ Emitted by the dispatch loop when a step begins, and again on every phase
 change:
 
 ```
-[ 3/7 ] DeepStream 9.1 SDK
-        phase 2/5  container image pull
+[ 1/7 ] Prerequisites (driver / CUDA / cuDNN / TensorRT / GStreamer)
+
+  ✓ base packages                        12s
+  ✓ CUDA repo and toolkit             3m41s
+  ✓ nouveau and distro cleanup            4s
+  ✓ NVIDIA driver runfile             6m02s
+  ▸ TensorRT and cuDNN
+      ████████████░░░░░  68%   412 MB / 606 MB   14.2 MB/s   0:14
+        Setting up libnvinfer10 (10.16.0.72-1+cuda13.2)
+        Setting up tensorrt-dev (10.16.0.72-1+cuda13.2)
 ```
 
 Two things the current output never states: which step of how many, and how
 far into that step. Event 4 in §2 is exactly this gap — the operator's only
 signal was an internal environment-variable name.
+
+**Completed phases collapse to one line (LOCKED):** a tick, the phase label,
+and the wall-clock duration it took. The finished phases stay on screen as a
+running record of the install, so an operator can see at a glance where the
+time went and which phase a later failure followed. Only the active phase
+carries a bar and a log window.
 
 ### 3.3 Phase changes are logged, not just drawn
 
@@ -292,12 +306,17 @@ streamed output.
 
 | Flag | Command output | Bars | Use |
 |------|----------------|------|-----|
-| `--quiet` | Suppressed | Yes | Unattended re-runs |
-| *(default)* | Last 8 lines, scrolling | Yes | Normal install |
+| *(default)* | Last 8 lines, rolling | Yes | Normal install |
 | `--verbose` | Everything, verbatim | Yes | Debugging a failure |
+
+The rolling window is **8 lines in every phase** (LOCKED) — a fixed height
+rather than one that grows for download-heavy phases, so the layout does not
+shift underneath the operator as the install moves between phases.
 
 `--verbose` is what an operator is told to re-run with when reporting a
 problem, replacing today's advice to find and tail the transcript by hand.
+
+`--quiet` is **not** part of this batch ([§11](#11-out-of-scope--open-decisions)).
 
 ---
 
@@ -355,16 +374,18 @@ Settled exclusions:
 - No progress persisted to `state.json`. Progress is a property of a
   running process, not of installed state.
 
-Open decisions for the human:
+1. **Default verbosity — RESOLVED: last 8 lines, always.** A fixed-height
+   rolling window under the bar in every phase, with the full stream always
+   reaching the transcript (§7). Rejected: fully-verbose-by-default (buries
+   the phase banner in thousands of apt lines) and bars-only (leaves nothing
+   to go on when a command is misbehaving but has not yet failed).
+2. **`--quiet` — RESOLVED: not in this batch.** It has no consumer; the
+   systemd units in [`STEP-6`](STEP-6-REMOTE-SUPERVISION.md) run
+   non-interactively and are already covered by the non-tty rule in §7.
+   U11 therefore ships `--verbose` and the doc 00 §8 update only.
 
-1. **Default verbosity.** §8 proposes last-8-lines as the default. The
-   alternative is fully verbose by default, trading a readable terminal for
-   never having to re-run to see what happened. Flagged rather than
-   assumed.
-2. **Whether `--quiet` is worth shipping now.** It has no current consumer;
-   the systemd units in
-   [`STEP-6`](STEP-6-REMOTE-SUPERVISION.md) run non-interactively and are
-   already covered by the non-tty rule in §7.
+Open decision for the human:
+
 3. **Docker pull progress (§5)** depends on Step 2's install method, which
    the DS 9.1 flow may route through `docker pull` or a local `.deb`. Wire
    the bar only for whichever path Step 2 actually takes.
