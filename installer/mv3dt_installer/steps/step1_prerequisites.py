@@ -305,17 +305,46 @@ def _secure_boot_enabled(ctx: "Context") -> bool:
 _VIRTUAL_CONSOLE_RE = re.compile(r"^/dev/tty\d+$")
 
 
+# Escape hatch for the caveat-6a guard. The guard infers the session from
+# the environment, and an inference that is wrong must never be the thing
+# that makes the install impossible -- set this to run anyway.
+ALLOW_DISPLAY_STOP_ENV = "MV3DT_ALLOW_DISPLAY_STOP"
+
+
 def _controlling_tty() -> str | None:
     """The process's controlling terminal, or None when it has none.
 
     `/dev/ttyN` is a virtual console, which survives the display manager
     being stopped. `/dev/pts/N` is a pseudo-terminal -- a terminal emulator
     window (dies with the X session) or an SSH session (does not).
+
+    All three standard descriptors are tried, not just stdin: a redirected
+    or closed stdin (`< /dev/null`, a pipe, a wrapper that closes it) makes
+    `ttyname(0)` raise even on a perfectly good virtual console, and
+    treating that as "no console" refuses an operator who is doing exactly
+    what the guard asked of them.
     """
+    for fd in (0, 1, 2):
+        try:
+            name = os.ttyname(fd)
+        except (OSError, AttributeError):
+            continue
+        if name:
+            return name
+    # Last resort: the kernel's own record of the controlling terminal.
+    # /proc/self/stat field 7 is tty_nr; major 4 is the virtual consoles,
+    # so minor N means /dev/ttyN.
     try:
-        return os.ttyname(0)
-    except (OSError, AttributeError):
+        stat = pathlib.Path("/proc/self/stat").read_text()
+        fields = stat[stat.rfind(")") + 2 :].split()
+        tty_nr = int(fields[4])
+    except (OSError, IndexError, ValueError):
         return None
+    if tty_nr <= 0:
+        return None
+    major = (tty_nr >> 8) & 0xFF
+    minor = (tty_nr & 0xFF) | ((tty_nr >> 20) << 8)
+    return f"/dev/tty{minor}" if major == 4 else None
 
 
 def _has_sshd_ancestor(pid: "int | None" = None) -> bool:
@@ -379,6 +408,8 @@ def _would_kill_own_session(ctx: "Context") -> bool:
     indication that anything went wrong. A virtual console and an SSH
     session are both safe; a desktop terminal emulator is not.
     """
+    if os.environ.get(ALLOW_DISPLAY_STOP_ENV):
+        return False
     tty = _controlling_tty()
     if tty is not None and _VIRTUAL_CONSOLE_RE.match(tty):
         return False
@@ -916,9 +947,11 @@ class Step1Prerequisites:
                             "Switch to a virtual console with Ctrl+Alt+F3, log in "
                             "there, and re-run this command. The desktop session "
                             "cannot take the installer down with it from a console. "
-                            "An SSH session works too."
+                            "An SSH session works too. If you are already on a "
+                            "console and see this anyway, override the check with "
+                            f"{ALLOW_DISPLAY_STOP_ENV}=1."
                         ),
-                        command="sudo ./mv3dt-installer",
+                        command=f"sudo {ALLOW_DISPLAY_STOP_ENV}=1 ./mv3dt-installer",
                     ),
                 ],
             )

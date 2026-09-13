@@ -1111,3 +1111,28 @@ def test_sshd_ancestor_walk_handles_a_comm_containing_parens(monkeypatch, tmp_pa
 
     monkeypatch.setattr(s1.pathlib, "Path", lambda p: proc / str(p).replace("/proc/", ""))
     assert s1._has_sshd_ancestor(10) is False
+
+
+def test_controlling_tty_falls_back_past_a_redirected_stdin(monkeypatch):
+    """A closed or redirected stdin must not look like "no console": the
+    guard would then refuse an operator sitting on a real tty."""
+    def fake_ttyname(fd):
+        if fd == 0:
+            raise OSError("not a tty")
+        return "/dev/tty3"
+
+    monkeypatch.setattr(s1.os, "ttyname", fake_ttyname)
+    assert s1._controlling_tty() == "/dev/tty3"
+
+
+def test_guard_can_be_overridden_by_the_environment(tmp_path, monkeypatch):
+    """The guard infers the session; a wrong inference must never be what
+    makes the install impossible."""
+    monkeypatch.setattr(s1, "_controlling_tty", lambda: "/dev/pts/1")
+    monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: False)
+    ctx, _ = _make_ctx(tmp_path, display_manager_active=True)
+
+    assert s1._would_kill_own_session(ctx) is True
+
+    monkeypatch.setenv(s1.ALLOW_DISPLAY_STOP_ENV, "1")
+    assert s1._would_kill_own_session(ctx) is False
