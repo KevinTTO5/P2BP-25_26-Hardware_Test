@@ -387,12 +387,18 @@ def _download_driver_run(ctx: "Context", dest: pathlib.Path) -> str | None:
     partial.unlink(missing_ok=True)
 
     ctx.log.info(f"Downloading NVIDIA driver {DRIVER_VERSION} from {DRIVER_DOWNLOAD_URL}")
+    # curl, not wget: BASE_TOOLING_PACKAGES guarantees curl is installed and
+    # says nothing about wget, which a minimal or server image need not ship.
+    # -f so an HTTP error is a non-zero exit rather than an error page saved
+    # under the runfile's name, -L to follow the mirror's redirect.
     result = ctx.run_root(
-        "wget",
-        "--tries=3",
-        "--timeout=30",
-        "--progress=dot:giga",
-        "-O",
+        "curl",
+        "-fL",
+        "--retry",
+        "3",
+        "--connect-timeout",
+        "30",
+        "-o",
         str(partial),
         DRIVER_DOWNLOAD_URL,
         check=False,
@@ -401,7 +407,7 @@ def _download_driver_run(ctx: "Context", dest: pathlib.Path) -> str | None:
     )
     if result.returncode != 0 or not partial.is_file():
         partial.unlink(missing_ok=True)
-        return f"download failed (wget exit {result.returncode})"
+        return f"download failed (curl exit {result.returncode})"
 
     reason = _verify_driver_run(partial)
     if reason is not None:
@@ -475,7 +481,11 @@ def _install_cuda_toolkit(ctx: "Context") -> None:
     ctx.run_root(
         "bash",
         "-c",
-        "wget -q -O /tmp/cuda-keyring.deb "
+        # curl for the same reason as the driver download: curl is in
+        # BASE_TOOLING_PACKAGES, wget is not guaranteed on a minimal image.
+        # -f turns an HTTP error into a non-zero exit, so `&&` stops rather
+        # than handing dpkg an error page saved as a .deb.
+        "curl -fsSL -o /tmp/cuda-keyring.deb "
         "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb "
         "&& dpkg -i /tmp/cuda-keyring.deb",
         check=False,

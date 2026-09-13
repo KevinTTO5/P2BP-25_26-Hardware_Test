@@ -158,10 +158,10 @@ class FakeRunner:
             return _ok(args)
         if cmd == "update-initramfs":
             return _ok(args)
-        if cmd == "wget":
-            # Mirror real wget: write the body to the `-O` target on success,
+        if cmd == "curl":
+            # Mirror real curl: write the body to the `-o` target on success,
             # leave nothing behind on failure.
-            dest = pathlib.Path(args[args.index("-O") + 1])
+            dest = pathlib.Path(args[args.index("-o") + 1])
             if not self.driver_download_ok:
                 return _rc(args, 8)
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -533,9 +533,9 @@ def test_launch_a_downloads_the_driver_when_not_staged(tmp_path):
 
     result = s1.Step1Prerequisites()._run_launch_a(ctx)
 
-    wget_calls = [c for c in runner.calls if c[0] == "wget"]
-    assert len(wget_calls) == 1
-    assert s1.DRIVER_DOWNLOAD_URL in wget_calls[0]
+    curl_calls = [c for c in runner.calls if c[0] == "curl"]
+    assert len(curl_calls) == 1
+    assert s1.DRIVER_DOWNLOAD_URL in curl_calls[0]
     # Landed at the canonical path, with no .part left behind.
     run_path = s1._driver_run_path(ctx)
     assert run_path.is_file()
@@ -552,7 +552,7 @@ def test_launch_a_does_not_redownload_an_already_staged_driver(tmp_path):
 
     s1.Step1Prerequisites()._run_launch_a(ctx)
 
-    assert [c for c in runner.calls if c[0] == "wget"] == []
+    assert [c for c in runner.calls if c[0] == "curl"] == []
 
 
 def test_launch_a_user_action_when_the_download_fails(tmp_path):
@@ -593,7 +593,7 @@ def test_launch_a_replaces_a_staged_driver_of_the_wrong_version(tmp_path):
     result = s1.Step1Prerequisites()._run_launch_a(ctx)
 
     # Rejected the stale file, fetched the pinned one, and carried on.
-    assert len([c for c in runner.calls if c[0] == "wget"]) == 1
+    assert len([c for c in runner.calls if c[0] == "curl"]) == 1
     assert s1._driver_run_embedded_version(s1._driver_run_path(ctx)) == s1.DRIVER_VERSION
     assert result.status is StepStatus.USER_ACTION_REQUIRED
     assert "reboot" in result.message.lower()
@@ -964,3 +964,37 @@ def test_launch_a_does_not_loop_on_a_clean_machine(tmp_path):
     assert result.status is StepStatus.USER_ACTION_REQUIRED
     assert "nouveau" not in result.message.lower()
     assert "kernel module is installed but not yet loaded" in result.message
+
+
+# ---------------------------------------------------------------------------
+# Fetch tooling (STEP-1 section 4, caveat 2)
+# ---------------------------------------------------------------------------
+
+
+def test_every_fetch_uses_a_tool_step_1_actually_installs(tmp_path):
+    """Step 1 downloads before it can assume anything beyond a base Ubuntu
+    image, so it may only shell out to fetch tools it installs itself.
+    `curl` is in BASE_TOOLING_PACKAGES; `wget` is not, and a minimal or
+    server image need not ship it -- a wget call there fails as exit 127,
+    which reads like a network fault rather than a missing binary.
+    """
+    ctx, runner = _make_ctx(tmp_path)
+
+    s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    fetchers = {
+        c[0] for c in runner.calls if c[0] in ("curl", "wget")
+    }
+    # Anything embedded in a `bash -c` fragment counts too.
+    for call in runner.calls:
+        if call[0] == "bash":
+            script = call[2]
+            for tool in ("curl", "wget"):
+                if f"{tool} " in script:
+                    fetchers.add(tool)
+
+    assert "curl" in fetchers, "expected Step 1 to fetch with curl"
+    assert "wget" not in fetchers, (
+        "Step 1 shelled out to wget, which it never installs; use curl "
+        "(BASE_TOOLING_PACKAGES) or add wget to that list"
+    )

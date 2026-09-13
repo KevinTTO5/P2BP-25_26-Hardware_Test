@@ -457,6 +457,16 @@ The download lands on a sibling `.part` path and is renamed into place only
 after verification passes, so a failed or interrupted fetch never leaves
 something a later launch would mistake for a good staged file.
 
+Every fetch in this step shells out to **`curl`**, never `wget` (REQUIRED).
+Step 1 runs before anything beyond a base Ubuntu image can be assumed, so it
+may only use fetch tools it installs itself: `curl` is in
+`BASE_TOOLING_PACKAGES` ([§4](#4-first-install-caveats-install-time-preconditions)
+caveat 2) and `wget` is not. A minimal or server image need not ship `wget`,
+and the resulting exit 127 surfaces as a download failure rather than as a
+missing binary. `curl -fL` is the required form: `-f` turns an HTTP error
+into a non-zero exit instead of a saved error page, `-L` follows the mirror
+redirect.
+
 > **Fallback is retained, not removed.** An air-gapped host, an outbound proxy,
 > or a 404 on a withdrawn build still ends in the original
 > `USER_ACTION_REQUIRED` pointing at NVIDIA's driver download search
