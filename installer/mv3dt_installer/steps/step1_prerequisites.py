@@ -304,6 +304,13 @@ def _secure_boot_enabled(ctx: "Context") -> bool:
 
 _VIRTUAL_CONSOLE_RE = re.compile(r"^/dev/tty\d+$")
 
+# Display-manager units, in the order they are tried. `gdm3` leads because
+# that is what Ubuntu 24.04 -- the only supported target (section 1) --
+# actually ships; looking only for `gdm`/`lightdm` found nothing on every
+# real workstation, which made `_stop_display_manager` report failure for a
+# desktop it had simply failed to name.
+DISPLAY_MANAGER_UNITS: tuple[str, ...] = ("gdm3", "gdm", "lightdm", "sddm")
+
 
 # Escape hatch for the caveat-6a guard. The guard infers the session from
 # the environment, and an inference that is wrong must never be the thing
@@ -379,7 +386,7 @@ def _has_sshd_ancestor(pid: "int | None" = None) -> bool:
 
 
 def _display_manager_active(ctx: "Context") -> bool:
-    for unit in ("gdm", "lightdm"):
+    for unit in DISPLAY_MANAGER_UNITS:
         if (
             ctx.run_root(
                 "systemctl",
@@ -437,15 +444,37 @@ def _stop_display_manager(ctx: "Context") -> bool:
         ),
         non_interactive=bool(getattr(ctx, "non_interactive", False)),
     )
-    result = ctx.run_root(
-        "service", "gdm", "stop", check=False, capture_output=True, text=True
-    )
-    if result.returncode != 0:
+    # Stop whichever display manager is actually running. "None running"
+    # is success, not failure -- there is nothing to stop, which is exactly
+    # the case when the operator has already done as they were asked and
+    # launched from a console.
+    stopped_any = False
+    for unit in DISPLAY_MANAGER_UNITS:
+        if (
+            ctx.run_root(
+                "systemctl",
+                "is-active",
+                "--quiet",
+                unit,
+                check=False,
+                capture_output=True,
+                text=True,
+            ).returncode
+            != 0
+        ):
+            continue
         result = ctx.run_root(
-            "service", "lightdm", "stop", check=False, capture_output=True, text=True
+            "systemctl", "stop", unit, check=False, capture_output=True, text=True
         )
+        if result.returncode != 0:
+            return False
+        stopped_any = True
+
     ctx.run_root("pkill", "-9", "Xorg", check=False, capture_output=True, text=True)
-    return result.returncode == 0
+    ctx.log.info(
+        f"display manager stopped: {stopped_any and 'yes' or 'none was running'}"
+    )
+    return True
 
 
 def _nouveau_loaded(ctx: "Context") -> bool:

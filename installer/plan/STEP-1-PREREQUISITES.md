@@ -412,6 +412,27 @@ using the NVIDIA **local-repo `.deb`** (an older `cuda-drivers-590` pin); Step
 1 supersedes that and uses the `.run` because "use what the NVIDIA docs say"
 is the ruling constraint. Only the `.run` path is documented.
 
+### 5.1b Display-manager unit names (RESOLVED)
+
+Ubuntu 24.04 ships the GNOME display manager as **`gdm3`**, not `gdm`.
+Stopping it by trying `gdm` and falling back to `lightdm` therefore found
+nothing on every real workstation, and -- because "neither unit stopped"
+was treated as failure -- Step 1 reported *"could not stop the desktop
+session"* and told the operator to switch to a virtual console they were
+already sitting on.
+
+Two corrections, both REQUIRED:
+
+- Units are tried in the order `gdm3`, `gdm`, `lightdm`, `sddm`, and only
+  the one that is actually active is stopped (`systemctl is-active` first).
+- **No display manager running is success, not failure.** There is nothing
+  to stop, which is precisely the state after the operator has done what
+  [§5.1a](#51a-documented-drift---silent-and-the-session-guard-resolved)
+  asked of them. Failure is reserved for an active display manager that
+  refuses to stop.
+
+---
+
 ### 5.1a Documented drift: `--silent` and the session guard (RESOLVED)
 
 Two departures from the verbatim DS 9.1 command, both found on real

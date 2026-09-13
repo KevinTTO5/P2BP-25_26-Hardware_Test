@@ -150,6 +150,8 @@ class FakeRunner:
             return _ok(args, f"SecureBoot {state}")
         if cmd == "service":
             return _rc(args, 0 if self.gdm_stops else 1)
+        if cmd == "systemctl" and args[1] == "stop":
+            return _rc(args, 0 if self.gdm_stops else 1)
         if cmd == "pkill":
             return _rc(args, 0)
         if cmd == "dpkg-query":
@@ -192,7 +194,7 @@ class FakeRunner:
             return _ok(args, f"gst-inspect-1.0 version {self.gstreamer_version}")
         if cmd == "systemctl":
             unit = args[-1]
-            if unit in ("gdm", "lightdm"):
+            if unit in s1.DISPLAY_MANAGER_UNITS:
                 return _rc(args, 0 if self.display_manager_active else 1)
             return _rc(args, 0 if self.mosquitto_active else 1)
         if isinstance(cmd, str) and cmd.endswith(".run"):
@@ -1136,3 +1138,34 @@ def test_guard_can_be_overridden_by_the_environment(tmp_path, monkeypatch):
 
     monkeypatch.setenv(s1.ALLOW_DISPLAY_STOP_ENV, "1")
     assert s1._would_kill_own_session(ctx) is False
+
+
+def test_ubuntu_2404_display_manager_unit_is_tried():
+    """Ubuntu 24.04 ships gdm3. Looking only for `gdm`/`lightdm` found no
+    display manager on any real workstation."""
+    assert "gdm3" in s1.DISPLAY_MANAGER_UNITS
+    assert s1.DISPLAY_MANAGER_UNITS[0] == "gdm3"
+
+
+def test_stopping_succeeds_when_no_display_manager_is_running(tmp_path):
+    """The regression: on a console with no DM active, Step 1 reported
+    "could not stop the desktop session" and told the operator to switch to
+    a console they were already sitting on."""
+    ctx, runner = _make_ctx(tmp_path, display_manager_active=False)
+
+    assert s1._stop_display_manager(ctx) is True
+    assert not [c for c in runner.calls if c[0] == "systemctl" and c[1] == "stop"]
+
+
+def test_stopping_stops_the_active_display_manager(tmp_path):
+    ctx, runner = _make_ctx(tmp_path, display_manager_active=True)
+
+    assert s1._stop_display_manager(ctx) is True
+    stops = [c for c in runner.calls if c[0] == "systemctl" and c[1] == "stop"]
+    assert stops and stops[0][2] in s1.DISPLAY_MANAGER_UNITS
+
+
+def test_stopping_fails_only_when_an_active_manager_will_not_stop(tmp_path):
+    ctx, _ = _make_ctx(tmp_path, display_manager_active=True, gdm_stops=False)
+
+    assert s1._stop_display_manager(ctx) is False
