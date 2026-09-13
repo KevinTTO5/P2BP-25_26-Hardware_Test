@@ -16,6 +16,7 @@ Public API:
     Progress -- the renderer. `begin_step` / `phase` / `task` / `bytes` /
         `line` / `tick` / `end_step`; `phase`, `task` and `bytes` are the
         step-author contract in doc 08 section 9.
+    sanitise(text) -- strip control characters out of command output.
     format_duration / format_clock / format_bytes / format_rate -- pure
         formatters.
     render_step_banner / render_phase_done / render_phase_active /
@@ -37,7 +38,9 @@ Three properties this module owes its callers:
    the run is non-interactive, no bar, no spinner and no escape sequence is
    written at all -- command output goes out as plain lines, and position
    in the install comes from `logs.log`, which the transcript already
-   guarantees is escape-free.
+   guarantees is escape-free. That holds for text the installer did not
+   write either: `apt`, `dpkg` and `curl` colour and carriage-return their
+   own output, so everything a caller hands in is sanitised on the way in.
 3. **The phase sequence survives in the transcript (section 3.3).** Every
    phase transition emits a `log.info` line whether or not anything is
    being drawn, because a post-mortem of a failed install has only the
@@ -52,6 +55,8 @@ from __future__ import annotations
 
 import http.client
 import pathlib
+import re
+import shutil
 import sys
 import time
 import urllib.error
@@ -64,6 +69,7 @@ from .logs import log
 
 __all__ = [
     "Progress",
+    "sanitise",
     "WINDOW_LINES",
     "BAR_WIDTH",
     "SPINNER_FRAMES",
@@ -107,11 +113,22 @@ _WINDOW_INDENT = "        "
 _PHASE_LABEL_WIDTH = 34
 _DURATION_WIDTH = 6
 
-# Every live row is truncated rather than wrapped: a wrapped row occupies
-# two terminal rows, which desynchronises the cursor-up arithmetic the live
-# region is redrawn with and leaves debris on screen.
-_MAX_LINE_CHARS = 96
-_MAX_ROW_CHARS = len(_WINDOW_INDENT) + _MAX_LINE_CHARS
+# Every live row is truncated to the real terminal width rather than
+# wrapped: a wrapped row occupies two terminal rows, so the cursor-up count
+# used to redraw the region would be short by one for every row that
+# overflowed, and the difference stays on screen as debris that grows with
+# each redraw. One column is held back because writing the last column of a
+# row is enough to wrap on terminals with deferred auto-wrap.
+_FALLBACK_COLUMNS = 80
+_MIN_ROW_CHARS = 20
+
+# Control characters in caller-supplied output. apt, dpkg and curl all emit
+# colour and carriage returns in normal operation, and neither may reach a
+# transcript, a pipe, or the cursor arithmetic above (section 7).
+_ANSI_RE = re.compile(
+    r"\033(?:\[[0-?]*[ -/]*[@-~]|\][^\a\033]*(?:\a|\033\\)?|[@-Z\\-_])"
+)
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 # Rate/ETA sampling. Samples older than the window are dropped so the rate
 # tracks the current transfer rather than its lifetime average, and nothing
@@ -147,6 +164,38 @@ def _write(out: Any, text: str) -> None:
             flush()
     except (OSError, ValueError):  # pragma: no cover -- closed/broken stream
         pass
+
+
+def _terminal_width() -> int:
+    """Columns available to the live region, or 80 when unknowable."""
+    try:
+        columns = shutil.get_terminal_size(
+            fallback=(_FALLBACK_COLUMNS, 24)
+        ).columns
+    except Exception:  # pragma: no cover -- exotic environments
+        columns = _FALLBACK_COLUMNS
+    return max(int(columns), _MIN_ROW_CHARS)
+
+
+def sanitise(text: str) -> str:
+    """Strip control characters out of caller-supplied output.
+
+    Two things this protects. The transcript and every non-tty stream must
+    stay free of escapes (section 7), and they carry command output that
+    the installer did not write: `apt` colours its own lines, `curl` and
+    `dpkg` redraw theirs with carriage returns. And a row containing an
+    escape or a CR no longer occupies the number of terminal rows the
+    redraw arithmetic assumed it did.
+
+    A carriage return means the writer overwrote what it had already
+    emitted, so what survives is the text after the last one, which is what
+    a terminal would have been showing anyway.
+    """
+    text = _ANSI_RE.sub("", text)
+    text = text.replace("\t", " ")
+    if "\r" in text:
+        text = text.rsplit("\r", 1)[-1]
+    return _CONTROL_RE.sub("", text)
 
 
 # ---------------------------------------------------------------------------
@@ -256,14 +305,28 @@ def render_bytes_line(
     `rate` and `eta` are optional because they are not knowable at the
     start of a transfer (section 5.3); their fields are omitted entirely
     rather than rendered as zero or as a guess.
+
+    A missing or non-positive `total` raises: section 5.3 is REQUIRED, and
+    a renderer that quietly substitutes a zero denominator produces exactly
+    the bar that requirement exists to prevent. Callers that may not have a
+    denominator use `render_spinner_line` instead, which is what
+    `Progress.bytes` falls back to.
     """
-    fraction = (done / total) if total > 0 else 0.0
-    # Rounded, but held at 99 until the last byte actually lands: a bar
-    # that sits at 100% while the transfer is still running is the same
-    # broken promise as a bar with no denominator behind it.
+    if not total or total <= 0:
+        raise ValueError(
+            f"no denominator to render a bar from (total={total!r}); "
+            "use render_spinner_line for indeterminate work"
+        )
+
+    fraction = done / total
+    # Rounded, but held one short of complete until the last byte actually
+    # lands, in the bar as well as in the number: a bar that sits full
+    # while the transfer is still running is the same broken promise as a
+    # bar with no denominator behind it.
     percent = min(round(fraction * 100), 100)
-    if percent >= 100 and done < total:
-        percent = 99
+    if done < total:
+        percent = min(percent, 99)
+        fraction = min(fraction, (BAR_WIDTH - 1) / BAR_WIDTH)
 
     fields = [
         f"{render_bar(fraction)} {percent:3d}%",
@@ -291,10 +354,10 @@ def render_spinner_line(
     return line
 
 
-def _truncate(text: str, limit: int = _MAX_LINE_CHARS) -> str:
+def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
-    return text[: limit - 1] + "…"
+    return text[: max(limit - 1, 0)] + "…"
 
 
 # ---------------------------------------------------------------------------
@@ -328,12 +391,16 @@ class Progress:
         non_interactive: bool = False,
         window_lines: int = WINDOW_LINES,
         clock: Callable[[], float] = time.monotonic,
+        terminal_width: Callable[[], int] = _terminal_width,
     ) -> None:
         self._total_steps = int(total_steps)
         self._out = out
         self._verbose = bool(verbose)
         self._window_lines = max(int(window_lines), 0)
         self._clock = clock
+        # Queried per redraw rather than cached: an operator resizing the
+        # terminal mid-install must not leave the region wrapping.
+        self._terminal_width = terminal_width
 
         # The single switch behind section 7: everything live is gated on
         # it, so a pipe, a CI run, a `tee` and a non-interactive run all
@@ -354,7 +421,7 @@ class Progress:
         self._total: int | None = None
         self._samples: Deque[tuple[float, int]] = deque()
 
-        self._window: Deque[str] = deque(maxlen=self._window_lines or 1)
+        self._window: Deque[str] = deque(maxlen=max(self._window_lines, 1))
         self._last_line: str | None = None
         self._frame = 0
         self._drawn = 0
@@ -417,6 +484,7 @@ class Progress:
     def task(self, name: str) -> None:
         """Name the operation now running inside the current phase."""
         self._reset_task()
+        name = sanitise(name)
         self._task_name = name
         self._task_started = self._clock()
         log.info(name)
@@ -451,10 +519,18 @@ class Progress:
     def line(self, text: str) -> None:
         """Feed one line of command output to the window (4.2, 8).
 
-        The caller has already redacted it: redaction belongs to
-        `shellout.py` and is not re-implemented here.
+        The line is sanitised on the way in, so no colour or carriage
+        return a child process emitted can reach a transcript, a pipe, or
+        the redraw arithmetic. It is not truncated here: off a tty the full
+        line is the point, and on a tty the live region truncates to the
+        terminal width at draw time.
+
+        Redaction is a separate concern and is not re-implemented here: it
+        belongs to `shellout.py`, and the caller has already applied it.
         """
-        text = _truncate(text.rstrip("\n"))
+        # Trailing whitespace is stripped after sanitising, not before: an
+        # erase-to-end-of-line escape leaves its own behind.
+        text = sanitise(text).rstrip()
         self._last_line = text
 
         if not self._live:
@@ -572,13 +648,17 @@ class Progress:
 
         lines = [render_phase_active(self._phase_label or self._step_title)]
         lines.append(self._activity_line())
-        if not self._verbose:
+        if not self._verbose and self._window_lines:
             window = list(self._window)[-self._window_lines :]
             lines.extend(_WINDOW_INDENT + text for text in window)
             # Blank rows keep the region exactly `window_lines` tall in
             # every phase (LOCKED, section 8).
             lines.extend("" for _ in range(self._window_lines - len(window)))
-        return [_truncate(row, _MAX_ROW_CHARS) for row in lines]
+
+        # Every row is one terminal row, or the cursor-up count below is
+        # wrong by however many of them wrapped.
+        limit = max(self._terminal_width() - 1, 1)
+        return [_truncate(row, limit) for row in lines]
 
     def _erase(self) -> None:
         if not self._live or not self._drawn:
@@ -773,7 +853,10 @@ def follow_download(
     denominator = int(total) if total and int(total) > 0 else None
     interval = max(float(poll_s), _MIN_DOWNLOAD_POLL_S)
     log_every = max(float(log_interval_s), 0.0)
-    name = task or pathlib.Path(path).name
+    # Sanitised for the same reason `task()` sanitises: this name reaches
+    # the transcript through `log.info`, which section 7 requires to stay
+    # free of escapes.
+    name = sanitise(task or pathlib.Path(path).name)
 
     if renderer is not None:
         if task is not None:
