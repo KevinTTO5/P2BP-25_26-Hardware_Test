@@ -12,6 +12,7 @@ Run with:
 from __future__ import annotations
 
 import io
+import os
 import pathlib
 import re
 import sys
@@ -80,8 +81,13 @@ _ANSI = re.compile(r"\033\[[0-9;]*[A-Za-z]")
 
 _PHASES = ("base packages", "CUDA repo and toolkit", "TensorRT and cuDNN")
 
+# Forced terminal width for every test, so the live region's truncation is
+# asserted against a known number of columns instead of the real terminal.
+_COLUMNS = 80
+
 
 def _tty_progress(clock: FakeClock, out: FakeTty, **kwargs) -> progress.Progress:
+    kwargs.setdefault("terminal_width", lambda: _COLUMNS)
     return progress.Progress(
         total_steps=7, out=out, clock=clock, **kwargs
     )
@@ -141,6 +147,103 @@ def test_format_bytes_loses_precision_as_the_value_grows():
 
 def test_format_rate_is_a_humanised_size_per_second():
     assert progress.format_rate(14_200_000) == "14.2 MB/s"
+
+
+# ---------------------------------------------------------------------------
+# sanitise -- caller-supplied output is never trusted (section 7)
+# ---------------------------------------------------------------------------
+
+
+# Real shapes: apt colours its progress line, curl redraws its meter with a
+# carriage return, dpkg emits both.
+_COLOURED = "\033[1;32mSetting up\033[0m libnvinfer10 \033[K"
+_CARRIAGE_RETURNED = "  0 412M    0 1024k    0     0  [ 42%]\r partial"
+
+
+def test_sanitise_strips_colour_and_leaves_the_text():
+    assert progress.sanitise(_COLOURED) == "Setting up libnvinfer10 "
+
+
+def test_sanitise_keeps_only_what_survived_a_carriage_return():
+    assert progress.sanitise(_CARRIAGE_RETURNED) == " partial"
+
+
+def test_sanitise_removes_every_remaining_control_character():
+    dirty = "a\x00b\x07c\x1bd\x9fe\nf"
+
+    cleaned = progress.sanitise(dirty)
+
+    assert cleaned == "abcdef"
+    assert not any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in cleaned)
+
+
+def test_sanitise_expands_tabs_so_row_widths_stay_predictable():
+    assert progress.sanitise("a\tb") == "a b"
+
+
+def test_sanitise_leaves_ordinary_output_alone():
+    plain = "Setting up tensorrt-dev (10.16.0.72-1+cuda13.2)"
+
+    assert progress.sanitise(plain) == plain
+
+
+def test_dirty_lines_reach_a_non_tty_stream_clean():
+    out, clock = io.StringIO(), FakeClock()
+    bar = progress.Progress(total_steps=7, out=out, clock=clock)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(1)
+
+    bar.line(_COLOURED)
+    bar.line(_CARRIAGE_RETURNED)
+
+    rendered = out.getvalue()
+    assert rendered == "Setting up libnvinfer10\n partial\n"
+    assert "\033" not in rendered
+    assert "\r" not in rendered
+
+
+def test_dirty_lines_reach_the_window_and_the_spinner_note_clean():
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(1)
+    bar.task("installing")
+
+    bar.line(_COLOURED)
+
+    frame = _last_frame(out)
+    assert frame[2] == "        Setting up libnvinfer10"
+    # The most recent line is also the spinner's note, so it has to be
+    # clean there too.
+    assert "[ Setting up libnvinfer10 ]" in frame[1]
+    for row in frame:
+        assert "\033" not in row and "\r" not in row
+
+
+def test_a_dirty_line_still_occupies_exactly_one_row():
+    """An escape in the text would desynchronise the redraw arithmetic."""
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(1)
+
+    bar.line(_COLOURED + "\r" + _COLOURED)
+
+    assert len(_last_frame(out)) == 2 + progress.WINDOW_LINES
+
+
+def test_a_dirty_task_name_is_cleaned_too():
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(1)
+
+    bar.task("\033[31minstalling\033[0m")
+
+    assert "installing" in _last_frame(out)[1]
+    # The renderer's own cursor moves are the only escapes on the stream.
+    assert "\033[31m" not in out.getvalue()
+    assert "\033[0m" not in out.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +308,22 @@ def test_render_bytes_line_omits_rate_and_eta_until_they_are_known():
 
 
 def test_percent_never_claims_completion_before_the_last_byte():
-    assert " 99%" in progress.render_bytes_line(605_999_999, 606_000_000)
-    assert "100%" in progress.render_bytes_line(606_000_000, 606_000_000)
+    almost = progress.render_bytes_line(605_999_999, 606_000_000)
+    done = progress.render_bytes_line(606_000_000, 606_000_000)
+
+    assert " 99%" in almost
+    assert "100%" in done
+    # The bar holds back with the number: a full bar next to 99% is the
+    # same broken promise.
+    assert almost.count(progress.BAR_EMPTY) == 1
+    assert done.count(progress.BAR_EMPTY) == 0
+
+
+def test_render_bytes_line_refuses_to_draw_a_bar_without_a_denominator():
+    """Section 5.3 is enforced by the renderer, not by its callers."""
+    for absent in (0, -1, -606_000_000, None):
+        with pytest.raises(ValueError):
+            progress.render_bytes_line(5, absent)
 
 
 def test_render_spinner_line_reports_elapsed_and_never_a_bar():
@@ -393,16 +510,48 @@ def test_window_is_cleared_when_the_phase_changes():
     assert all("apt output" not in row for row in _last_frame(out))
 
 
-def test_long_output_lines_are_truncated_so_the_redraw_stays_aligned():
+def test_long_output_lines_are_truncated_to_the_terminal_width():
+    """A wrapped row would leave the cursor-up count short, every redraw."""
     out, clock = FakeTty(), FakeClock()
-    bar = _tty_progress(clock, out)
+    bar = _tty_progress(clock, out, terminal_width=lambda: 40)
     bar.begin_step(1, "Prerequisites", _PHASES)
     bar.phase(1)
 
-    bar.line("x" * 400)
+    bar.line(
+        "Get:14 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 "
+        "libnvinfer10 amd64 10.16.0.72-1+cuda13.2 [412 MB]"
+    )
 
-    for row in _last_frame(out):
-        assert len(row) <= progress._MAX_ROW_CHARS
+    frame = _last_frame(out)
+    # One logical row is one visual row: nothing reaches the last column,
+    # so nothing wraps onto a row the redraw does not know about.
+    assert all(len(row) < 40 for row in frame)
+    assert len(frame) == 2 + progress.WINDOW_LINES
+
+
+def test_the_live_region_follows_a_resized_terminal():
+    out, clock = FakeTty(), FakeClock()
+    columns = [100]
+    bar = _tty_progress(clock, out, terminal_width=lambda: columns[0])
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(1)
+    bar.line("y" * 200)
+
+    assert max(len(row) for row in _last_frame(out)) == 99
+
+    columns[0] = 40
+    bar.tick()
+    assert max(len(row) for row in _last_frame(out)) == 39
+
+
+def test_terminal_width_falls_back_when_there_is_no_terminal(monkeypatch):
+    monkeypatch.setattr(
+        progress.shutil,
+        "get_terminal_size",
+        lambda fallback=None: os.terminal_size((fallback[0], fallback[1])),
+    )
+
+    assert progress._terminal_width() == progress._FALLBACK_COLUMNS
 
 
 def test_window_size_is_configurable_for_callers_that_need_it():
@@ -418,6 +567,21 @@ def test_window_size_is_configurable_for_callers_that_need_it():
     assert [row.strip() for row in _last_frame(out)[2:]] == [
         "line 3", "line 4", "line 5",
     ]
+
+
+def test_window_lines_zero_leaves_no_window_at_all():
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out, window_lines=0)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(1)
+
+    for n in range(4):
+        bar.line(f"line {n}")
+
+    frame = _last_frame(out)
+    assert len(frame) == 2
+    # The last line is still the spinner's note even with no window.
+    assert "[ line 3 ]" in frame[1]
 
 
 # ---------------------------------------------------------------------------
