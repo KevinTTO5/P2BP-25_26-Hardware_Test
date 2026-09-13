@@ -522,16 +522,39 @@ def _write_nouveau_blacklist() -> None:
 
 
 def _purge_distro_nvidia_packages(ctx: "Context") -> bool:
-    """STEP-1 section 4, caveat 3. Returns whether anything was purged."""
+    """STEP-1 section 4, caveat 3. Returns whether anything was purged.
+
+    Only packages dpkg reports as actually *present* are purged. `dpkg-query
+    -W` lists every package name dpkg knows about, which on a stock Ubuntu
+    24.04 desktop includes `nvidia-common`, `nvidia-prime`,
+    `libnvidia-encode1` and friends at `unknown ok not-installed` -- names
+    referenced as dependencies by other packages but never installed. Keying
+    the return value on "the name list is non-empty" made those four look
+    like a purge on every launch, so this returned True forever and section 5
+    step 5 demanded a reboot the reboot could never satisfy. The current
+    status field (third word of `${Status}`) is what distinguishes a package
+    that is really there from one dpkg has merely heard of.
+    """
     result = ctx.run_root(
         "bash",
         "-c",
-        "dpkg-query -W -f='${Package}\\n' 'nvidia-*' 'libnvidia-*' 2>/dev/null",
+        "dpkg-query -W -f='${Status}|${Package}\\n' 'nvidia-*' 'libnvidia-*' "
+        "2>/dev/null",
         capture_output=True,
         text=True,
         check=False,
     )
-    packages = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    packages: list[str] = []
+    for line in result.stdout.splitlines():
+        status, _, package = line.partition("|")
+        package = package.strip()
+        # `${Status}` is "<want> <flag> <current>"; only the current status
+        # says whether the package exists on disk. "not-installed" is the
+        # name-known-but-absent case above; "config-files" is a genuine
+        # leftover that purging does clear, so it stays in scope.
+        current = status.split()[-1] if status.split() else ""
+        if package and current not in ("", "not-installed"):
+            packages.append(package)
     if not packages:
         return False
     ctx.run_root(

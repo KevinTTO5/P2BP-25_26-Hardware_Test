@@ -122,7 +122,17 @@ class FakeRunner:
             if "nouveau" in script:
                 return _rc(args, 0 if self.nouveau_loaded else 1)
             if "nvidia-*" in script:
-                return _ok(args, "\n".join(self.distro_nvidia_packages))
+                # Real `dpkg-query -W -f='${Status}|${Package}'` output. An
+                # entry may be a bare name (installed) or an explicit
+                # (name, status) pair.
+                lines = []
+                for entry in self.distro_nvidia_packages:
+                    if isinstance(entry, tuple):
+                        package, status = entry
+                    else:
+                        package, status = entry, "install ok installed"
+                    lines.append(f"{status}|{package}")
+                return _ok(args, "\n".join(lines))
             return _ok(args)
         if cmd == "mokutil":
             state = "enabled" if self.secure_boot_enabled else "disabled"
@@ -893,3 +903,64 @@ def test_mosquitto_omits_non_interactive_flag_when_interactive(tmp_path, monkeyp
 def test_mosquitto_script_and_conf_are_bundled():
     assert shellout.asset_path("scripts", "10_setup_mosquitto.sh").is_file()
     assert shellout.asset_path("mosquitto", "mv3dt.conf").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Distro NVIDIA purge probe (STEP-1 section 4, caveat 3)
+# ---------------------------------------------------------------------------
+
+
+# Exactly what a stock Ubuntu 24.04 desktop reports: names dpkg knows about
+# as dependency references, none of them actually installed. Treating these
+# as a purge made Step 1 demand a reboot on every launch, forever.
+_NOT_INSTALLED_ON_STOCK_UBUNTU = (
+    ("libnvidia-encode1", "unknown ok not-installed"),
+    ("nvidia-common", "unknown ok not-installed"),
+    ("nvidia-libopencl1-dev", "unknown ok not-installed"),
+    ("nvidia-prime", "unknown ok not-installed"),
+)
+
+
+def test_purge_ignores_packages_dpkg_only_knows_the_name_of(tmp_path):
+    ctx, runner = _make_ctx(
+        tmp_path, distro_nvidia_packages=_NOT_INSTALLED_ON_STOCK_UBUNTU
+    )
+
+    assert s1._purge_distro_nvidia_packages(ctx) is False
+    assert [c for c in runner.calls if c[0] == "apt-get" and c[1] == "purge"] == []
+
+
+def test_purge_removes_installed_and_config_files_packages(tmp_path):
+    ctx, runner = _make_ctx(
+        tmp_path,
+        distro_nvidia_packages=(
+            ("nvidia-driver-550", "install ok installed"),
+            ("nvidia-prime", "unknown ok not-installed"),
+            ("libnvidia-gl-550", "deinstall ok config-files"),
+        ),
+    )
+
+    assert s1._purge_distro_nvidia_packages(ctx) is True
+    purge = [c for c in runner.calls if c[0] == "apt-get" and c[1] == "purge"][0]
+    assert "nvidia-driver-550" in purge
+    assert "libnvidia-gl-550" in purge  # a real leftover purging does clear
+    assert "nvidia-prime" not in purge  # never installed
+
+
+def test_launch_a_does_not_loop_on_a_clean_machine(tmp_path):
+    """The regression: nouveau gone, blacklist already written, only
+    not-installed names in dpkg. Step 1 must fall through the cleanup gate
+    to the driver rather than asking for a reboot again."""
+    ctx, _ = _make_ctx(
+        tmp_path,
+        nouveau_loaded=False,
+        distro_nvidia_packages=_NOT_INSTALLED_ON_STOCK_UBUNTU,
+    )
+
+    result = s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    # Not the cleanup gate's message: it reached the driver .run and the
+    # post-install reboot instead.
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert "nouveau" not in result.message.lower()
+    assert "kernel module is installed but not yet loaded" in result.message
