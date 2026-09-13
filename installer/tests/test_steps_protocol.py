@@ -4,6 +4,11 @@ Covers: `StepStatus`'s five named values, `StepResult` defaults, a minimal
 `UserAction`, and that `STEP_REGISTRY` starts empty and `register()` orders
 by `.order`.
 
+Also covers the optional `phases` declaration and its accessors (doc
+`08-PROGRESS-AND-OBSERVABILITY.md` §3.1 and §9): a step that declares
+phases, a step that omits them, and every way a declaration can be
+malformed.
+
 `Context` (doc 00 §12.3) does not exist yet — it is built in a later,
 separate integration PR. The dummy `Step` implementation below uses
 `typing.Any` in place of `Context` for its method signatures; this is
@@ -25,7 +30,11 @@ from mv3dt_installer.steps import (  # noqa: E402
     StepResult,
     StepStatus,
     UserAction,
+    phase_count,
+    phase_label,
     register,
+    step_phases,
+    validate_phases,
 )
 
 
@@ -94,6 +103,9 @@ def test_user_action_with_command_and_path() -> None:
     assert action.path is not None
 
 
+_UNSET = object()
+
+
 class _DummyStep:
     """Minimal conforming `Step` implementation, for registry tests only.
 
@@ -101,10 +113,16 @@ class _DummyStep:
     docstring).
     """
 
-    def __init__(self, id_: str, title: str, order: int) -> None:
+    def __init__(
+        self, id_: str, title: str, order: int, phases: Any = _UNSET
+    ) -> None:
         self.id = id_
         self.title = title
         self.order = order
+        # A sentinel rather than a `None` default, so tests can distinguish
+        # "declared nothing" from "declared something malformed".
+        if phases is not _UNSET:
+            self.phases = phases
 
     def preflight(self, ctx: Any) -> StepResult:
         return StepResult(status=StepStatus.COMPLETE)
@@ -142,3 +160,115 @@ def test_register_orders_by_order_field() -> None:
         "step2_deepstream_sdk",
         "step3_amc_launcher",
     ]
+
+
+# --- phases declaration (doc 08 §3.1, §9) -------------------------------
+
+_PHASES = (
+    "base packages",
+    "CUDA repo and toolkit",
+    "NVIDIA driver runfile",
+)
+
+
+def _phased_step() -> _DummyStep:
+    return _DummyStep("step1_prerequisites", "Prerequisites", 1, phases=_PHASES)
+
+
+def test_step_declaring_phases_registers_and_exposes_them() -> None:
+    step = _phased_step()
+    register(step)
+
+    assert STEP_REGISTRY == [step]
+    assert step_phases(step) == _PHASES
+    assert phase_count(step) == 3
+    assert phase_label(step, 1) == "base packages"
+    assert phase_label(step, 3) == "NVIDIA driver runfile"
+
+
+def test_phases_declared_as_a_list_is_accepted_and_normalized() -> None:
+    step = _DummyStep("step4_calib", "Calib wiring", 4, phases=list(_PHASES))
+    register(step)
+
+    assert step_phases(step) == _PHASES
+
+
+def test_step_without_phases_registers_as_one_unnamed_phase() -> None:
+    # The backward-compatibility case that lets the seven steps adopt
+    # phases one at a time.
+    step = _DummyStep("step5_per_project_exes", "Per-project exes", 5)
+    register(step)
+
+    assert STEP_REGISTRY == [step]
+    assert not hasattr(step, "phases")
+    assert step_phases(step) == ()
+    assert phase_count(step) == 1
+    assert phase_label(step, 1) is None
+
+
+def test_phase_index_out_of_range_raises() -> None:
+    # Doc 08 §9: raise rather than render a wrong denominator.
+    step = _phased_step()
+    unphased = _DummyStep("step5_per_project_exes", "Per-project exes", 5)
+
+    for index in (0, -1, 4):
+        with pytest.raises(IndexError):
+            phase_label(step, index)
+    with pytest.raises(IndexError):
+        phase_label(unphased, 2)
+
+
+def test_phase_index_must_be_an_int() -> None:
+    step = _phased_step()
+    for index in ("1", 1.0, True, None):
+        with pytest.raises(TypeError):
+            phase_label(step, index)
+
+
+@pytest.mark.parametrize(
+    "phases",
+    [
+        "base packages",  # a str is itself a sequence of strings
+        b"base packages",
+        {"base packages"},  # unordered, so meaningless as phase 1..N
+        {"1": "base packages"},
+        7,
+        object(),
+    ],
+)
+def test_register_rejects_phases_that_are_not_a_string_sequence(phases: Any) -> None:
+    step = _DummyStep("step1_prerequisites", "Prerequisites", 1, phases=phases)
+    with pytest.raises(TypeError):
+        register(step)
+    assert STEP_REGISTRY == []
+
+
+@pytest.mark.parametrize("phases", [("base packages", 2), (None,), (("nested",),)])
+def test_register_rejects_non_string_phase_labels(phases: Any) -> None:
+    step = _DummyStep("step1_prerequisites", "Prerequisites", 1, phases=phases)
+    with pytest.raises(TypeError):
+        register(step)
+    assert STEP_REGISTRY == []
+
+
+@pytest.mark.parametrize("phases", [("",), ("base packages", "   ")])
+def test_register_rejects_empty_phase_labels(phases: Any) -> None:
+    step = _DummyStep("step1_prerequisites", "Prerequisites", 1, phases=phases)
+    with pytest.raises(ValueError):
+        register(step)
+    assert STEP_REGISTRY == []
+
+
+def test_register_rejects_an_empty_phases_tuple() -> None:
+    # Omitting the attribute is how a step says "one unnamed phase";
+    # declaring an empty tuple is an authoring mistake.
+    step = _DummyStep("step1_prerequisites", "Prerequisites", 1, phases=())
+    with pytest.raises(ValueError):
+        register(step)
+    assert STEP_REGISTRY == []
+
+
+def test_validate_phases_names_the_offending_step() -> None:
+    step = _DummyStep("step2_deepstream_sdk", "DeepStream SDK", 2, phases=("ok", ""))
+    with pytest.raises(ValueError, match="step2_deepstream_sdk"):
+        validate_phases(step)
