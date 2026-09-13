@@ -76,6 +76,8 @@ class FakeRunner:
         nouveau_loaded: bool = False,
         distro_nvidia_packages: tuple = (),
         driver_run_returncode: int = 0,
+        driver_download_ok: bool = True,
+        driver_download_version: str = s1.DRIVER_VERSION,
         dpkg_versions: Optional[dict] = None,
         driver_version: str = "",
         nvcc_release: str = "",
@@ -93,6 +95,8 @@ class FakeRunner:
         self.nouveau_loaded = nouveau_loaded
         self.distro_nvidia_packages = list(distro_nvidia_packages)
         self.driver_run_returncode = driver_run_returncode
+        self.driver_download_ok = driver_download_ok
+        self.driver_download_version = driver_download_version
         self.dpkg_versions: dict[str, str] = dict(dpkg_versions or {})
         self.driver_version = driver_version
         self.nvcc_release = nvcc_release
@@ -143,6 +147,15 @@ class FakeRunner:
                     self.dpkg_versions[pkg] = version
             return _ok(args)
         if cmd == "update-initramfs":
+            return _ok(args)
+        if cmd == "wget":
+            # Mirror real wget: write the body to the `-O` target on success,
+            # leave nothing behind on failure.
+            dest = pathlib.Path(args[args.index("-O") + 1])
+            if not self.driver_download_ok:
+                return _rc(args, 8)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(_runfile_bytes(self.driver_download_version))
             return _ok(args)
         if cmd == "nvidia-smi":
             if any("driver_version" in a for a in args):
@@ -223,10 +236,22 @@ def _make_ctx(tmp_path: pathlib.Path, **runner_kwargs: Any) -> tuple[FakeContext
     return ctx, runner
 
 
-def _stage_driver_run(ctx: FakeContext) -> pathlib.Path:
+def _runfile_bytes(version: str = s1.DRIVER_VERSION) -> bytes:
+    """A stand-in for the self-extracting runfile header `_verify_driver_run`
+    reads -- same shape as the real one, which stamps the build into a
+    comment line near the top of the archive."""
+    return (
+        b"#!/bin/sh\n"
+        b"#  NVIDIA Accelerated Graphics Driver for Linux-x86_64 "
+        + version.encode()
+        + b"\nskip=1234\n"
+    )
+
+
+def _stage_driver_run(ctx: FakeContext, version: str = s1.DRIVER_VERSION) -> pathlib.Path:
     path = s1._driver_run_path(ctx)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"#!/bin/sh\necho fake driver installer\n")
+    path.write_bytes(_runfile_bytes(version))
     return path
 
 
@@ -485,17 +510,103 @@ def test_confirmed_reboot_still_lets_launch_b_run_on_next_dispatch(tmp_path, mon
 # ---------------------------------------------------------------------------
 
 
-def test_launch_a_user_action_when_driver_run_not_staged(tmp_path):
-    ctx, _ = _make_ctx(tmp_path)
+def test_driver_download_url_is_derived_from_the_pinned_version():
+    """A pin bump must not leave the URL pointing at the old build."""
+    assert s1.DRIVER_VERSION in s1.DRIVER_DOWNLOAD_URL
+    assert s1.DRIVER_DOWNLOAD_URL.endswith(s1.DRIVER_RUN_FILENAME)
+    assert s1.DRIVER_DOWNLOAD_URL.startswith("https://")
+
+
+def test_launch_a_downloads_the_driver_when_not_staged(tmp_path):
+    ctx, runner = _make_ctx(tmp_path)
     # deliberately do not stage the .run file
 
     result = s1.Step1Prerequisites()._run_launch_a(ctx)
 
+    wget_calls = [c for c in runner.calls if c[0] == "wget"]
+    assert len(wget_calls) == 1
+    assert s1.DRIVER_DOWNLOAD_URL in wget_calls[0]
+    # Landed at the canonical path, with no .part left behind.
+    run_path = s1._driver_run_path(ctx)
+    assert run_path.is_file()
+    assert not run_path.with_suffix(run_path.suffix + ".part").exists()
+    # And the step proceeded all the way to the reboot gate.
     assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert "reboot" in result.message.lower()
+    assert (s1.DRIVER_RUN_FILENAME, s1.DRIVER_VERSION) in ctx.installed
+
+
+def test_launch_a_does_not_redownload_an_already_staged_driver(tmp_path):
+    ctx, runner = _make_ctx(tmp_path)
+    _stage_driver_run(ctx)
+
+    s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    assert [c for c in runner.calls if c[0] == "wget"] == []
+
+
+def test_launch_a_user_action_when_the_download_fails(tmp_path):
+    ctx, _ = _make_ctx(tmp_path, driver_download_ok=False)
+
+    result = s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert "could not obtain" in result.message
     assert len(result.user_actions) == 1
     action = result.user_actions[0]
     assert s1.DRIVER_RUN_FILENAME in action.path
     assert "nvidia.com" in (action.command or "")
+    # A failed fetch leaves nothing a later launch could mistake for good.
+    run_path = s1._driver_run_path(ctx)
+    assert not run_path.exists()
+    assert not run_path.with_suffix(run_path.suffix + ".part").exists()
+
+
+def test_launch_a_rejects_a_download_of_the_wrong_driver_version(tmp_path):
+    """A mirror redirect or withdrawn build must never reach the .run
+    invocation -- DS 9.1 pins driver equality (STEP-1 section 2)."""
+    ctx, runner = _make_ctx(tmp_path, driver_download_version="580.10.01")
+
+    result = s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert "580.10.01" in result.message
+    assert s1.DRIVER_VERSION in result.message
+    assert not s1._driver_run_path(ctx).exists()
+    assert not any(str(c[0]).endswith(".run") for c in runner.calls)
+
+
+def test_launch_a_replaces_a_staged_driver_of_the_wrong_version(tmp_path):
+    ctx, runner = _make_ctx(tmp_path)
+    _stage_driver_run(ctx, version="580.10.01")
+
+    result = s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    # Rejected the stale file, fetched the pinned one, and carried on.
+    assert len([c for c in runner.calls if c[0] == "wget"]) == 1
+    assert s1._driver_run_embedded_version(s1._driver_run_path(ctx)) == s1.DRIVER_VERSION
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert "reboot" in result.message.lower()
+
+
+def test_verify_driver_run_rejects_a_truncated_or_html_body(tmp_path):
+    path = tmp_path / "bad.run"
+    path.write_bytes(b"<html><head><title>404 Not Found</title></head></html>")
+
+    assert "not a recognisable NVIDIA runfile" in (s1._verify_driver_run(path) or "")
+
+
+def test_verify_driver_run_enforces_the_sha256_pin_when_set(tmp_path, monkeypatch):
+    path = tmp_path / "good.run"
+    path.write_bytes(_runfile_bytes())
+
+    assert s1._verify_driver_run(path) is None  # unpinned: version check only
+
+    monkeypatch.setattr(s1, "DRIVER_RUN_SHA256", "0" * 64)
+    assert "SHA256 mismatch" in (s1._verify_driver_run(path) or "")
+
+    monkeypatch.setattr(s1, "DRIVER_RUN_SHA256", s1._sha256_file(path))
+    assert s1._verify_driver_run(path) is None
 
 
 def test_launch_a_user_action_when_secure_boot_enabled(tmp_path):

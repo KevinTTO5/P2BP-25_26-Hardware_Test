@@ -153,9 +153,38 @@ APT_PREREQ_PACKAGES: tuple[str, ...] = (
     "ffmpeg",
 )
 
-# STEP-1 section 5.1 -- the driver .run is not bundled (too large); it must
-# be staged by the operator at this path under the install dir.
+# STEP-1 section 5.1 -- the driver .run is not bundled (too large at ~400MB
+# to ship in every GitHub Release binary). It is fetched automatically from
+# NVIDIA's public runfile mirror; the operator-staged path remains the
+# fallback when the download is unavailable (air-gapped host, proxy, 404 on
+# a withdrawn build).
 DRIVER_RUN_FILENAME = f"NVIDIA-Linux-x86_64-{DRIVER_VERSION}.run"
+
+# The version-stamped public runfile URL. Derived from DRIVER_VERSION rather
+# than hardcoded so the section 2 pin stays the single source of truth: a pin
+# bump cannot leave this pointing at the old build.
+DRIVER_DOWNLOAD_URL = (
+    "https://us.download.nvidia.com/XFree86/Linux-x86_64/"
+    f"{DRIVER_VERSION}/{DRIVER_RUN_FILENAME}"
+)
+
+# Optional integrity pin for the runfile. NVIDIA publishes no stable checksum
+# manifest alongside the runfile mirror, so this is None until a human pins
+# the value they verified out of band; when set, a mismatch is fatal and the
+# download is discarded. `_verify_driver_run` always enforces the embedded
+# version check below regardless, which is what actually guarantees DS 9.1
+# compatibility (section 2's equality pin).
+DRIVER_RUN_SHA256: "str | None" = None
+
+# A .run runfile is a self-extracting shell archive whose plain-text header
+# carries the build it was cut from, e.g.
+#   #  NVIDIA Accelerated Graphics Driver for Linux-x86_64 595.58.03
+# Reading that is how a downloaded-or-staged file is proven to be the pinned
+# build before it is ever executed -- a mirror redirect, a resumed partial
+# fetch, or an operator staging last year's driver under the right filename
+# all fail this check.
+DRIVER_HEADER_READ_BYTES = 8192
+_DRIVER_HEADER_VERSION_RE = re.compile(rb"Linux-x86_64[\s-]+(\d+\.\d+(?:\.\d+)?)")
 
 # STEP-1 section 4, caveat 7 / section 6.2 -- CUDA on PATH for new shells.
 CUDA_HOME = f"/usr/local/cuda-{CUDA_VERSION}"
@@ -301,6 +330,87 @@ def _nouveau_loaded(ctx: "Context") -> bool:
 
 def _driver_run_path(ctx: "Context") -> pathlib.Path:
     return pathlib.Path(ctx.install_dir) / "downloads" / "nvidia" / DRIVER_RUN_FILENAME
+
+
+def _driver_run_embedded_version(path: pathlib.Path) -> str | None:
+    """The driver build stamped in the runfile's self-extracting header, or
+    None if the file carries no recognisable NVIDIA runfile header."""
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(DRIVER_HEADER_READ_BYTES)
+    except OSError:
+        return None
+    match = _DRIVER_HEADER_VERSION_RE.search(header)
+    return match.group(1).decode("ascii") if match else None
+
+
+def _verify_driver_run(path: pathlib.Path) -> str | None:
+    """STEP-1 section 2 equality pin, applied to the runfile itself.
+
+    Returns None when `path` is the pinned DRIVER_VERSION build, or a short
+    operator-facing reason string when it is not. Checked before the file is
+    ever made executable, so a wrong or truncated download is never run.
+    """
+    embedded = _driver_run_embedded_version(path)
+    if embedded is None:
+        return (
+            "file is not a recognisable NVIDIA runfile (no driver version in "
+            "its header); it is most likely truncated or an HTML error page"
+        )
+    if embedded != DRIVER_VERSION:
+        return (
+            f"file contains driver {embedded}, but DeepStream 9.1 requires "
+            f"exactly {DRIVER_VERSION}"
+        )
+    if DRIVER_RUN_SHA256 is not None:
+        actual = _sha256_file(path)
+        if actual != DRIVER_RUN_SHA256:
+            return (
+                f"SHA256 mismatch: expected {DRIVER_RUN_SHA256}, got "
+                f"{actual or 'unreadable'}"
+            )
+    return None
+
+
+def _download_driver_run(ctx: "Context", dest: pathlib.Path) -> str | None:
+    """Fetch the pinned driver runfile to `dest` (STEP-1 section 5.1).
+
+    Downloads to a sibling `.part` file and only renames into place once
+    `_verify_driver_run` passes, so an interrupted or wrong-build fetch can
+    never leave something at `dest` that a later launch would mistake for a
+    good staged file. Returns None on success, or a reason string on failure
+    -- callers fall back to the operator-staging user action rather than
+    treating a failed download as fatal.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_suffix(dest.suffix + ".part")
+    partial.unlink(missing_ok=True)
+
+    ctx.log.info(f"Downloading NVIDIA driver {DRIVER_VERSION} from {DRIVER_DOWNLOAD_URL}")
+    result = ctx.run_root(
+        "wget",
+        "--tries=3",
+        "--timeout=30",
+        "--progress=dot:giga",
+        "-O",
+        str(partial),
+        DRIVER_DOWNLOAD_URL,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not partial.is_file():
+        partial.unlink(missing_ok=True)
+        return f"download failed (wget exit {result.returncode})"
+
+    reason = _verify_driver_run(partial)
+    if reason is not None:
+        partial.unlink(missing_ok=True)
+        return f"downloaded {reason}"
+
+    partial.replace(dest)
+    ctx.report_installed(DRIVER_RUN_FILENAME, DRIVER_VERSION)
+    return None
 
 
 def _mosquitto_dst_path() -> pathlib.Path:
@@ -622,10 +732,27 @@ class Step1Prerequisites:
             )
 
         run_path = _driver_run_path(ctx)
-        if not run_path.is_file():
+
+        # STEP-1 section 5.1: fetch the pinned runfile ourselves. An already
+        # staged file is verified rather than re-downloaded, so an operator
+        # who pre-staged the driver (or a resumed launch after the download
+        # already landed) does not pay for it twice.
+        if run_path.is_file():
+            reason = _verify_driver_run(run_path)
+            if reason is not None:
+                ctx.log.warn(f"Staged driver runfile rejected: {reason}; re-downloading")
+                run_path.unlink(missing_ok=True)
+                reason = _download_driver_run(ctx, run_path)
+        else:
+            reason = _download_driver_run(ctx, run_path)
+
+        if reason is not None:
             return StepResult(
                 status=StepStatus.USER_ACTION_REQUIRED,
-                message=f"NVIDIA driver installer not staged at {run_path}",
+                message=(
+                    f"could not obtain NVIDIA driver {DRIVER_VERSION} "
+                    f"automatically: {reason}"
+                ),
                 user_actions=[
                     UserAction(
                         text=(

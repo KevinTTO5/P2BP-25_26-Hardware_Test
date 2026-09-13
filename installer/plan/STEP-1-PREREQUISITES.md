@@ -412,15 +412,57 @@ using the NVIDIA **local-repo `.deb`** (an older `cuda-drivers-590` pin); Step
 1 supersedes that and uses the `.run` because "use what the NVIDIA docs say"
 is the ruling constraint. Only the `.run` path is documented.
 
-The `.run` file is a bundled asset located via `ctx.asset_path(...)`
-([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-and-staging-bundled-assets-at-runtime))
-or, if too large to bundle, surfaced as a `USER_ACTION_REQUIRED` download from
-NVIDIA's driver download search (<https://www.nvidia.com/en-us/drivers/>) for
-driver `595.58.03` — resolve the exact `driver/details/<id>` URL for that
-build at implementation time rather than hardcoding one here, since it is
-driver-build-specific and not part of the DS 9.1 documentation set.
-Bundled-vs-download is the only remaining DevA implementation choice here
-(see [§9](#9-open-decisions-for-the-human)); the method itself is settled.
+### 5.2 Runfile acquisition: installer-fetched (RESOLVED)
+
+The `.run` file is **neither bundled nor operator-staged by default**: Step 1
+downloads it itself, from the version-stamped public runfile mirror
+
+```
+https://us.download.nvidia.com/XFree86/Linux-x86_64/595.58.03/NVIDIA-Linux-x86_64-595.58.03.run
+```
+
+Bundling was rejected — the runfile is ~400MB, and [`00`
+§4.1](00-FRAMEWORK-AND-BOOTSTRAP.md#41-what-builds-the-binary)
+makes the Release binary the single artifact every operator downloads, so
+bundling would tax every install for a file apt already parallels for CUDA /
+TRT / cuDNN. Requiring the operator to stage it by hand was equally rejected:
+every other dependency in this step is acquired automatically, and a manual
+step here is the one thing that stops an unattended run.
+
+`DRIVER_DOWNLOAD_URL` is **derived from the `DRIVER_VERSION` constant**, never
+hardcoded, so the [§2](#2-the-ds-91-dgpu-prerequisite-pins-equality) equality pin stays
+the single source of truth — a pin bump cannot leave the URL pointing at the
+superseded build. The mirror path is used rather than the
+`driver/details/<id>` search result because the latter is a per-build
+redirect page, not a stable fetchable asset.
+
+**Compatibility is enforced on the file itself, not on the URL** (REQUIRED).
+A `.run` runfile is a self-extracting shell archive whose plain-text header
+names the build it was cut from; `_verify_driver_run` reads the first 8KB and
+refuses anything whose stamped version is not exactly `595.58.03`, before the
+file is made executable or run. This catches a mirror redirect, a withdrawn
+build, a resumed partial fetch, and an HTML error page saved under the right
+filename. An optional `DRIVER_RUN_SHA256` constant adds a full-content pin
+when a human has verified a checksum out of band; it is `None` by default
+because NVIDIA publishes no stable checksum manifest for this mirror.
+
+| Condition | Outcome |
+| --- | --- |
+| No file staged | Download, verify, proceed |
+| File staged, version matches | Verify only — no re-download |
+| File staged, version wrong | Discard, re-download, verify |
+| Download fails, or verify fails | `USER_ACTION_REQUIRED` — manual staging |
+
+The download lands on a sibling `.part` path and is renamed into place only
+after verification passes, so a failed or interrupted fetch never leaves
+something a later launch would mistake for a good staged file.
+
+> **Fallback is retained, not removed.** An air-gapped host, an outbound proxy,
+> or a 404 on a withdrawn build still ends in the original
+> `USER_ACTION_REQUIRED` pointing at NVIDIA's driver download search
+> (<https://www.nvidia.com/en-us/drivers/>) and the exact staging path. A
+> failed download is never `FAILED` — only the `.run` exiting non-zero is
+> ([§5](#5-order-of-operations)).
 
 ---
 
@@ -603,9 +645,10 @@ LOCKED constraints):
    accordingly and supersedes the local-repo `.deb` driver install in the
    existing [`00_bootstrap.sh`](../../laptop/scripts/00_bootstrap.sh). This
    accepts the GDM-stop / TTY / MOK friction (caveats 5–6) as the documented
-   cost. The **only** residual DevA choice is whether the `.run` ships
-   **bundled** in the binary or is fetched via a `USER_ACTION_REQUIRED` download
-   (§5.1).
+   cost. The residual bundled-vs-download choice is now also **RESOLVED:
+   installer-fetched** from the version-stamped NVIDIA runfile mirror, with
+   header-based version verification and operator staging retained as the
+   fallback — see [§5.2](#52-runfile-acquisition-installer-fetched-resolved).
 3. **apt prereq superset.** Step 1 installs the DS 9.1 §4.1 list **plus** the
    repo additions in §3.1 (`libgles2-mesa-dev`, `libjsoncpp-dev`,
    `protobuf-compiler`, `gcc`, `make`, `git`, `python3`). Confirm the superset
