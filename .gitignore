@@ -16,3 +16,6 @@ config/
 !laptop/config/**
 .cursor/
 .DS_Store
+
+# Transient agent worktrees (parallel-worktree-dev); never part of the repo.
+.claude/worktrees/
