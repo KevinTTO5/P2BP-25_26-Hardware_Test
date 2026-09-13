@@ -385,7 +385,8 @@ def _has_sshd_ancestor(pid: "int | None" = None) -> bool:
     return False
 
 
-def _display_manager_active(ctx: "Context") -> bool:
+def _active_display_manager(ctx: "Context") -> str | None:
+    """The name of the running display-manager unit, or None if none is."""
     for unit in DISPLAY_MANAGER_UNITS:
         if (
             ctx.run_root(
@@ -399,11 +400,11 @@ def _display_manager_active(ctx: "Context") -> bool:
             ).returncode
             == 0
         ):
-            return True
-    return False
+            return unit
+    return None
 
 
-def _would_kill_own_session(ctx: "Context") -> bool:
+def _session_hazard(ctx: "Context") -> str | None:
     """STEP-1 section 4, caveat 6a: whether stopping the display manager
     would take this installer process down with it.
 
@@ -416,13 +417,23 @@ def _would_kill_own_session(ctx: "Context") -> bool:
     session are both safe; a desktop terminal emulator is not.
     """
     if os.environ.get(ALLOW_DISPLAY_STOP_ENV):
-        return False
+        return None
     tty = _controlling_tty()
     if tty is not None and _VIRTUAL_CONSOLE_RE.match(tty):
-        return False
+        return None
     if _has_sshd_ancestor():
-        return False
-    return _display_manager_active(ctx)
+        return None
+    unit = _active_display_manager(ctx)
+    if unit is None:
+        return None
+    # Report the evidence, not just the verdict. A refusal that says only
+    # "this would kill the installer" is undebuggable from the console it
+    # just refused: the operator can see they are on a tty, the installer
+    # disagrees, and neither can see why.
+    return (
+        f"controlling terminal: {tty or 'none detected'}; "
+        f"sshd ancestor: no; active display manager: {unit}"
+    )
 
 
 def _stop_display_manager(ctx: "Context") -> bool:
@@ -963,12 +974,13 @@ class Step1Prerequisites:
         # Refuse before touching the display manager, not after: once gdm
         # is stopped from inside the desktop session there is no process
         # left to report anything (section 4, caveat 6a).
-        if _would_kill_own_session(ctx):
+        hazard = _session_hazard(ctx)
+        if hazard is not None:
             return StepResult(
                 status=StepStatus.USER_ACTION_REQUIRED,
                 message=(
                     "the driver installer must stop the desktop session, which "
-                    "would kill this installer along with it"
+                    f"would kill this installer along with it ({hazard})"
                 ),
                 user_actions=[
                     UserAction(

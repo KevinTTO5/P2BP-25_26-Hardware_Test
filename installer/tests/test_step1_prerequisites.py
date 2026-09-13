@@ -1055,7 +1055,7 @@ def test_guard_allows_a_virtual_console(tmp_path, monkeypatch):
     monkeypatch.setattr(s1, "_controlling_tty", lambda: "/dev/tty3")
     ctx, _ = _make_ctx(tmp_path, display_manager_active=True)
 
-    assert s1._would_kill_own_session(ctx) is False
+    assert s1._session_hazard(ctx) is None
 
 
 def test_guard_allows_an_ssh_session(tmp_path, monkeypatch):
@@ -1065,7 +1065,7 @@ def test_guard_allows_an_ssh_session(tmp_path, monkeypatch):
     monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: True)
     ctx, _ = _make_ctx(tmp_path, display_manager_active=True)
 
-    assert s1._would_kill_own_session(ctx) is False
+    assert s1._session_hazard(ctx) is None
 
 
 def test_guard_allows_a_desktop_terminal_when_no_display_manager_runs(tmp_path, monkeypatch):
@@ -1073,7 +1073,7 @@ def test_guard_allows_a_desktop_terminal_when_no_display_manager_runs(tmp_path, 
     monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: False)
     ctx, _ = _make_ctx(tmp_path, display_manager_active=False)
 
-    assert s1._would_kill_own_session(ctx) is False
+    assert s1._session_hazard(ctx) is None
 
 
 def test_guard_blocks_a_desktop_terminal_emulator(tmp_path, monkeypatch):
@@ -1081,7 +1081,7 @@ def test_guard_blocks_a_desktop_terminal_emulator(tmp_path, monkeypatch):
     monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: False)
     ctx, _ = _make_ctx(tmp_path, display_manager_active=True)
 
-    assert s1._would_kill_own_session(ctx) is True
+    assert s1._session_hazard(ctx) is not None
 
 
 def test_launch_a_refuses_before_touching_the_display_manager(tmp_path, monkeypatch):
@@ -1134,10 +1134,10 @@ def test_guard_can_be_overridden_by_the_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: False)
     ctx, _ = _make_ctx(tmp_path, display_manager_active=True)
 
-    assert s1._would_kill_own_session(ctx) is True
+    assert s1._session_hazard(ctx) is not None
 
     monkeypatch.setenv(s1.ALLOW_DISPLAY_STOP_ENV, "1")
-    assert s1._would_kill_own_session(ctx) is False
+    assert s1._session_hazard(ctx) is None
 
 
 def test_ubuntu_2404_display_manager_unit_is_tried():
@@ -1169,3 +1169,27 @@ def test_stopping_fails_only_when_an_active_manager_will_not_stop(tmp_path):
     ctx, _ = _make_ctx(tmp_path, display_manager_active=True, gdm_stops=False)
 
     assert s1._stop_display_manager(ctx) is False
+
+
+def test_refusal_names_what_it_detected(tmp_path, monkeypatch):
+    """A refusal the operator cannot check is a refusal they cannot fix."""
+    monkeypatch.setattr(s1, "_controlling_tty", lambda: "/dev/pts/1")
+    monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: False)
+    ctx, _ = _make_ctx(tmp_path, display_manager_active=True)
+    _stage_driver_run(ctx)
+
+    result = s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    assert "/dev/pts/1" in result.message
+    assert "gdm3" in result.message
+    assert s1.ALLOW_DISPLAY_STOP_ENV in result.user_actions[0].text
+
+
+def test_refusal_says_so_when_no_terminal_was_detected(tmp_path, monkeypatch):
+    """The case actually hit on the workstation: the guard could not read a
+    controlling terminal at all, and said nothing about it."""
+    monkeypatch.setattr(s1, "_controlling_tty", lambda: None)
+    monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: False)
+    ctx, _ = _make_ctx(tmp_path, display_manager_active=True)
+
+    assert "none detected" in (s1._session_hazard(ctx) or "")
