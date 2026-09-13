@@ -56,6 +56,7 @@ without ever touching the real filesystem.
 from __future__ import annotations
 
 import hashlib
+import os
 import pathlib
 import re
 from typing import TYPE_CHECKING, Sequence
@@ -299,6 +300,91 @@ def _secure_boot_enabled(ctx: "Context") -> bool:
     if result.returncode != 0:
         return False
     return "enabled" in result.stdout.lower()
+
+
+_VIRTUAL_CONSOLE_RE = re.compile(r"^/dev/tty\d+$")
+
+
+def _controlling_tty() -> str | None:
+    """The process's controlling terminal, or None when it has none.
+
+    `/dev/ttyN` is a virtual console, which survives the display manager
+    being stopped. `/dev/pts/N` is a pseudo-terminal -- a terminal emulator
+    window (dies with the X session) or an SSH session (does not).
+    """
+    try:
+        return os.ttyname(0)
+    except (OSError, AttributeError):
+        return None
+
+
+def _has_sshd_ancestor(pid: "int | None" = None) -> bool:
+    """Whether this process descends from sshd.
+
+    Walks /proc rather than reading SSH_CONNECTION/SSH_TTY, because sudo's
+    default env_reset strips those before a step ever sees them -- an SSH
+    operator would otherwise be refused for a hazard that cannot touch
+    them: stopping the display manager does not disturb an SSH session.
+    """
+    pid = os.getpid() if pid is None else pid
+    seen = set()
+    while pid and pid > 1 and pid not in seen:
+        seen.add(pid)
+        try:
+            stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return False
+        # comm is parenthesised and may itself contain spaces/parens.
+        open_paren, close_paren = stat.find("("), stat.rfind(")")
+        if open_paren < 0 or close_paren < 0:
+            return False
+        comm = stat[open_paren + 1 : close_paren]
+        if comm == "sshd":
+            return True
+        rest = stat[close_paren + 2 :].split()
+        try:
+            pid = int(rest[1])  # ppid
+        except (IndexError, ValueError):
+            return False
+    return False
+
+
+def _display_manager_active(ctx: "Context") -> bool:
+    for unit in ("gdm", "lightdm"):
+        if (
+            ctx.run_root(
+                "systemctl",
+                "is-active",
+                "--quiet",
+                unit,
+                check=False,
+                capture_output=True,
+                text=True,
+            ).returncode
+            == 0
+        ):
+            return True
+    return False
+
+
+def _would_kill_own_session(ctx: "Context") -> bool:
+    """STEP-1 section 4, caveat 6a: whether stopping the display manager
+    would take this installer process down with it.
+
+    `service gdm stop` tears down the X session, killing every terminal
+    emulator inside it -- including the one the installer is running in, if
+    it was launched from the desktop. The installer then dies on SIGHUP
+    part-way through, most often before the driver `.run` starts at all,
+    leaving a black screen, no `/var/log/nvidia-installer.log`, and no
+    indication that anything went wrong. A virtual console and an SSH
+    session are both safe; a desktop terminal emulator is not.
+    """
+    tty = _controlling_tty()
+    if tty is not None and _VIRTUAL_CONSOLE_RE.match(tty):
+        return False
+    if _has_sshd_ancestor():
+        return False
+    return _display_manager_active(ctx)
 
 
 def _stop_display_manager(ctx: "Context") -> bool:
@@ -814,6 +900,29 @@ class Step1Prerequisites:
                 ],
             )
 
+        # Refuse before touching the display manager, not after: once gdm
+        # is stopped from inside the desktop session there is no process
+        # left to report anything (section 4, caveat 6a).
+        if _would_kill_own_session(ctx):
+            return StepResult(
+                status=StepStatus.USER_ACTION_REQUIRED,
+                message=(
+                    "the driver installer must stop the desktop session, which "
+                    "would kill this installer along with it"
+                ),
+                user_actions=[
+                    UserAction(
+                        text=(
+                            "Switch to a virtual console with Ctrl+Alt+F3, log in "
+                            "there, and re-run this command. The desktop session "
+                            "cannot take the installer down with it from a console. "
+                            "An SSH session works too."
+                        ),
+                        command="sudo ./mv3dt-installer",
+                    ),
+                ],
+            )
+
         if not _stop_display_manager(ctx):
             return StepResult(
                 status=StepStatus.USER_ACTION_REQUIRED,
@@ -832,8 +941,18 @@ class Step1Prerequisites:
             )
 
         run_path.chmod(0o755)
+        # --silent is documented drift from the DS 9.1 page's verbatim
+        # command (STEP-1 section 5.1). The runfile is interactive by
+        # default: it can stop on ncurses questions about DKMS
+        # registration, 32-bit compatibility libraries, or an existing
+        # driver. run_root captures output, so such a question is never
+        # drawn on any screen -- the install simply blocks forever with
+        # nothing to show why, which is indistinguishable from a slow
+        # kernel-module build. --silent (which implies --no-questions and
+        # accepts the licence) makes that class of hang impossible.
         result = ctx.run_root(
             str(run_path),
+            "--silent",
             "--no-cc-version-check",
             check=False,
             capture_output=True,

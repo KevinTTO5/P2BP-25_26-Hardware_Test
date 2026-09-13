@@ -412,6 +412,37 @@ using the NVIDIA **local-repo `.deb`** (an older `cuda-drivers-590` pin); Step
 1 supersedes that and uses the `.run` because "use what the NVIDIA docs say"
 is the ruling constraint. Only the `.run` path is documented.
 
+### 5.1a Documented drift: `--silent` and the session guard (RESOLVED)
+
+Two departures from the verbatim DS 9.1 command, both found on real
+hardware rather than in review:
+
+1. **`--silent` is added** to the `.run` invocation. The runfile is
+   interactive by default and can stop on ncurses questions (DKMS
+   registration, 32-bit compatibility libraries, an existing driver).
+   `run_root` captures output, so such a question is drawn on no screen at
+   all: the install blocks forever with nothing to show why, which from the
+   outside is indistinguishable from a slow kernel-module build. `--silent`
+   implies `--no-questions` and accepts the licence, making that class of
+   hang impossible.
+2. **Step 1 refuses to stop the display manager when doing so would kill the
+   installer itself** (caveat 6a). `service gdm stop` tears down the X
+   session and every terminal emulator in it — including the one the
+   operator launched from, if they launched from the desktop. The installer
+   then dies on `SIGHUP`, usually *before* the `.run` starts, leaving a black
+   screen, no `/var/log/nvidia-installer.log`, and no indication anything
+   went wrong. The check runs **before** the display manager is touched,
+   since afterwards no process survives to report anything.
+
+The session check treats a virtual console (`/dev/ttyN`) and an SSH session
+as safe, and a desktop terminal emulator with a display manager running as
+unsafe. SSH is detected by walking `/proc` for an `sshd` ancestor rather
+than by reading `SSH_CONNECTION`/`SSH_TTY`, because `sudo`'s default
+`env_reset` strips those before a step ever sees them — an SSH operator
+would otherwise be refused for a hazard that cannot reach them.
+
+---
+
 ### 5.2 Runfile acquisition: installer-fetched (RESOLVED)
 
 The `.run` file is **neither bundled nor operator-staged by default**: Step 1

@@ -40,6 +40,15 @@ def _force_no_colour(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _console_session(monkeypatch):
+    """Every test runs as if launched from a virtual console -- the safe
+    case for the caveat-6a guard. Tests for the guard itself override this.
+    pytest's own stdin is not a tty, so without this the guard would trip
+    in every Launch A test."""
+    monkeypatch.setattr(s1, "_controlling_tty", lambda: "/dev/tty3")
+
+
+@pytest.fixture(autouse=True)
 def _safe_system_paths(monkeypatch, tmp_path):
     """Belt and braces: point every real system path this module writes at a
     scratch dir so a bug under test can never reach the real filesystem."""
@@ -83,6 +92,7 @@ class FakeRunner:
         nvcc_release: str = "",
         gstreamer_version: str = "",
         mosquitto_active: bool = True,
+        display_manager_active: bool = True,
         cudnn_install_result: Optional[str] = s1.CUDNN_VERSION,
         kernel_release: str = "6.8.0-generic",
     ) -> None:
@@ -102,6 +112,7 @@ class FakeRunner:
         self.nvcc_release = nvcc_release
         self.gstreamer_version = gstreamer_version
         self.mosquitto_active = mosquitto_active
+        self.display_manager_active = display_manager_active
         self.cudnn_install_result = cudnn_install_result
         self.kernel_release = kernel_release
 
@@ -180,6 +191,9 @@ class FakeRunner:
                 return _rc(args, 1)
             return _ok(args, f"gst-inspect-1.0 version {self.gstreamer_version}")
         if cmd == "systemctl":
+            unit = args[-1]
+            if unit in ("gdm", "lightdm"):
+                return _rc(args, 0 if self.display_manager_active else 1)
             return _rc(args, 0 if self.mosquitto_active else 1)
         if isinstance(cmd, str) and cmd.endswith(".run"):
             return _rc(args, self.driver_run_returncode)
@@ -1014,3 +1028,86 @@ def test_display_manager_stop_warns_before_the_screen_goes_black(tmp_path, monke
     assert len(seen) == 1
     assert "screen will go black" in seen[0]
     assert "do NOT power off" in seen[0]
+
+
+# ---------------------------------------------------------------------------
+# Caveat 6a -- refusing to kill the session the installer runs in
+# ---------------------------------------------------------------------------
+
+
+def test_driver_run_is_invoked_silently(tmp_path):
+    """The runfile is interactive by default and run_root captures its
+    output, so a question would block forever, invisibly."""
+    ctx, runner = _make_ctx(tmp_path)
+    _stage_driver_run(ctx)
+
+    s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    run_calls = [c for c in runner.calls if str(c[0]).endswith(".run")]
+    assert len(run_calls) == 1
+    assert "--silent" in run_calls[0]
+    assert "--no-cc-version-check" in run_calls[0]
+
+
+def test_guard_allows_a_virtual_console(tmp_path, monkeypatch):
+    monkeypatch.setattr(s1, "_controlling_tty", lambda: "/dev/tty3")
+    ctx, _ = _make_ctx(tmp_path, display_manager_active=True)
+
+    assert s1._would_kill_own_session(ctx) is False
+
+
+def test_guard_allows_an_ssh_session(tmp_path, monkeypatch):
+    """Stopping gdm cannot disturb an SSH session, so a pts under sshd is
+    safe. sudo strips SSH_CONNECTION, hence the /proc ancestry walk."""
+    monkeypatch.setattr(s1, "_controlling_tty", lambda: "/dev/pts/1")
+    monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: True)
+    ctx, _ = _make_ctx(tmp_path, display_manager_active=True)
+
+    assert s1._would_kill_own_session(ctx) is False
+
+
+def test_guard_allows_a_desktop_terminal_when_no_display_manager_runs(tmp_path, monkeypatch):
+    monkeypatch.setattr(s1, "_controlling_tty", lambda: "/dev/pts/1")
+    monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: False)
+    ctx, _ = _make_ctx(tmp_path, display_manager_active=False)
+
+    assert s1._would_kill_own_session(ctx) is False
+
+
+def test_guard_blocks_a_desktop_terminal_emulator(tmp_path, monkeypatch):
+    monkeypatch.setattr(s1, "_controlling_tty", lambda: "/dev/pts/1")
+    monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: False)
+    ctx, _ = _make_ctx(tmp_path, display_manager_active=True)
+
+    assert s1._would_kill_own_session(ctx) is True
+
+
+def test_launch_a_refuses_before_touching_the_display_manager(tmp_path, monkeypatch):
+    """The regression: launched from a desktop terminal, Step 1 used to stop
+    gdm, die on SIGHUP before the .run started, and leave a black screen with
+    no log and no explanation."""
+    monkeypatch.setattr(s1, "_controlling_tty", lambda: "/dev/pts/1")
+    monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: False)
+    ctx, runner = _make_ctx(tmp_path, display_manager_active=True)
+    _stage_driver_run(ctx)
+
+    result = s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert "kill this installer" in result.message
+    assert "Ctrl+Alt+F3" in result.user_actions[0].text
+    # Nothing was torn down, and the .run never started.
+    assert not [c for c in runner.calls if c[0] == "service"]
+    assert not [c for c in runner.calls if c[0] == "pkill"]
+    assert not [c for c in runner.calls if str(c[0]).endswith(".run")]
+
+
+def test_sshd_ancestor_walk_handles_a_comm_containing_parens(monkeypatch, tmp_path):
+    """/proc/<pid>/stat's comm field is parenthesised and may itself contain
+    spaces and parens, so the parser must not split on them."""
+    proc = tmp_path / "proc"
+    (proc / "10").mkdir(parents=True)
+    (proc / "10" / "stat").write_text("10 (weird (name) here) S 1 10 10 0 -1 0")
+
+    monkeypatch.setattr(s1.pathlib, "Path", lambda p: proc / str(p).replace("/proc/", ""))
+    assert s1._has_sshd_ancestor(10) is False
