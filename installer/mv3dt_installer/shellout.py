@@ -40,7 +40,10 @@ Four properties this module owes its callers:
    `CompletedProcess` buffers and writes the transcript from the same lines,
    so live output and captured output can never disagree and no stream is
    read twice. `run_bundled_script` runs through it rather than keeping a
-   second subprocess path of its own.
+   second subprocess path of its own. Control characters are stripped with
+   `progress.sanitise` and nothing else -- this module deliberately keeps no
+   stripper of its own, so there is one definition of "clean" rather than
+   two that agree today and drift later.
 
 Exactly what redaction guarantees, stated precisely because the transcript
 is an audited artifact:
@@ -199,32 +202,6 @@ def _env_dump(env: Mapping[str, str], secrets: Sequence[str]) -> str:
         else:
             entries.append(_scrub(f"{key}={shlex.quote(value)}", secrets))
     return " ".join(entries)
-
-
-# ---------------------------------------------------------------------------
-# Control characters (doc 00 §8.2, doc 08 §7)
-# ---------------------------------------------------------------------------
-
-# A child is free to emit colour, cursor moves and window-title sets -- apt,
-# curl and the NVIDIA runfile all do. None of it may reach the transcript,
-# which `logs.py` cannot enforce on its own because it never sees the raw
-# line. So a streamed line is stripped once, here, and that one stripped form
-# is what the transcript records and what the renderer is handed; the renderer
-# sanitises whatever it is given anyway, and shellout does not compute a
-# second variant for it. The returned buffer keeps the child's text as it
-# was: 72 call sites parse it and are entitled to exactly what
-# `subprocess.run` would have handed them.
-_CONTROL_RE = re.compile(
-    r"\x1b\[[0-9;:?]*[ -/]*[@-~]"          # CSI: colour, cursor moves, erase
-    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC: window titles, hyperlinks
-    r"|\x1b[@-_]"                          # remaining two-character escapes
-    r"|[\x00-\x08\x0b-\x1f\x7f]"           # bare C0 controls; tab and LF kept
-)
-
-
-def _strip_control(text: str) -> str:
-    """Remove ANSI sequences and stray control characters from one line."""
-    return _CONTROL_RE.sub("", text)
 
 
 # ---------------------------------------------------------------------------
@@ -425,8 +402,19 @@ def run_streamed(
 
     def _consume(name: str, raw: str) -> None:
         scrubbed = _scrub(raw, secrets or ())
+        # The buffer keeps the child's own text, redaction aside: 72 call
+        # sites parse it, and a parser is entitled to exactly what
+        # `subprocess.run(capture_output=True, text=True)` would have handed
+        # it -- escapes, tabs and all. Only the two destinations that render
+        # text get the sanitised form below.
         buffers[name].append(scrubbed if redact_capture else raw)
-        rendered = _strip_control(scrubbed).rstrip("\r\n")
+        # `progress.sanitise` is the one definition of "clean" (doc 08 §7),
+        # applied here because the transcript needs it and `logs.py` cannot
+        # do it for itself -- it never sees the raw line. The renderer
+        # sanitises its own input too; that second pass is a no-op on an
+        # already-clean string, so the terminal and the transcript are
+        # guaranteed to be showing the same text.
+        rendered = progress.sanitise(scrubbed)
         if sink is not None:
             sink.line(rendered)
         emit[name](f"[{label}] {rendered}")

@@ -941,14 +941,48 @@ def test_streamed_output_off_a_tty_is_plain_lines_with_no_escapes(tmp_path, caps
         _ANSI_CHILD, renderer=progress.Progress(out=out, total_steps=7)
     )
 
-    written = out.getvalue()
-    assert "\x1b" not in written
-    assert "green-line" in written
-    assert "plain" in written
+    # Exact, not merely escape-free: both sides sanitise with the same
+    # function, so what the renderer writes is fully determined.
+    assert out.getvalue() == "green-line\nplain\n"
     assert "\x1b" not in run_file.read_text()
     # The buffer is what `subprocess.run` would have returned, escapes and all:
     # a parser is entitled to the child's own bytes.
     assert "\x1b[32m" in result.stdout
+    capsys.readouterr()
+
+
+def test_streamed_lines_carry_the_renderers_own_sanitising(tmp_path, capsys):
+    """One definition of "clean", not two. The line handed to the renderer is
+    exactly `progress.sanitise` of the child's output, so the terminal and the
+    transcript cannot disagree, and the renderer's own pass over it is a no-op
+    rather than a second, different strip."""
+    run_file = _transcript(tmp_path)
+    sink = _RecordingSink()
+
+    result = shellout.run_streamed(
+        _sh('printf "\033[32mgreen\033[0m\tcolumn\n"'), renderer=sink
+    )
+
+    expected = progress.sanitise("\x1b[32mgreen\x1b[0m\tcolumn\n")
+    assert sink.lines == [expected]
+    assert progress.sanitise(expected) == expected  # nothing changes twice
+    assert f"[info ] [sh] {expected}" in run_file.read_text()
+    # The buffer is untouched by any of it.
+    assert result.stdout == "\x1b[32mgreen\x1b[0m\tcolumn\n"
+    capsys.readouterr()
+
+
+def test_streamed_buffer_keeps_the_child_text_the_renderer_cleaned(capsys):
+    """The capture buffer is what `subprocess.run` would have returned, not
+    what the terminal showed: 72 call sites parse it and are entitled to the
+    child's own bytes."""
+    program = _sh('printf "\033[1mbold\033[0m\ttabbed\n"')
+
+    streamed = shellout.run_streamed(program, renderer=_RecordingSink())
+    reference = subprocess.run(program, capture_output=True, text=True)
+
+    assert streamed.stdout == reference.stdout
+    assert "\t" in streamed.stdout
     capsys.readouterr()
 
 
