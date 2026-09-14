@@ -14,8 +14,9 @@ and no call site, imports `logs` and nothing from `steps/` or
 
 Public API:
     Progress -- the renderer. `begin_step` / `phase` / `task` / `bytes` /
-        `line` / `tick` / `end_step`; `phase`, `task` and `bytes` are the
-        step-author contract in doc 08 section 9.
+        `percent` / `line` / `tick` / `end_step`; `phase`, `task` and
+        `bytes` are the step-author contract in doc 08 section 9, and
+        `percent` is the adapter-facing sibling of `bytes`.
     sanitise(text) -- strip control characters out of command output.
     format_duration / format_clock / format_bytes / format_rate -- pure
         formatters.
@@ -25,6 +26,9 @@ Public API:
     content_length / follow_download -- the download byte-progress adapter
         (section 5.1): poll the `.part` file the installer is writing and
         drive the bar from `size(.part) / Content-Length`.
+    parse_apt_status / apt_fraction / follow_apt -- the apt percentage
+        adapter (section 5.2): read `APT::Status-Fd` and drive one bar that
+        only ever rises across apt's two independent 0-100 sweeps.
 
 Three properties this module owes its callers:
 
@@ -56,6 +60,7 @@ injected so tests get exact elapsed times instead of wall-clock ones.
 from __future__ import annotations
 
 import http.client
+import math
 import pathlib
 import re
 import shutil
@@ -84,6 +89,7 @@ __all__ = [
     "render_phase_done",
     "render_phase_active",
     "render_bytes_line",
+    "render_percent_line",
     "render_spinner_line",
     "DownloadOutcome",
     "DEFAULT_DOWNLOAD_POLL_S",
@@ -94,6 +100,16 @@ __all__ = [
     "render_download_log_line",
     "render_download_done_line",
     "follow_download",
+    "APT_DOWNLOAD_SHARE",
+    "APT_LOG_INTERVAL_S",
+    "AptStatus",
+    "AptOutcome",
+    "apt_status_fd_args",
+    "parse_apt_status",
+    "apt_fraction",
+    "render_apt_log_line",
+    "render_apt_done_line",
+    "follow_apt",
 ]
 
 
@@ -342,6 +358,37 @@ def render_bytes_line(
     return "   ".join(fields)
 
 
+def render_percent_line(percent: float | None, note: str | None = None) -> str:
+    """The determinate row for work that reports a percentage, not bytes.
+
+    apt is the one operation in the section 5 table with a true denominator
+    and no byte count behind it: `APT::Status-Fd` reports how far through
+    the transaction it is, so the row is the bar, the percentage, and what
+    apt is working on -- "Bar + percent + current package" in that table.
+
+    `percent` is in 0-100. A missing or non-finite one raises for the same
+    reason `render_bytes_line` does: section 5.3 is REQUIRED, and a
+    renderer that quietly substitutes a zero produces exactly the bar that
+    requirement exists to prevent. Indeterminate work uses
+    `render_spinner_line`, which is what `Progress.percent` falls back to.
+    """
+    try:
+        usable = percent is not None and math.isfinite(float(percent))
+    except (TypeError, ValueError):
+        usable = False
+    if not usable:
+        raise ValueError(
+            f"no percentage to render a bar from (percent={percent!r}); "
+            "use render_spinner_line for indeterminate work"
+        )
+
+    value = min(max(float(percent), 0.0), 100.0)
+    fields = [f"{render_bar(value / 100.0)} {round(value):3d}%"]
+    if note:
+        fields.append(note)
+    return "   ".join(fields)
+
+
 def render_spinner_line(
     frame: str, name: str, elapsed: float, note: str | None = None
 ) -> str:
@@ -377,6 +424,7 @@ class Progress:
         p.phase(1)                    # section 9: indexes declared phases
         p.task("fetching SDK tarball")
         p.bytes(done, total)          # only with a real denominator
+        p.percent(68.0, "libnvinfer10")   # the same, as a percentage
         p.line("...")                 # one line of command output
         p.end_step()
 
@@ -423,6 +471,8 @@ class Progress:
         self._done: int | None = None
         self._total: int | None = None
         self._samples: Deque[tuple[float, int]] = deque()
+        self._percent: float | None = None
+        self._percent_note: str | None = None
 
         self._window: Deque[str] = deque(maxlen=max(self._window_lines, 1))
         self._last_line: str | None = None
@@ -499,6 +549,12 @@ class Progress:
         A missing or non-positive `total` is not an error and not a reason
         to guess: the row falls back to the spinner, per section 5.3.
         """
+        # A task is a byte transfer or a percentage-reporting transaction,
+        # never both, so adopting one denominator drops the other rather
+        # than leaving two bars competing for the activity row.
+        self._percent = None
+        self._percent_note = None
+
         if not total or int(total) <= 0:
             self._done = None
             self._total = None
@@ -517,6 +573,43 @@ class Progress:
         ):
             self._samples.popleft()
 
+        self._draw()
+
+    def percent(self, value: float | None, note: str | None = None) -> None:
+        """Drive a determinate bar from a percentage (section 5).
+
+        The sibling of `bytes()` for an operation that reports how far
+        through it is rather than how many bytes it has moved -- apt on
+        `APT::Status-Fd` is the one in the section 5 table. `value` is in
+        0-100 and `note` is what the operation is working on, rendered
+        beside the bar.
+
+        `None`, or a value that is not a finite number, is not an error and
+        not a reason to guess: the row falls back to the spinner, per
+        section 5.3. The caller stays responsible for the value only ever
+        rising -- see `follow_apt`, which is where apt's two independent
+        sweeps are mapped onto one bar that cannot go backwards.
+        """
+        # A task is a byte transfer or a percentage-reporting transaction,
+        # never both, so adopting one denominator drops the other rather
+        # than leaving two bars competing for the activity row.
+        self._done = None
+        self._total = None
+        self._samples.clear()
+
+        try:
+            usable = value is not None and math.isfinite(float(value))
+        except (TypeError, ValueError):
+            usable = False
+
+        if not usable:
+            self._percent = None
+            self._percent_note = None
+            self._draw()
+            return
+
+        self._percent = min(max(float(value), 0.0), 100.0)
+        self._percent_note = sanitise(note) if note else None
         self._draw()
 
     def line(self, text: str) -> None:
@@ -571,6 +664,8 @@ class Progress:
         self._done = None
         self._total = None
         self._samples.clear()
+        self._percent = None
+        self._percent_note = None
         self._window.clear()
         self._last_line = None
 
@@ -633,6 +728,11 @@ class Progress:
                 eta = max(self._total - self._done, 0) / rate
             return _ACTIVITY_INDENT + render_bytes_line(
                 self._done, self._total, rate, eta
+            )
+
+        if self._percent is not None:
+            return _ACTIVITY_INDENT + render_percent_line(
+                self._percent, self._percent_note
             )
 
         started = self._task_started
@@ -840,6 +940,25 @@ def render_download_done_line(
     return line
 
 
+def _say(renderer: "Progress | None", message: str) -> None:
+    """Emit one progress line, to the screen when there is room for it.
+
+    Suppressed for rendering reasons is not the same as dropped (section
+    7.1). Off a tty the drawn region does not exist, so this line is the
+    only signal a long operation gives and it goes to `log.info`, which
+    writes the screen and the transcript together. On a tty it would fight
+    the live region's cursor arithmetic, so it is recorded and not printed:
+    an interactive install is the one an operator runs by hand and asks
+    about afterwards, and without this its transcript reads task name,
+    nothing at all for the length of a multi-gigabyte transaction, phase
+    done.
+    """
+    if renderer is None or not renderer.live:
+        log.info(message)
+    else:
+        transcript("info", message)
+
+
 def follow_download(
     path: "pathlib.Path | str",
     total: int | None,
@@ -890,24 +1009,8 @@ def follow_download(
             # rather than after one stale bar.
             renderer.bytes(0, None)
 
-    # Off a tty the drawn region does not exist, so the periodic line is
-    # the only signal; on a tty it would fight the live region's cursor
-    # arithmetic, so it is kept off the screen.
-    speak = renderer is None or not renderer.live
-
     def say(message: str) -> None:
-        """Emit one progress line, to the screen when there is room for it.
-
-        Suppressed for rendering reasons is not the same as dropped
-        (section 7.1). An interactive install is the one an operator runs by
-        hand and asks about afterwards, and without this its transcript
-        reads: task name, nothing at all for the length of a
-        multi-hundred-megabyte transfer, phase done.
-        """
-        if speak:
-            log.info(message)
-        else:
-            transcript("info", message)
+        _say(renderer, message)
 
     started = clock()
     next_log_at = 0.0
@@ -948,4 +1051,384 @@ def follow_download(
 
     return DownloadOutcome(
         bytes_done=done, total=denominator, elapsed_s=elapsed, polls=polls
+    )
+
+
+# ---------------------------------------------------------------------------
+# apt Status-Fd percentage adapter (section 5.2)
+# ---------------------------------------------------------------------------
+
+
+# `apt-get install -o APT::Status-Fd=<fd>` writes one machine-readable
+# record per line to that descriptor, in parallel with its human output:
+#
+#     dlstatus:1:12.5000:Retrieving file 3 of 24
+#     pmstatus:libnvinfer10:68.0000:Setting up libnvinfer10 (10.16.0.72-1+cuda13.2)
+#
+# That is the denominator event 3 in section 2 lacked -- the transaction an
+# operator interrupted because several gigabytes of captured apt output
+# presented exactly like a hung process, and which then needed
+# `dpkg --configure -a` to recover.
+
+# The two sweeps are independent: `dlstatus` runs 0 to 100 while apt fetches
+# archives, then `pmstatus` runs 0 to 100 again while dpkg unpacks and
+# configures them. Feeding both to one bar naively resets it halfway, which
+# is worse than no bar at all -- so they are rendered as two segments of a
+# single 0-100 range, download first. The share is a convention, not a
+# measurement, and it is the only number here that is: both percentages
+# inside their segments are apt's own.
+APT_DOWNLOAD_SHARE = 0.5
+
+# Same interval and the same reason as `DOWNLOAD_LOG_INTERVAL_S`: off a tty
+# nothing is drawn, so this line is all a multi-minute transaction gives,
+# and on a tty it paces the transcript instead of the screen (section 7.1).
+APT_LOG_INTERVAL_S = 30.0
+
+# Only these two carry a percentage this module will draw. `pmerror` is
+# read for its description alone -- an error apt reports mid-transaction is
+# the one line an operator most needs to see -- and every other record kind
+# (`media-change`, `pmconffile`, dpkg's own `status:`) is ignored rather
+# than guessed at, per the parse-defensively rule.
+_APT_BAR_KINDS = frozenset({"dlstatus", "pmstatus"})
+_APT_NOTE_KINDS = frozenset({"pmerror"})
+_APT_KINDS = _APT_BAR_KINDS | _APT_NOTE_KINDS
+
+# How many colon-separated fields the item may occupy before the percentage.
+# Normally one, but apt qualifies package names with an architecture
+# (`libnvinfer10:amd64`), so the percentage is not reliably field 2.
+_APT_MAX_ITEM_FIELDS = 3
+
+
+@dataclass(frozen=True)
+class AptStatus:
+    """One parsed `APT::Status-Fd` record.
+
+    `percent` is None whenever the record carried no usable number, which
+    is not an error: the description alone is still worth showing, and
+    section 5.3 is what governs whether a bar appears.
+    """
+
+    kind: str
+    item: str
+    percent: float | None
+    description: str
+
+    @property
+    def drives_bar(self) -> bool:
+        """True only for a record that can move a real denominator."""
+        return self.kind in _APT_BAR_KINDS and self.percent is not None
+
+
+@dataclass(frozen=True)
+class AptOutcome:
+    """What the status stream reported, for the caller that owns apt.
+
+    `percent` is the last percentage rendered, so `had_denominator` says
+    whether a bar was ever honest to draw. It is deliberately not forced to
+    100 at the end: the stream ending means apt closed the descriptor, and
+    whether the transaction succeeded is the caller's exit status to read,
+    not this adapter's to infer.
+    """
+
+    lines: int
+    parsed: int
+    percent: int | None
+    description: str | None
+    had_download_phase: bool
+    elapsed_s: float
+
+    @property
+    def had_denominator(self) -> bool:
+        """True when a percentage was reported and a bar was drawn."""
+        return self.percent is not None
+
+
+def apt_status_fd_args(fd: int) -> tuple[str, ...]:
+    """The `apt-get` options that turn the stream on, for the caller.
+
+    Kept beside the parser so the descriptor number and the thing that
+    reads it cannot drift apart. The caller owns the pipe itself: it makes
+    the descriptor inheritable (`pass_fds`) and hands the read end to
+    `follow_apt`.
+    """
+    return ("-o", f"APT::Status-Fd={int(fd)}")
+
+
+def _apt_percent(field: str) -> float | None:
+    """A status field as a percentage, or None when it is not one.
+
+    Non-finite values are rejected as hard as unparseable ones: `float()`
+    accepts "nan" and "inf" happily, and either would reach `round()` in
+    the renderer and raise, from a line that came off a pipe.
+    """
+    text = str(field).strip()
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return min(max(value, 0.0), 100.0)
+
+
+def parse_apt_status(line: Any) -> "AptStatus | None":
+    """Parse one `APT::Status-Fd` line, or None for anything unrecognised.
+
+    This never raises. It is fed a pipe that a subprocess writes and that
+    dies mid-line when that subprocess is killed, so a truncated, empty or
+    entirely foreign line has to read as "nothing to say" rather than as an
+    exception surfacing from inside a phase.
+
+    The split is bounded from both ends rather than greedy. A description
+    contains colons of its own (`Setting up libnvinfer10:amd64`), so the
+    tail is never split; and the item is not reliably one field either,
+    because apt qualifies package names with an architecture. What is
+    unambiguous is the percentage, so the item ends at the first field
+    after it that parses as a number -- and the scan starts at field 2, not
+    field 1, because `dlstatus` numbers its items and item "1" would
+    otherwise read as "1 percent".
+    """
+    try:
+        # The line terminator comes off first: `sanitise` keeps only what
+        # follows the last carriage return, so a CRLF-terminated record
+        # would otherwise sanitise away to nothing.
+        text = sanitise(str(line).rstrip("\r\n")).strip()
+    except Exception:  # pragma: no cover -- an object whose str() raises
+        return None
+    if not text:
+        return None
+
+    fields = text.split(":")
+    if len(fields) < 3:
+        return None
+
+    kind = fields[0].strip().lower()
+    if kind not in _APT_KINDS:
+        return None
+
+    limit = min(len(fields), 2 + _APT_MAX_ITEM_FIELDS)
+    for index in range(2, limit):
+        percent = _apt_percent(fields[index])
+        if percent is None:
+            continue
+        return AptStatus(
+            kind=kind,
+            item=":".join(fields[1:index]).strip(),
+            percent=percent,
+            description=":".join(fields[index + 1 :]).strip(),
+        )
+
+    # No number anywhere it could be: the record still names something, and
+    # the description is the half an operator can use.
+    return AptStatus(
+        kind=kind,
+        item=fields[1].strip(),
+        percent=None,
+        description=":".join(fields[2:]).strip(),
+    )
+
+
+def apt_fraction(
+    kind: str, percent: float | None, *, has_download_phase: bool
+) -> float | None:
+    """Map one sweep onto the single 0.0-1.0 range the bar renders.
+
+    The mapping, explicitly:
+
+    | transaction | `dlstatus` p | `pmstatus` p |
+    |-------------|--------------|--------------|
+    | with a download phase | `p * SHARE` | `SHARE + p * (1 - SHARE)` |
+    | without one | (not reached) | `p` |
+
+    A transaction whose archives are all cached emits no `dlstatus` at all,
+    so committing to the two-segment split unconditionally would start its
+    bar at 50 percent. `has_download_phase` is therefore learned from the
+    stream -- it is the kind of the *first* record that carried a
+    percentage -- and the install sweep owns the whole range when no
+    download was ever reported.
+
+    This is monotonic within each segment and across the transition, but
+    not across a stream that interleaves the two kinds; `follow_apt` holds
+    the high-water mark that makes the rendered value monotonic outright.
+    """
+    if kind not in _APT_BAR_KINDS or percent is None:
+        return None
+    fraction = min(max(float(percent), 0.0), 100.0) / 100.0
+    if not has_download_phase:
+        return fraction
+    if kind == "dlstatus":
+        return fraction * APT_DOWNLOAD_SHARE
+    return APT_DOWNLOAD_SHARE + fraction * (1.0 - APT_DOWNLOAD_SHARE)
+
+
+def _apt_note(status: AptStatus) -> str | None:
+    """What to render beside the bar: the package, when there is one.
+
+    `dlstatus` numbers its items, and "1" on the bar row says nothing the
+    description does not already say better.
+    """
+    item = status.item.strip()
+    if not item or item.isdigit():
+        return None
+    return item
+
+
+def render_apt_log_line(
+    name: str, percent: int | None, description: str | None, elapsed: float
+) -> str:
+    """The off-tty line for a transaction in flight (section 7).
+
+    Same honesty rule as the drawn row: a percentage appears only when apt
+    reported one. Without it the line still says how long this has been
+    running and what apt last said it was doing, which is the whole
+    difference between a long transaction and a hung one.
+    """
+    if percent is None:
+        line = f"{name}: running for {format_duration(elapsed)}"
+    else:
+        line = f"{name}: {int(percent)}% after {format_duration(elapsed)}"
+    if description:
+        line += f" - {description}"
+    return line
+
+
+def render_apt_done_line(name: str, percent: int | None, elapsed: float) -> str:
+    """The closing line for a finished status stream (section 7.1).
+
+    "Finished" here means apt closed the descriptor, which is all this
+    adapter observed. It never rounds the last percentage up to 100 to make
+    the record look tidy: a stream that stopped at 62 percent is a
+    transaction that was killed, and the transcript of a failed install is
+    the one place that has to say so.
+    """
+    line = f"{name}: finished in {format_duration(elapsed)}"
+    if percent is None:
+        line += " (apt reported no percentage)"
+    elif percent < 100:
+        line += f" (apt last reported {percent}%)"
+    return line
+
+
+def follow_apt(
+    lines: Iterable[str],
+    *,
+    renderer: "Progress | None" = None,
+    task: str | None = None,
+    log_interval_s: float = APT_LOG_INTERVAL_S,
+    clock: Callable[[], float] = time.monotonic,
+) -> AptOutcome:
+    """Consume apt's status stream and drive the bar from it (section 5.2).
+
+    This owns no transaction. The caller runs `apt-get` with
+    `apt_status_fd_args(fd)`, keeps the write end of a pipe open for it,
+    and hands the read end here as any iterable of lines; the loop returns
+    when the stream ends. `clock` is injected on the `waitui.py` pattern so
+    tests drive a whole transaction without a clock or an apt.
+
+    Two properties it guarantees, and a third it inherits:
+
+    1. **The bar never goes backwards.** apt's download and install sweeps
+       each run 0 to 100 independently (`apt_fraction`), and on top of that
+       mapping a high-water mark clamps the rendered value, so no ordering
+       of records -- including a `dlstatus` arriving after the install
+       phase began -- can make it drop.
+    2. **No fabricated progress (section 5.3, REQUIRED).** A stream that
+       yields no parseable percentage at all drives no bar. It falls back
+       to the spinner, which reports honest elapsed time and apt's most
+       recent description, and `AptOutcome.had_denominator` says so
+       afterwards.
+    3. Each new description goes to the rolling window (section 3.2's
+       `Setting up libnvinfer10 (10.16.0.72-1+cuda13.2)` rows) via
+       `Progress.line`, so it is sanitised, truncated and recorded exactly
+       like streamed command output. Consecutive repeats are dropped: apt
+       restates the same description across dozens of percentage updates,
+       and eight identical window rows show less than one does.
+    """
+    name = sanitise(task or "apt")
+    log_every = max(float(log_interval_s), 0.0)
+
+    if renderer is not None:
+        if task is not None:
+            renderer.task(task)
+        # Clear any denominator the previous task left behind -- a byte
+        # bar included -- so the spinner path is selected from the first
+        # frame rather than after one stale bar.
+        renderer.percent(None)
+
+    started = clock()
+    next_log_at = 0.0
+    seen = 0
+    parsed = 0
+    percent: int | None = None
+    description: str | None = None
+    has_download_phase = False
+    committed = False
+    high_water: float | None = None
+
+    iterator = iter(lines)
+    while True:
+        try:
+            raw = next(iterator)
+        except StopIteration:
+            break
+        except (OSError, ValueError):
+            # The descriptor went away underneath us: apt exited, or the
+            # pipe was closed. Whatever was rendered stands, and the
+            # caller owns the transaction's exit status.
+            break
+
+        seen += 1
+        fraction = None
+        status = parse_apt_status(raw)
+        if status is not None:
+            parsed += 1
+
+            if status.description and status.description != description:
+                description = status.description
+                if renderer is not None:
+                    renderer.line(status.description)
+
+            if status.drives_bar:
+                if not committed:
+                    # The first record carrying a percentage decides
+                    # whether this transaction has a download segment at
+                    # all -- see `apt_fraction`.
+                    committed = True
+                    has_download_phase = status.kind == "dlstatus"
+                fraction = apt_fraction(
+                    status.kind,
+                    status.percent,
+                    has_download_phase=has_download_phase,
+                )
+
+        if fraction is not None:
+            high_water = (
+                fraction if high_water is None else max(high_water, fraction)
+            )
+            percent = int(round(high_water * 100))
+            if renderer is not None:
+                renderer.percent(percent, _apt_note(status))
+        elif renderer is not None and high_water is None:
+            # No denominator yet, so the spinner is the whole rendering
+            # and needs a frame advance to look alive -- including while
+            # every line so far has been one this module does not read.
+            renderer.tick()
+
+        elapsed = clock() - started
+        if elapsed >= next_log_at:
+            _say(renderer, render_apt_log_line(name, percent, description, elapsed))
+            next_log_at = elapsed + log_every
+
+    elapsed = clock() - started
+    _say(renderer, render_apt_done_line(name, percent, elapsed))
+
+    return AptOutcome(
+        lines=seen,
+        parsed=parsed,
+        percent=percent,
+        description=description,
+        had_download_phase=has_download_phase,
+        elapsed_s=elapsed,
     )

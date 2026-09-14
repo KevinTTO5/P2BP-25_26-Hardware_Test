@@ -1502,3 +1502,585 @@ def test_render_download_done_line_names_a_total_it_disagrees_with():
     assert progress.render_download_done_line("d.part", 12_000_000, None, 80) == (
         "d.part: received 12.0 MB in 1m20s"
     )
+
+
+# ---------------------------------------------------------------------------
+# apt Status-Fd percentage adapter (section 5.2)
+# ---------------------------------------------------------------------------
+
+
+# Real shapes off `apt-get install -o APT::Status-Fd=<fd>`: the item is a
+# plain number while apt fetches archives, and an architecture-qualified
+# package name while dpkg unpacks and configures them.
+_APT_DOWNLOAD = "dlstatus:1:50.0000:Retrieving file 12 of 24"
+_APT_INSTALL = (
+    "pmstatus:libnvinfer10:68.0000:"
+    "Setting up libnvinfer10 (10.16.0.72-1+cuda13.2)"
+)
+
+
+def _apt_stream(lines, clock: FakeClock, seconds_per_line: float = 0.0):
+    """The status pipe as an iterable, with the clock moving as it is read."""
+
+    def generate():
+        for line in lines:
+            clock.advance(seconds_per_line)
+            yield line
+
+    return generate()
+
+
+def _window_rows(out: FakeTty) -> list[str]:
+    return [row.strip() for row in _last_frame(out)[2:] if row.strip()]
+
+
+# -- the option the caller passes apt ---------------------------------------
+
+
+def test_apt_status_fd_args_names_the_descriptor():
+    assert progress.apt_status_fd_args(9) == ("-o", "APT::Status-Fd=9")
+
+
+# -- parse_apt_status -------------------------------------------------------
+
+
+def test_parse_apt_status_reads_the_two_documented_shapes():
+    download = progress.parse_apt_status(_APT_DOWNLOAD)
+    assert (download.kind, download.item, download.percent) == (
+        "dlstatus",
+        "1",
+        50.0,
+    )
+    assert download.description == "Retrieving file 12 of 24"
+
+    install = progress.parse_apt_status(_APT_INSTALL)
+    assert (install.kind, install.item, install.percent) == (
+        "pmstatus",
+        "libnvinfer10",
+        68.0,
+    )
+    assert install.description == "Setting up libnvinfer10 (10.16.0.72-1+cuda13.2)"
+    assert install.drives_bar is True
+
+
+def test_parse_apt_status_keeps_the_colons_inside_a_description():
+    """The split is bounded, not greedy: apt's own descriptions carry
+    colons, and a description truncated at the first one loses the package
+    the operator is being told about."""
+    status = progress.parse_apt_status(
+        "pmstatus:libc6:12.0:Unpacking libc6:amd64 over 2.39-0ubuntu8.3"
+    )
+    assert status.description == "Unpacking libc6:amd64 over 2.39-0ubuntu8.3"
+    assert status.percent == 12.0
+
+
+def test_parse_apt_status_finds_the_percent_past_an_arch_qualified_name():
+    """apt qualifies a multi-arch package name, so the percentage is not
+    reliably the third field."""
+    status = progress.parse_apt_status(
+        "pmstatus:libnvinfer10:amd64:68.0000:Setting up libnvinfer10:amd64"
+    )
+    assert status.item == "libnvinfer10:amd64"
+    assert status.percent == 68.0
+    assert status.description == "Setting up libnvinfer10:amd64"
+
+
+def test_parse_apt_status_does_not_mistake_a_numbered_item_for_a_percent():
+    """`dlstatus` numbers its items, so a scan that started at field 1
+    would read item "1" as one percent and then never move."""
+    status = progress.parse_apt_status("dlstatus:1:0.0000:Retrieving file 1 of 24")
+    assert (status.item, status.percent) == ("1", 0.0)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "",
+        "   ",
+        "junk without any colon at all",
+        "media-change:/cdrom:/dev/sr0",
+        "status: libc6: installed",
+        "pmconffile:/etc/nginx/nginx.conf:'a' 'b'",
+        "pmstatus",
+        "pmstatus:libc6",
+        "dlstatus:1",
+        ":::",
+        "PMSTATUS_BUT_NOT_REALLY:libc6:5:x",
+    ],
+)
+def test_parse_apt_status_ignores_what_it_does_not_understand(line):
+    """Other record kinds exist and more will be added. Ignoring one is
+    always correct; guessing at it is how a bar starts lying."""
+    assert progress.parse_apt_status(line) is None
+
+
+def test_parse_apt_status_never_raises_on_a_truncated_line():
+    """The stream is a pipe a subprocess writes, and it dies mid-line when
+    that subprocess is killed."""
+    for cut in range(len(_APT_INSTALL) + 1):
+        progress.parse_apt_status(_APT_INSTALL[:cut])
+    for cut in range(len(_APT_DOWNLOAD) + 1):
+        progress.parse_apt_status(_APT_DOWNLOAD[:cut])
+
+
+@pytest.mark.parametrize("value", ["nan", "-nan", "inf", "-inf", "1e400"])
+def test_parse_apt_status_rejects_a_percent_that_is_not_finite(value):
+    """`float()` accepts these happily and `round()` then raises, from a
+    line that came off a pipe."""
+    status = progress.parse_apt_status(f"pmstatus:libc6:{value}:Setting up libc6")
+    assert status is not None
+    assert status.percent is None
+    assert status.drives_bar is False
+    assert "Setting up libc6" in status.description
+
+
+def test_parse_apt_status_keeps_a_description_that_carries_no_percent():
+    status = progress.parse_apt_status("pmerror:libc6:Sub-process returned an error")
+    assert status.kind == "pmerror"
+    assert status.percent is None
+    assert status.description == "Sub-process returned an error"
+    assert status.drives_bar is False
+
+
+def test_parse_apt_status_clamps_a_percent_outside_the_range():
+    assert progress.parse_apt_status("pmstatus:libc6:140:x").percent == 100.0
+    assert progress.parse_apt_status("pmstatus:libc6:-5:x").percent == 0.0
+
+
+def test_parse_apt_status_cleans_control_characters_out_of_a_record():
+    status = progress.parse_apt_status(
+        "pmstatus:libc6:12.0:\033[1;32mSetting up\033[0m libc6\r\n"
+    )
+    assert status.description == "Setting up libc6"
+
+
+def test_parse_apt_status_survives_an_object_that_is_not_a_string():
+    assert progress.parse_apt_status(None) is None
+    assert progress.parse_apt_status(17) is None
+
+
+# -- apt_fraction: the monotonic mapping ------------------------------------
+
+
+def test_apt_fraction_maps_the_two_sweeps_onto_one_rising_range():
+    """apt's download and install percentages each run 0 to 100
+    independently, so they are two segments of a single range rather than
+    two goes at the same bar."""
+    share = progress.APT_DOWNLOAD_SHARE
+    assert progress.apt_fraction("dlstatus", 0, has_download_phase=True) == 0.0
+    assert progress.apt_fraction("dlstatus", 100, has_download_phase=True) == share
+    # The install sweep picks up exactly where the download sweep stopped.
+    assert progress.apt_fraction("pmstatus", 0, has_download_phase=True) == share
+    assert progress.apt_fraction("pmstatus", 100, has_download_phase=True) == 1.0
+
+    sweep = [
+        progress.apt_fraction("dlstatus", p, has_download_phase=True)
+        for p in range(0, 101, 10)
+    ] + [
+        progress.apt_fraction("pmstatus", p, has_download_phase=True)
+        for p in range(0, 101, 10)
+    ]
+    assert sweep == sorted(sweep)
+
+
+def test_apt_fraction_gives_a_cached_transaction_the_whole_range():
+    """No archive to fetch means no `dlstatus` at all, and committing to
+    the split anyway would open the bar at 50 percent."""
+    assert progress.apt_fraction("pmstatus", 0, has_download_phase=False) == 0.0
+    assert progress.apt_fraction("pmstatus", 50, has_download_phase=False) == 0.5
+    assert progress.apt_fraction("pmstatus", 100, has_download_phase=False) == 1.0
+
+
+def test_apt_fraction_has_nothing_to_say_about_a_record_with_no_percent():
+    assert progress.apt_fraction("pmstatus", None, has_download_phase=True) is None
+    assert progress.apt_fraction("pmerror", 50, has_download_phase=True) is None
+    assert progress.apt_fraction("media-change", 50, has_download_phase=True) is None
+
+
+# -- render_percent_line ----------------------------------------------------
+
+
+def test_render_percent_line_draws_the_bar_and_what_it_is_working_on():
+    line = progress.render_percent_line(68, "libnvinfer10")
+    assert line == "████████████░░░░░  68%   libnvinfer10"
+
+
+def test_render_percent_line_omits_the_note_when_there_is_none():
+    assert progress.render_percent_line(0) == "░" * progress.BAR_WIDTH + "   0%"
+
+
+def test_render_percent_line_clamps_rather_than_overflowing_the_bar():
+    assert _percents(progress.render_percent_line(140)) == [100]
+    assert _percents(progress.render_percent_line(-5)) == [0]
+
+
+@pytest.mark.parametrize("value", [None, float("nan"), float("inf"), "x", []])
+def test_render_percent_line_refuses_to_draw_without_a_percentage(value):
+    with pytest.raises(ValueError):
+        progress.render_percent_line(value)
+
+
+# -- Progress.percent -------------------------------------------------------
+
+
+def _apt_progress(clock: FakeClock, out: FakeTty) -> progress.Progress:
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+    return bar
+
+
+def test_percent_drives_the_bar_from_a_percentage():
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+    bar.percent(68, "libnvinfer10")
+    row = _activity_row(out)
+    assert " 68%" in row
+    assert row.endswith("libnvinfer10")
+
+
+def test_percent_without_a_usable_value_falls_back_to_the_spinner():
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+    bar.percent(40)
+    for absent in (None, float("nan"), "not a number"):
+        bar.percent(absent)
+        row = _activity_row(out)
+        assert "%" not in row
+        assert "TensorRT and cuDNN" in row
+
+
+def test_percent_and_bytes_never_render_two_bars_at_once():
+    """One task is a byte transfer or a percentage-reporting transaction,
+    never both."""
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+
+    bar.bytes(412_000_000, 606_000_000)
+    bar.percent(68, "libnvinfer10")
+    row = _activity_row(out)
+    assert "MB" not in row
+    assert " 68%" in row
+
+    bar.bytes(412_000_000, 606_000_000)
+    row = _activity_row(out)
+    assert "412 MB / 606 MB" in row
+    assert "libnvinfer10" not in row
+
+
+def test_a_dirty_note_on_the_bar_row_is_cleaned_too():
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+    bar.percent(68, "\033[1;32mlibnvinfer10\033[0m")
+    assert "\033" not in _activity_row(out)
+    assert _activity_row(out).endswith("libnvinfer10")
+
+
+# -- follow_apt -------------------------------------------------------------
+
+
+# One transaction, as apt reports it: fetch every archive, then unpack and
+# configure them, with a record kind this module does not read in between.
+_APT_TRANSACTION = [
+    "dlstatus:1:0.0000:Retrieving file 1 of 24",
+    "dlstatus:1:50.0000:Retrieving file 12 of 24",
+    "dlstatus:1:100.0000:Retrieving file 24 of 24",
+    "media-change:/cdrom:/dev/sr0",
+    "pmstatus:libnvinfer10:amd64:0.0000:Preparing libnvinfer10:amd64",
+    "pmstatus:libnvinfer10:amd64:36.0000:"
+    "Setting up libnvinfer10 (10.16.0.72-1+cuda13.2)",
+    "pmstatus:tensorrt-dev:100.0000:"
+    "Setting up tensorrt-dev (10.16.0.72-1+cuda13.2)",
+]
+
+
+def test_follow_apt_never_lets_the_bar_go_backwards():
+    """The defect this mapping exists to prevent: both sweeps run 0 to 100,
+    so feeding them to one bar naively resets it halfway through the
+    transaction, which is worse than showing no bar at all."""
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+
+    outcome = progress.follow_apt(
+        _apt_stream(_APT_TRANSACTION, clock), renderer=bar, clock=clock
+    )
+
+    drawn = _percents(_ANSI.sub("", out.getvalue()))
+    assert drawn == sorted(drawn)
+    # The download sweep occupies the first segment and stops there; the
+    # install sweep carries the bar the rest of the way.
+    assert 50 in drawn and 100 in drawn
+    assert max(drawn[: drawn.index(50) + 1]) == 50
+    assert outcome.had_download_phase is True
+    assert outcome.had_denominator is True
+    assert outcome.percent == 100
+    assert (outcome.lines, outcome.parsed) == (7, 6)
+
+
+def test_follow_apt_holds_the_bar_when_a_record_arrives_out_of_order():
+    """The mapping is monotonic in order; the high-water mark is what makes
+    the rendered value monotonic outright."""
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+
+    progress.follow_apt(
+        _apt_stream(
+            [
+                "dlstatus:1:100.0000:Retrieving file 24 of 24",
+                "pmstatus:libc6:60.0000:Setting up libc6",
+                "dlstatus:2:10.0000:Retrieving a straggler",
+                "pmstatus:libc6:62.0000:Configuring libc6",
+            ],
+            clock,
+        ),
+        renderer=bar,
+        clock=clock,
+    )
+
+    drawn = _percents(_ANSI.sub("", out.getvalue()))
+    assert drawn == sorted(drawn)
+    assert drawn[-1] == 81
+
+
+def test_follow_apt_gives_a_fully_cached_transaction_the_whole_range():
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+
+    outcome = progress.follow_apt(
+        _apt_stream(
+            [
+                "pmstatus:libc6:0.0000:Preparing libc6",
+                "pmstatus:libc6:50.0000:Unpacking libc6",
+                "pmstatus:libc6:100.0000:Setting up libc6",
+            ],
+            clock,
+        ),
+        renderer=bar,
+        clock=clock,
+    )
+
+    assert outcome.had_download_phase is False
+    # 50 percent of the install sweep is 50 percent of the bar, not 75.
+    assert _percents(_ANSI.sub("", out.getvalue())) == [0, 0, 50, 50, 100]
+
+
+def test_follow_apt_surfaces_each_description_once():
+    """Section 3.2's `Setting up ...` rows. apt restates one description
+    across dozens of percentage updates, and eight identical window rows
+    show less than one does."""
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+
+    first = "Setting up libnvinfer10 (10.16.0.72-1+cuda13.2)"
+    second = "Setting up tensorrt-dev (10.16.0.72-1+cuda13.2)"
+    restated = [f"pmstatus:libnvinfer10:{p}.0:{first}" for p in (10, 20, 30)]
+
+    progress.follow_apt(
+        _apt_stream(restated + [f"pmstatus:tensorrt-dev:40.0:{second}"], clock),
+        renderer=bar,
+        clock=clock,
+    )
+
+    assert _window_rows(out) == [first, second]
+
+
+def test_follow_apt_names_the_task_on_the_renderer():
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+    progress.follow_apt(
+        _apt_stream(["pmstatus:libc6:10.0:Setting up libc6"], clock),
+        renderer=bar,
+        task="installing TensorRT and cuDNN",
+        clock=clock,
+    )
+    assert "installing TensorRT and cuDNN" in _ANSI.sub("", out.getvalue())
+
+
+def test_follow_apt_clears_a_denominator_the_previous_task_left_behind():
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+    bar.bytes(412_000_000, 606_000_000)
+
+    progress.follow_apt(
+        _apt_stream(["status: libc6: half-installed"], clock),
+        renderer=bar,
+        clock=clock,
+    )
+    assert "%" not in _activity_row(out)
+
+
+# -- follow_apt with nothing to count (section 5.3, REQUIRED) ---------------
+
+
+def test_follow_apt_without_a_percentage_shows_a_spinner_and_never_a_bar():
+    """A transaction whose stream says nothing this module can count is
+    reported as elapsed time and apt's last description, not as a
+    fabricated fraction."""
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+
+    outcome = progress.follow_apt(
+        _apt_stream(
+            [
+                "pmerror:libc6:Sub-process returned an error",
+                "media-change:/cdrom:/dev/sr0",
+                "not a status record at all",
+                "pmerror:libc6:dpkg was interrupted",
+            ],
+            clock,
+            seconds_per_line=9.0,
+        ),
+        renderer=bar,
+        task="installing TensorRT",
+        clock=clock,
+    )
+
+    rendered = _ANSI.sub("", out.getvalue())
+    assert "%" not in rendered
+    assert progress.BAR_FILLED not in rendered
+    assert progress.BAR_EMPTY not in rendered
+
+    row = _activity_row(out)
+    assert "installing TensorRT" in row
+    assert "36s" in row
+    assert row.endswith("[ dpkg was interrupted ]")
+
+    assert outcome.had_denominator is False
+    assert outcome.percent is None
+    assert outcome.description == "dpkg was interrupted"
+
+
+def test_follow_apt_animates_the_spinner_while_it_has_no_denominator():
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+
+    progress.follow_apt(
+        _apt_stream(["media-change:/cdrom:/dev/sr0"] * 4, clock),
+        renderer=bar,
+        clock=clock,
+    )
+
+    frames = {
+        row[0]
+        for row in (
+            line.strip() for line in _ANSI.sub("", out.getvalue()).split("\n")
+        )
+        if row and row[0] in progress.SPINNER_FRAMES
+    }
+    assert len(frames) > 1
+
+
+def test_follow_apt_survives_a_stream_that_dies_mid_transaction():
+    """apt was killed, so the read end of the pipe raises rather than
+    ending. Whatever was drawn stands, and the caller owns the exit
+    status."""
+    clock = FakeClock()
+
+    def dying():
+        yield "pmstatus:libc6:40.0:Setting up libc6"
+        raise OSError("Input/output error")
+
+    outcome = progress.follow_apt(dying(), clock=clock)
+    assert outcome.percent == 40
+    assert outcome.lines == 1
+
+
+def test_follow_apt_with_no_lines_at_all_reports_nothing_rather_than_zero():
+    clock = FakeClock()
+    outcome = progress.follow_apt([], clock=clock)
+    assert outcome == progress.AptOutcome(
+        lines=0,
+        parsed=0,
+        percent=None,
+        description=None,
+        had_download_phase=False,
+        elapsed_s=0.0,
+    )
+    assert outcome.had_denominator is False
+
+
+# -- follow_apt, the recorded line (sections 7 and 7.1) ---------------------
+
+
+def test_render_apt_log_line_states_a_percentage_only_when_it_has_one():
+    assert progress.render_apt_log_line("apt", 68, "Setting up libnvinfer10", 252) == (
+        "apt: 68% after 4m12s - Setting up libnvinfer10"
+    )
+    assert progress.render_apt_log_line("apt", None, "Preparing libc6", 252) == (
+        "apt: running for 4m12s - Preparing libc6"
+    )
+    assert progress.render_apt_log_line("apt", None, None, 252) == (
+        "apt: running for 4m12s"
+    )
+
+
+def test_render_apt_done_line_does_not_round_an_interrupted_run_up():
+    assert progress.render_apt_done_line("apt", 100, 362) == "apt: finished in 6m02s"
+    assert progress.render_apt_done_line("apt", 62, 362) == (
+        "apt: finished in 6m02s (apt last reported 62%)"
+    )
+    assert progress.render_apt_done_line("apt", None, 362) == (
+        "apt: finished in 6m02s (apt reported no percentage)"
+    )
+
+
+def test_follow_apt_off_a_tty_logs_a_plain_line_on_an_interval(capsys):
+    clock = FakeClock()
+    bar = _plain_progress(clock)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+    capsys.readouterr()
+
+    progress.follow_apt(
+        _apt_stream(_APT_TRANSACTION, clock, seconds_per_line=20.0),
+        renderer=bar,
+        task="installing TensorRT",
+        log_interval_s=30.0,
+        clock=clock,
+    )
+
+    err = capsys.readouterr().err
+    # Nothing is drawn off a tty, so these lines are the only thing that
+    # keeps a multi-gigabyte transaction distinguishable from a hang --
+    # event 3 in section 2, which an operator interrupted.
+    assert "installing TensorRT: 0% after 20s - Retrieving file 1 of 24" in err
+    assert "installing TensorRT: 50% after 1m00s - Retrieving file 24 of 24" in err
+    assert "installing TensorRT: finished in 2m20s" in err
+    assert "\033" not in err
+    # Throttled to the interval, not one line per record.
+    assert err.count("after") == 4
+
+
+def test_follow_apt_on_a_tty_records_the_line_instead_of_printing_it(
+    tmp_path, capsys
+):
+    """Section 7.1: the periodic line stays off the screen so it cannot
+    fight the live region, and lands in the transcript anyway."""
+    run_file = logs.open_transcript(log_dir=tmp_path / "logs")
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+
+    progress.follow_apt(
+        _apt_stream(_APT_TRANSACTION, clock, seconds_per_line=20.0),
+        renderer=bar,
+        task="installing TensorRT",
+        log_interval_s=30.0,
+        clock=clock,
+    )
+
+    transcript = run_file.read_text(encoding="utf-8")
+    assert "[info ] installing TensorRT: 0% after 20s" in transcript
+    assert "[info ] installing TensorRT: finished in 2m20s" in transcript
+    assert "\033" not in transcript
+    assert "after" not in capsys.readouterr().err
+
+
+def test_follow_apt_with_no_renderer_still_reaches_the_transcript(capsys):
+    clock = FakeClock()
+    progress.follow_apt(
+        _apt_stream(["pmstatus:libc6:40.0:Setting up libc6"], clock),
+        clock=clock,
+    )
+    err = capsys.readouterr().err
+    assert "apt: 40% after 0s - Setting up libc6" in err
+    assert "apt: finished in 0s (apt last reported 40%)" in err
