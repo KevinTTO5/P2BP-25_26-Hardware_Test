@@ -52,7 +52,6 @@ from __future__ import annotations
 
 import os
 import pathlib
-import shlex
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -98,6 +97,53 @@ def verify_pinned(label: str, actual: str, expected: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Shared cleaning helpers -- one definition of "clean" and one of "scrubbed"
+# ---------------------------------------------------------------------------
+
+
+def _secrets() -> tuple[str, ...]:
+    """Plaintext this process is holding under a redacted key.
+
+    Deliberately `shellout`'s collector and `shellout`'s scrubber rather
+    than a second pair here: doc 08 §4.2 says redaction is not
+    re-implemented, and a private-but-shared definition is the lesser evil
+    against two key lists that drift. Everything this module builds prints
+    to the terminal and the transcript, which are exactly the two
+    destinations §4.2 requires to be scrubbed -- a `CompletedProcess`
+    buffer reaches them for the first time here, and it has never been
+    scrubbed on its way in.
+
+    Known narrowness: this reads `os.environ`, whereas `shellout` derives
+    its secrets from the child environment it actually handed the command
+    (`run_streamed` and `run_fragment` both pass `child_env`). A command
+    run under an env overlay that carries a redacted key is therefore
+    value-scrubbed on shellout's streaming path but only key-scrubbed here,
+    because `FailureContext` has no field to carry the environment the run
+    used. Adding one is the fix, and it belongs with whichever unit teaches
+    the steps to build a context from `ctx.run_root`.
+    """
+    return shellout._secret_values(os.environ)
+
+
+def _clean(text: str, secrets: Sequence[str]) -> str:
+    """One line of text, made fit for a stream and for the transcript.
+
+    Sanitise first, then scrub: `progress.sanitise` is what drops the
+    carriage returns and escapes, and scrubbing before that would let an
+    escape sequence sit between a secret's characters. `secrets` is passed
+    in rather than collected here so a long buffer scans the environment
+    once, not once per line.
+    """
+    return shellout._scrub(progress.sanitise(text), secrets)
+
+
+def _decode(value: Any) -> str:
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace")
+    return str(value)
+
+
+# ---------------------------------------------------------------------------
 # doc 08 §6 -- inferred refusals name their inputs
 # ---------------------------------------------------------------------------
 
@@ -136,7 +182,7 @@ class Evidence:
 
     Keyword labels have their underscores turned into spaces, so the common
     case is one expression with no punctuation to get wrong. `add()` takes
-    the label verbatim and returns `self`, for a guard that collects its
+    the label as given and returns `self`, for a guard that collects its
     inputs as it probes them:
 
         evidence = Evidence()
@@ -161,8 +207,25 @@ class Evidence:
             self.add(label.replace("_", " "), value)
 
     def add(self, label: str, value: Any) -> "Evidence":
-        """Append one `label: value` pair. Returns self, so calls chain."""
-        self._items.append((str(label).strip(), _format_value(value)))
+        """Append one `label: value` pair. Returns self, so calls chain.
+
+        The value is cleaned and scrubbed on the way in, the same way a
+        captured output line is (doc 08 §4.2). An evidence value is as
+        likely to come from `installer.conf` or the environment as from a
+        literal, and it lands in a message `app.py` prints to stderr and
+        writes to the transcript -- §6 exists to make naming the inputs the
+        cheap thing to do across all seven steps, so the cheap path has to
+        be the safe one. A value that cleans away to nothing degrades to
+        `unknown` for the same reason a blank one does.
+
+        A blank label is dropped rather than stored, so `len()` and
+        `render()` never disagree about how many inputs there are.
+        """
+        label = str(label).strip()
+        if not label:
+            return self
+        value_text = _clean(_format_value(value), _secrets()) or "unknown"
+        self._items.append((label, value_text))
         return self
 
     def extend(
@@ -176,7 +239,7 @@ class Evidence:
 
     def render(self) -> str:
         """The `label: value; ...` string, or `""` when there is nothing."""
-        return "; ".join(f"{label}: {value}" for label, value in self._items if label)
+        return "; ".join(f"{label}: {value}" for label, value in self._items)
 
     def __iter__(self):
         return iter(self._items)
@@ -216,7 +279,10 @@ def render_evidence(evidence: EvidenceLike) -> str:
     if isinstance(evidence, Evidence):
         return evidence.render()
     if isinstance(evidence, str):
-        return evidence.strip()
+        # Cleaned and scrubbed like every other evidence value: a
+        # pre-rendered string is the one shape that does not pass through
+        # `Evidence.add`, and it is the shape a guard builds by hand.
+        return _clean(evidence, _secrets()).strip()
     return Evidence(evidence).render()
 
 
@@ -235,8 +301,9 @@ def with_evidence(message: str, evidence: EvidenceLike = None) -> str:
 # doc 08 §6.1 -- the failure context block
 # ---------------------------------------------------------------------------
 
-# "the last 20 lines of its output" (§6.1), named so a caller that wants a
-# shorter tail asks for one rather than re-deriving the default.
+# "the last 20 lines of its output" (§6.1). Named rather than inlined so
+# the number is greppable against the doc; it is deliberately not a
+# parameter, because §6.1 fixes it and no caller has a reason to differ.
 FAILURE_TAIL_LINES = 20
 
 # Frame width matches doc 00 §9.3's ACTION REQUIRED block (privilege.py's
@@ -256,35 +323,6 @@ def _header_line() -> str:
     return "|" + f"  {_HEADER_TEXT}".ljust(_BOX_WIDTH - 2) + "|"
 
 
-def _secrets() -> tuple[str, ...]:
-    """Plaintext this process is holding under a redacted key.
-
-    Deliberately `shellout`'s collector and `shellout`'s scrubber rather
-    than a second pair here: doc 08 §4.2 says redaction is not
-    re-implemented, and a private-but-shared definition is the lesser evil
-    against two key lists that drift. The block prints to the terminal and
-    the transcript, which are exactly the two destinations §4.2 requires to
-    be scrubbed -- a `CompletedProcess` buffer reaches them for the first
-    time here, and it has never been scrubbed on its way in.
-    """
-    return shellout._secret_values(os.environ)
-
-
-def _clean(text: str, secrets: Sequence[str]) -> str:
-    """One captured line, made fit for a stream and for the transcript.
-
-    `secrets` is passed in rather than collected here so a long buffer
-    scans the environment once, not once per line.
-    """
-    return shellout._scrub(progress.sanitise(text), secrets)
-
-
-def _decode(value: Any) -> str:
-    if isinstance(value, (bytes, bytearray)):
-        return bytes(value).decode("utf-8", errors="replace")
-    return str(value)
-
-
 def _current_transcript() -> pathlib.Path | None:
     """The open transcript's path, or None when none is open.
 
@@ -295,7 +333,17 @@ def _current_transcript() -> pathlib.Path | None:
 
 
 def _output_lines(output: Any) -> list[str]:
-    """Split captured output into cleaned lines, trailing blanks dropped.
+    r"""Split captured output into cleaned lines, trailing blanks dropped.
+
+    Split on `"\n"` alone, never `str.splitlines()`: splitlines also breaks
+    on `\r` (and on `\v`, `\f`, `\x1c`-`\x1e`, `\x85`), which would hand
+    `progress.sanitise` lines that no longer contain the carriage returns
+    it exists to collapse. That is not cosmetic. curl, wget and dpkg redraw
+    one line hundreds of times (doc 08 §2 events 2 and 3), so a splitlines
+    split turns one progress bar into one "line" per redraw frame and
+    spends the whole 20-line tail on percentages, burying the error the
+    block was printed for. Splitting on newlines only leaves each frame
+    sequence intact inside its line, and sanitise keeps the last frame.
 
     A command's output almost always ends in a newline, which would
     otherwise spend one of the 20 tail lines on nothing.
@@ -303,7 +351,7 @@ def _output_lines(output: Any) -> list[str]:
     if output is None:
         return []
     if isinstance(output, (str, bytes, bytearray)):
-        raw = _decode(output).splitlines()
+        raw = _decode(output).split("\n")
     else:
         raw = [_decode(item) for item in output]
     secrets = _secrets()
@@ -324,25 +372,41 @@ def _indent_output(lines: Iterable[str]) -> list[str]:
 
 
 def _render_command(command: Any) -> str:
-    """The failed command, quoted so the operator can paste it back."""
+    """The failed command, cleaned and quoted so it can be pasted back.
+
+    Cleaned for the same reason a captured output line is: this line goes
+    to stderr raw and into the transcript, `logs`' ANSI strip does not
+    touch a carriage return (doc 08 §12.2 defect 2), and a CR here would
+    clobber the frame the block just drew. The argv branch is
+    `shellout._command_dump` rather than a copy of it -- per-argument
+    quoting and scrubbing is already defined there, and this module's whole
+    premise is not re-implementing it.
+    """
     if command is None:
         return _NOT_RECORDED
     secrets = _secrets()
     if isinstance(command, (str, bytes, bytearray)):
-        return shellout._scrub(_decode(command), secrets) or _NOT_RECORDED
-    parts = [_decode(part) for part in command]
+        return _clean(_decode(command), secrets) or _NOT_RECORDED
+    parts = [progress.sanitise(_decode(part)) for part in command]
     if not parts:
         return _NOT_RECORDED
-    return " ".join(shellout._scrub(shlex.quote(part), secrets) for part in parts)
+    return shellout._command_dump(parts, secrets) or _NOT_RECORDED
 
 
 @dataclass
 class FailureContext:
     """What the operator needs in order to act on a `FAILED` (doc 08 §6.1).
 
-    Every field is optional and every one degrades to an explicit
-    "(not recorded)" rather than a missing line: a block that silently
-    omits the exit code reads as though the command never ran.
+    Every field is optional, and every one but the phase degrades to an
+    explicit "(not recorded)" rather than a missing line: a block that
+    silently omits the exit code reads as though the command never ran.
+
+    The phase is the single exception -- its line is dropped entirely when
+    there is none. A step that declared no phases has no phase to report,
+    so "Phase: (not recorded)" would claim something was lost when nothing
+    was; a missing exit code, by contrast, really is something that was not
+    captured. §6.1 names step and phase together, which is why the
+    difference is spelled out here rather than left to be discovered.
 
     `output` is the failed command's own output -- stdout and stderr
     concatenated in that order by `from_completed`, so the tail favours
@@ -401,20 +465,19 @@ class FailureContext:
         )
 
 
-def render_failure_context(
-    context: FailureContext | None = None, *, tail: int = FAILURE_TAIL_LINES
-) -> str:
+def render_failure_context(context: FailureContext | None = None) -> str:
     """Render the §6.1 block as a string.
 
     Names the step and phase, the exact command, its exit code, the last
-    `tail` lines of that command's output, and the transcript path -- in
-    that order, which is also the order an operator reads them in: what
-    failed, what it ran, what it said, where the rest of it is.
+    `FAILURE_TAIL_LINES` lines of that command's output, and the transcript
+    path -- in that order, which is also the order an operator reads them
+    in: what failed, what it ran, what it said, where the rest of it is.
 
     `None`, and a `FailureContext` with nothing set, both render the full
-    frame with every field explicitly not recorded. A block that says "we
-    did not capture this" is still worth printing; it tells the operator to
-    go to the transcript rather than to guess.
+    frame, with every field except the phase explicitly not recorded (see
+    `FailureContext` for why the phase line is the one that is dropped). A
+    block that says "we did not capture this" is still worth printing; it
+    tells the operator to go to the transcript rather than to guess.
     """
     if context is None:
         context = FailureContext()
@@ -437,16 +500,12 @@ def render_failure_context(
     lines.append("")
     if not output_lines:
         lines.append(f"{_FIELD_INDENT}Output:     (none captured)")
-    elif tail < 1:
+    elif len(output_lines) > FAILURE_TAIL_LINES:
         lines.append(
-            f"{_FIELD_INDENT}Output:     {len(output_lines)} lines (not shown)"
-        )
-    elif len(output_lines) > tail:
-        lines.append(
-            f"{_FIELD_INDENT}Last {tail} lines of output "
+            f"{_FIELD_INDENT}Last {FAILURE_TAIL_LINES} lines of output "
             f"({len(output_lines)} total):"
         )
-        lines.extend(_indent_output(output_lines[-tail:]))
+        lines.extend(_indent_output(output_lines[-FAILURE_TAIL_LINES:]))
     else:
         plural = "" if len(output_lines) == 1 else "s"
         lines.append(f"{_FIELD_INDENT}Output ({len(output_lines)} line{plural}):")
@@ -464,16 +523,14 @@ def render_failure_context(
     return "\n".join(lines)
 
 
-def show_failure_context(
-    context: FailureContext | None = None, *, tail: int = FAILURE_TAIL_LINES
-) -> None:
+def show_failure_context(context: FailureContext | None = None) -> None:
     """Render the §6.1 block and emit it at error level.
 
     Routed through `logs.log.error` for the same reason
     `privilege.show_user_action_block` is: stderr and the transcript in one
     call, with no second writer to the terminal (doc 08 §4.2).
     """
-    log.error(render_failure_context(context, tail=tail))
+    log.error(render_failure_context(context))
 
 
 # ---------------------------------------------------------------------------
