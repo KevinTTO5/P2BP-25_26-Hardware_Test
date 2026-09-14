@@ -117,6 +117,7 @@ def _minimal_ctx(
     webapp_integration: str = "off",
     remote_supervision: str = "off",
     non_interactive: bool = False,
+    verbose: bool = False,
 ):
     """A `Context` + `Config` pair for direct `_dispatch()` unit tests,
     never touching a real install dir or a real invoking user."""
@@ -131,7 +132,7 @@ def _minimal_ctx(
     user = InvokingUser(
         name="tester", home=tmp_path, uid=os.getuid(), gid=os.getgid()
     )
-    ctx = app.build_context(cfg, user, non_interactive)
+    ctx = app.build_context(cfg, user, non_interactive, verbose)
     return ctx, cfg
 
 
@@ -149,6 +150,7 @@ def test_parse_args_defaults():
     assert args.reset_step is None
     assert args.non_interactive is False
     assert args.no_pause is False
+    assert args.verbose is False
     assert args.log_dir is None
     # Both gate flags default to None, not to "off": config.load() has to
     # tell "not passed" from "explicitly passed off" (doc 00 §3.4).
@@ -1922,20 +1924,24 @@ def _run_echo(ctx, **kwargs):
     )
 
 
-def test_should_stream_auto_needs_a_tty_and_captured_text(monkeypatch):
-    """Doc 08 §4.1's AUTO rule, stated as a table."""
+def test_should_stream_auto_needs_captured_text_and_nothing_else():
+    """Doc 00 §8.5's AUTO rule, stated as a table.
+
+    AUTO asks one question: can the tee serve this call? A terminal is not
+    part of the answer -- §7 requires per-line output off a tty too, and
+    which shape those lines take is the renderer's decision.
+    """
     captured_text = {"capture_output": True, "text": True}
 
-    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
     assert app._should_stream(None, captured_text) is True
     assert app._should_stream(None, {"capture_output": True}) is False
     assert app._should_stream(None, {"text": True}) is False
+    older_text_spelling = {"capture_output": True, "universal_newlines": True}
+    assert app._should_stream(None, older_text_spelling) is True
     assert app._should_stream(None, {}) is False
-    assert app._should_stream(False, captured_text) is False
 
-    monkeypatch.setattr(app, "_stderr_is_tty", lambda: False)
-    assert app._should_stream(None, captured_text) is False
-    # An explicit request still streams off a tty -- plain lines, per §7.
+    # The escape hatch is absolute, and an explicit request is honoured.
+    assert app._should_stream(False, captured_text) is False
     assert app._should_stream(True, captured_text) is True
 
 
@@ -1946,9 +1952,8 @@ def test_should_stream_rejects_forcing_a_shape_the_tee_cannot_return():
         app._should_stream(True, {})
 
 
-def test_run_root_streams_to_the_progress_renderer_on_a_tty(tmp_path, monkeypatch):
+def test_run_root_streams_to_the_progress_renderer(tmp_path):
     ctx, recorder = _recording_ctx(tmp_path)
-    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
 
     result = _run_echo(ctx)
 
@@ -1959,10 +1964,9 @@ def test_run_root_streams_to_the_progress_renderer_on_a_tty(tmp_path, monkeypatc
     assert "err-line" in recorder.lines
 
 
-def test_run_root_stream_false_suppresses_live_output(tmp_path, monkeypatch):
+def test_run_root_stream_false_suppresses_live_output(tmp_path):
     """The escape hatch in doc 08 §4.1: a probe whose output is noise."""
     ctx, recorder = _recording_ctx(tmp_path)
-    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
 
     result = _run_echo(ctx, stream=False)
 
@@ -1971,25 +1975,29 @@ def test_run_root_stream_false_suppresses_live_output(tmp_path, monkeypatch):
     assert recorder.lines == []
 
 
-def test_run_root_auto_does_not_stream_off_a_tty(tmp_path, monkeypatch):
+def test_run_root_auto_still_streams_off_a_tty(tmp_path):
+    """The resolution doc 08 §4.1 left open, now doc 00 §8.5.
+
+    Nothing under pytest is a tty, so this is the `mv3dt-installer | tee
+    install.log` case: §7 requires the operator to see per-line output
+    there, and before this the runner sent them nothing at all.
+    """
     ctx, recorder = _recording_ctx(tmp_path)
-    monkeypatch.setattr(app, "_stderr_is_tty", lambda: False)
 
     result = _run_echo(ctx)
 
     assert result.stdout == "out-line\n"
-    assert recorder.lines == []
+    assert "out-line" in recorder.lines
+    assert "err-line" in recorder.lines
 
 
-def test_run_root_returns_the_same_completedprocess_either_way(tmp_path, monkeypatch):
+def test_run_root_returns_the_same_completedprocess_either_way(tmp_path):
     """The compatibility contract behind doc 08 §4.1: 72 `capture_output`
     call sites and every test asserting on `.stdout` keep working because
     the two paths return the same thing."""
     ctx, _recorder = _recording_ctx(tmp_path)
 
-    monkeypatch.setattr(app, "_stderr_is_tty", lambda: False)
-    plain = _run_echo(ctx)
-    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
+    plain = _run_echo(ctx, stream=False)
     streamed = _run_echo(ctx)
 
     assert isinstance(streamed, type(plain))
@@ -2000,9 +2008,8 @@ def test_run_root_returns_the_same_completedprocess_either_way(tmp_path, monkeyp
     )
 
 
-def test_run_root_streaming_reports_a_nonzero_exit_the_same_way(tmp_path, monkeypatch):
+def test_run_root_streaming_reports_a_nonzero_exit_the_same_way(tmp_path):
     ctx, _recorder = _recording_ctx(tmp_path)
-    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
 
     result = ctx.run_root(
         sys.executable,
@@ -2017,11 +2024,10 @@ def test_run_root_streaming_reports_a_nonzero_exit_the_same_way(tmp_path, monkey
     assert result.stdout == ""
 
 
-def test_run_root_streaming_still_honours_check(tmp_path, monkeypatch):
+def test_run_root_streaming_still_honours_check(tmp_path):
     import subprocess
 
     ctx, _recorder = _recording_ctx(tmp_path)
-    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
 
     with pytest.raises(subprocess.CalledProcessError):
         ctx.run_root(
@@ -2034,9 +2040,8 @@ def test_run_root_streaming_still_honours_check(tmp_path, monkeypatch):
         )
 
 
-def test_run_root_streaming_passes_through_popen_kwargs(tmp_path, monkeypatch):
+def test_run_root_streaming_passes_through_popen_kwargs(tmp_path):
     ctx, _recorder = _recording_ctx(tmp_path)
-    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
 
     result = ctx.run_root(
         sys.executable,
@@ -2050,12 +2055,11 @@ def test_run_root_streaming_passes_through_popen_kwargs(tmp_path, monkeypatch):
     assert result.stdout.strip() == os.path.realpath(str(tmp_path))
 
 
-def test_run_root_missing_executable_still_127_when_streaming(tmp_path, monkeypatch):
+def test_run_root_missing_executable_still_127_when_streaming(tmp_path):
     """The `_missing_executable_result` path survives the new route: the
     tee runner raises `FileNotFoundError` out of `Popen` exactly as
     `subprocess.run` did."""
     ctx, _recorder = _recording_ctx(tmp_path)
-    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
 
     result = ctx.run_root(
         "this-binary-does-not-exist-on-any-path",
@@ -2069,18 +2073,124 @@ def test_run_root_missing_executable_still_127_when_streaming(tmp_path, monkeypa
     assert result.stderr == ""
 
 
-def test_stderr_is_tty_tolerates_a_substitute_stream(monkeypatch):
-    class _NoIsatty:
-        pass
+# ---------------------------------------------------------------------------
+# doc 00 §8.5 / doc 08 §8 -- verbosity
+# ---------------------------------------------------------------------------
 
-    class _Raising:
-        def isatty(self):
-            raise ValueError("I/O operation on closed file")
 
-    monkeypatch.setattr(sys, "stderr", _NoIsatty())
-    assert app._stderr_is_tty() is False
-    monkeypatch.setattr(sys, "stderr", _Raising())
-    assert app._stderr_is_tty() is False
+def test_parse_args_verbose():
+    assert app.parse_args(["--verbose"]).verbose is True
+
+
+def test_there_is_no_quiet_flag():
+    """Doc 08 §11 decision 2: `--quiet` has no consumer and is not in this
+    batch. The systemd units in STEP-6 run non-interactively and are
+    already covered by the non-tty rule in §7."""
+    with pytest.raises(SystemExit):
+        app.parse_args(["--quiet"])
+
+
+def _renderer_kwargs(monkeypatch, tmp_path, **ctx_kwargs) -> dict:
+    """Capture what `build_context` hands `progress.Progress`."""
+    seen: dict = {}
+    real = app.progress_mod.Progress
+
+    def _spy(**kwargs):
+        seen.update(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(app.progress_mod, "Progress", _spy)
+    _minimal_ctx(tmp_path, **ctx_kwargs)
+    return seen
+
+
+def test_build_context_defaults_to_the_rolling_window(monkeypatch, tmp_path):
+    """Doc 08 §8: the default is the fixed 8-line window, not the full
+    stream and not silence."""
+    seen = _renderer_kwargs(monkeypatch, tmp_path)
+
+    assert seen["verbose"] is False
+    assert app.progress_mod.WINDOW_LINES == 8
+
+
+def test_build_context_passes_verbose_to_the_renderer(monkeypatch, tmp_path):
+    seen = _renderer_kwargs(monkeypatch, tmp_path, verbose=True)
+
+    assert seen["verbose"] is True
+    assert seen["non_interactive"] is False
+
+
+def test_verbose_and_non_interactive_are_independent(monkeypatch, tmp_path):
+    """Two different questions: `--verbose` says how much of the stream to
+    show, `--non-interactive` says whether anything may be drawn."""
+    seen = _renderer_kwargs(
+        monkeypatch, tmp_path, verbose=True, non_interactive=True
+    )
+
+    assert (seen["verbose"], seen["non_interactive"]) == (True, True)
+
+
+def test_verbose_reaches_the_renderer_on_the_context(tmp_path):
+    ctx, _cfg = _minimal_ctx(tmp_path, verbose=True)
+    default_ctx, _cfg2 = _minimal_ctx(tmp_path)
+
+    assert ctx.progress.renderer._verbose is True
+    assert default_ctx.progress.renderer._verbose is False
+
+
+def test_verbose_does_not_change_whether_run_root_streams(tmp_path):
+    """Doc 00 §8.5's matrix: verbosity is a rendering decision, so it never
+    moves the AUTO answer. A `stream=False` probe stays silent under
+    `--verbose` too -- its line is still in the transcript."""
+    verbose_ctx, verbose_recorder = _recording_ctx(tmp_path, verbose=True)
+    plain_ctx, plain_recorder = _recording_ctx(tmp_path)
+
+    _run_echo(verbose_ctx)
+    _run_echo(plain_ctx)
+    assert "out-line" in verbose_recorder.lines
+    assert verbose_recorder.lines == plain_recorder.lines
+
+    _run_echo(verbose_ctx, stream=False)
+    assert verbose_recorder.lines == plain_recorder.lines
+
+
+def test_non_interactive_does_not_change_whether_run_root_streams(tmp_path):
+    """Doc 08 §7's third row: a non-interactive run still gets per-line
+    output, plain. Suppressing the drawing is the renderer's job."""
+    ctx, recorder = _recording_ctx(tmp_path, non_interactive=True)
+
+    _run_echo(ctx)
+
+    assert "out-line" in recorder.lines
+
+
+def test_subcommand_context_honours_verbose(monkeypatch, tmp_path):
+    """A standalone `mv3dt-installer amc ...` re-launch gets the same flag
+    the install run does; the peek parser plucks it without consuming it."""
+    seen: dict = {}
+
+    monkeypatch.setattr(
+        app.onboarding,
+        "run_platform_preflight",
+        lambda: InvokingUser(
+            name="tester", home=tmp_path, uid=os.getuid(), gid=os.getgid()
+        ),
+    )
+    monkeypatch.setattr(
+        app,
+        "build_context",
+        lambda cfg, user, non_interactive, verbose=False: seen.update(
+            non_interactive=non_interactive, verbose=verbose
+        ),
+    )
+
+    app._bootstrap_subcommand_context(
+        ["amc", "--verbose", "--some-subcommand-flag"],
+        requires_root=False,
+        state_path=tmp_path / "state.json",
+    )
+
+    assert seen == {"non_interactive": False, "verbose": True}
 
 
 def test_run_root_streaming_redacts_the_terminal_not_the_parsed_buffer(
@@ -2090,7 +2200,6 @@ def test_run_root_streaming_redacts_the_terminal_not_the_parsed_buffer(
     visible. The buffer a step parses is still the child's own text, the
     way `subprocess.run` handed it over."""
     ctx, recorder = _recording_ctx(tmp_path)
-    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
     monkeypatch.setenv("NGC_API_KEY", "nvapi-secret-value")
 
     result = ctx.run_root(
