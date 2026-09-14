@@ -338,7 +338,12 @@ suppresses a line for rendering reasons uses it instead of dropping the line.
 The screen may show less than the transcript. The transcript may never show
 less than the screen.
 
-> **U12 is a release blocker, not merely a later unit.** The tee runner
+> **U12 is a release blocker, and it lands before U4.** The gap opens the
+> moment `run_root` streams, not at release, so U12 is resequenced ahead of
+> U4 rather than left to wave 5: the loss then never exists on `main`, even
+> transiently.
+>
+> **Why it is a blocker at all.** The tee runner
 > (§4.2) must route each line to exactly one writer, or a line renders twice
 > and the raw copy tears through the live region's cursor arithmetic. With
 > no transcript-only sink, "exactly one writer" means a streamed line
@@ -463,7 +468,7 @@ Open decision for the human:
 | U9 Phases and task naming, Steps 4-7 | `feat/installer-progress-steps-4-7` | `mv3dt_installer/steps/step4_calib_output_wiring.py`, `step5_per_project_exes.py`, `step6_remote_supervision.py`, `step7_webapp_integration.py`, their tests | U5, U7 | 6 |
 | U10 Failure context block and inferred-refusal evidence | `feat/installer-progress-failure-context` | `mv3dt_installer/report.py`, `tests/test_report.py` | U5 | 5 |
 | U11 Verbosity flag and doc 00 section 8 update | `feat/installer-progress-verbosity` | `mv3dt_installer/app.py`, `installer/plan/00-FRAMEWORK-AND-BOOTSTRAP.md`, `tests/test_app.py` | U5 | 5 |
-| U12 Transcript-only sink, so live rendering never costs the record | `feat/installer-progress-transcript-sink` | `mv3dt_installer/logs.py`, `tests/test_logs.py`, `mv3dt_installer/progress.py`, `tests/test_progress.py` | U7 | 5 |
+| U12 Transcript-only sink, so live rendering never costs the record | `feat/installer-progress-transcript-sink` | `mv3dt_installer/logs.py`, `tests/test_logs.py`, `mv3dt_installer/shellout.py`, `tests/test_shellout.py`, `mv3dt_installer/progress.py`, `tests/test_progress.py` | U3 | 4 |
 
 ### 12.1 Serialization points
 
