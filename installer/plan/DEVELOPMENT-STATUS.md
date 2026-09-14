@@ -15,8 +15,8 @@ connected across the step modules.** A reader who finds `report.py` can
 reasonably conclude the diagnostic work is done. It is not.
 [Section 5](#5-what-remains) is the honest list.
 
-Current release: **v0.3.2**. Current version string:
-`installer/mv3dt_installer/__init__.py` `__version__ = "0.3.2"`.
+Current release: **v0.3.3**. Current version string:
+`installer/mv3dt_installer/__init__.py` `__version__ = "0.3.3"`.
 
 ---
 
@@ -76,7 +76,7 @@ Current result on an **arm64 macOS** development machine:
 **The 5 failures are environmental, not regressions (REQUIRED to know before
 you start).** They are architecture assertions that cannot pass off x86_64.
 The same suite passes fully in CI on x86_64 — the `installer-tests` workflow
-run for the v0.3.2 tag is green. The five are:
+run for the v0.3.3 tag is green. The five are:
 
 | Test | Why it fails off x86_64 |
 |---|---|
@@ -327,7 +327,7 @@ Settled exclusions, carried from [`08` §11](08-PROGRESS-AND-OBSERVABILITY.md#11
 ## References
 
 Facts in this document are drawn from the repository through release
-`v0.3.2` and from the workstation install runs of `mv3dt-installer`
+`v0.3.3` and from the workstation install runs of `mv3dt-installer`
 0.1.2 through 0.1.9, which are the source of the observed-failure inventory
 in [`08` §2](08-PROGRESS-AND-OBSERVABILITY.md#2-observed-failures-this-doc-exists-to-fix).
 Test counts and the arm64 failure list were produced by running the suite,
