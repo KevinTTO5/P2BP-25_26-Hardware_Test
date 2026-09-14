@@ -27,8 +27,7 @@ Per the step-module interface in
 - `order = 1` — the first step the dispatch loop runs.
 - Consumes: `Context` (`install_dir`, `run_root`, `run_as_user`, `log`,
   `report_installed`, `report_already_installed`, `verify_pinned`,
-  `asset_path`, `reboot.request`), the reboot gate
-  ([`00` §7](00-FRAMEWORK-AND-BOOTSTRAP.md#7-reboot-detection--continuation-contract)),
+  `asset_path`), Step 1's private continuation evidence ([§6](#6-reboot-gating-step-1-owned-continuation)),
   and the exact reporting strings
   ([`00` §8.3–8.4](00-FRAMEWORK-AND-BOOTSTRAP.md#83-reporting-format-for-dependencies-required-exact-strings)).
 - Produces no NGC/download artifacts (Step 1 needs no NGC key). It writes only
@@ -318,8 +317,8 @@ and Phases 1–2 of
 |---|--------------|---------------------|---------|
 | 1 | Kernel headers for `.run` to build `nvidia.ko` | `apt install build-essential dkms linux-headers-$(uname -r)` | reported via §8.3 |
 | 2 | `add-apt-repository` / `apt-key` present on minimal 24.04 | `apt install software-properties-common ca-certificates gnupg curl` | reported via §8.3 |
-| 3 | Distro `nvidia-*` / `libnvidia-*` conflict with `.run` | `apt purge 'nvidia-*' 'libnvidia-*'` + `apt autoremove` | may set `REBOOT_REQUIRED` (§5) |
-| 4 | `nouveau` will abort the `.run` installer | write `/etc/modprobe.d/blacklist-nouveau.conf` (`blacklist nouveau` + `options nouveau modeset=0`), `update-initramfs -u` | `REBOOT_REQUIRED` if nouveau was loaded (§5) |
+| 3 | Distro `nvidia-*` / `libnvidia-*` conflict with `.run` | `apt purge 'nvidia-*' 'libnvidia-*'` + `apt autoremove` | may return `USER_ACTION_REQUIRED` for reboot (§5) |
+| 4 | `nouveau` will abort the `.run` installer | write `/etc/modprobe.d/blacklist-nouveau.conf` (`blacklist nouveau` + `options nouveau modeset=0`), `update-initramfs -u` | `USER_ACTION_REQUIRED` for reboot if nouveau was loaded (§5) |
 | 5 | Secure Boot → unsigned `nvidia.ko` | probe `mokutil --sb-state`; if enabled, surface `USER_ACTION_REQUIRED` (disable Secure Boot in BIOS **or** complete MOK enrollment on next boot) | operator action; MOK/BIOS is out of scope ([`00` §13](00-FRAMEWORK-AND-BOOTSTRAP.md#13-out-of-scope--defer-to-human)) |
 | 6 | GDM/Xorg holding the GPU during `.run` | From a desktop session, stage and asynchronously start `mv3dt-driver-handoff.service`; its root-owned worker stops the active display manager and Xorg after the foreground installer exits. TTY/SSH sessions retain the synchronous path. | desktop-safe precondition for §5 step 7 |
 | 7 | CUDA 13.2 not on `PATH` / `LD_LIBRARY_PATH` | write `/etc/profile.d/cuda.sh` exporting `/usr/local/cuda-13.2/bin` and `/usr/local/cuda-13.2/lib64` | enables `nvcc` in `verify()` |
@@ -359,7 +358,8 @@ defines.
 4. **CUDA repo + keyring** and `apt-get install cuda-toolkit-13-2`
    (DS 9.1 §4.2). Write `/etc/profile.d/cuda.sh` (caveat 7).
 5. **Nouveau + old-NVIDIA cleanup** (caveats 3–4). If nouveau was loaded or a
-   distro `nvidia-*` package was purged → **return `REBOOT_REQUIRED`** now
+   distro `nvidia-*` package was purged → **return `USER_ACTION_REQUIRED`**
+   with reboot instructions now
    (before touching the `.run`), because the `.run` cannot build against a
    live nouveau.
 6. **Secure Boot check** (caveat 5). If enabled → `USER_ACTION_REQUIRED`.
@@ -394,7 +394,7 @@ defines.
 > nouveau/purge reboot (step 5) only fires on machines that shipped with
 > nouveau loaded or a distro driver preinstalled; on a clean image it is a
 > no-op and Launch A proceeds straight to the driver `.run`. Both use the same
-> reboot gate, so a machine may legitimately require **two** reboots before
+> continuation flow, so a machine may legitimately require **two** reboots before
 > Step 1 completes; the framework resumes at the first incomplete step each
 > time.
 
@@ -590,7 +590,7 @@ again after either reboot path.
 - **Driver `595.58.03` loaded**: route directly to Launch B, regardless of a
   retained handoff marker.
 - **Handoff status `scheduled` or `running`**: refuse a duplicate worker.
-- **Handoff success from the current boot**: retain the reboot gate and show
+- **Handoff success from the current boot**: retain the Step 1 reboot gate and show
   `sudo reboot` as a fallback if the automatic request did not occur.
 - **Handoff success from a prior boot but driver absent**: report that the
   module did not load and show Secure Boot/MOK remediation.
@@ -628,9 +628,11 @@ Against the protocol in
   `report_already_installed` (§2.2, §3, §3.2). The "already installed" path is
   taken when a pre-check (`dpkg -s` / `nvidia-smi` / `nvcc` /
   `gst-inspect-1.0`) shows the component already at the pinned version.
-- May return `REBOOT_REQUIRED` (§6), `USER_ACTION_REQUIRED` (Secure Boot,
-  GDM-stop failure, driver failed to load), `FAILED` (apt/`.run` error), or
-  `COMPLETE`.
+- May return `USER_ACTION_REQUIRED` (reboot, active handoff, Secure Boot,
+  GDM-stop failure, or driver-load failure), `FAILED` (apt, synchronous
+  `.run`, or handoff scheduling error), or `COMPLETE`. It never returns
+  `REBOOT_REQUIRED`; [§6](#6-reboot-gating-step-1-owned-continuation) defines
+  why.
 
 ### 7.3 `verify(ctx)` — the pinned checklist
 
