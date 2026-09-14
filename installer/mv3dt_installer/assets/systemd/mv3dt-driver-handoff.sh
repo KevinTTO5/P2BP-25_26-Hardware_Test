@@ -17,9 +17,17 @@ write_status() {
 
 restore_desktop() {
   if [[ -n "${display_manager}" ]]; then
-    systemctl start "${display_manager}" || true
+    systemctl start "${display_manager}"
   else
-    systemctl start display-manager.service || true
+    systemctl start display-manager.service
+  fi
+}
+
+record_failure() {
+  reason=$1
+  write_status "${reason}"
+  if ! restore_desktop; then
+    write_status "${reason}:desktop-restore"
   fi
 }
 
@@ -27,8 +35,7 @@ handle_unexpected_exit() {
   exit_code=$?
   if ((finished == 0)); then
     set +e
-    write_status "failed:worker:${exit_code}"
-    restore_desktop
+    record_failure "failed:worker:${exit_code}"
   fi
 }
 
@@ -43,8 +50,7 @@ for unit in gdm3 gdm lightdm sddm; do
     display_manager=${unit}
     if ! systemctl stop "${unit}"; then
       printf 'Could not stop display manager %s\n' "${unit}" >>"${log_file}"
-      write_status failed:display-manager
-      restore_desktop
+      record_failure failed:display-manager
       finished=1
       exit 1
     fi
@@ -61,8 +67,7 @@ runfile_rc=${PIPESTATUS[0]}
 set -e
 
 if ((runfile_rc != 0)); then
-  write_status "failed:runfile:${runfile_rc}"
-  restore_desktop
+  record_failure "failed:runfile:${runfile_rc}"
   finished=1
   exit "${runfile_rc}"
 fi
@@ -71,8 +76,7 @@ boot_id=$(< "${boot_id_file}")
 write_status "succeeded:${boot_id}"
 sync
 if ! systemctl --no-block reboot; then
-  write_status failed:reboot
-  restore_desktop
+  record_failure failed:reboot
   finished=1
   exit 1
 fi

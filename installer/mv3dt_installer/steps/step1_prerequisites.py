@@ -504,6 +504,21 @@ def _stop_display_manager(ctx: "Context") -> bool:
     return True
 
 
+def _start_display_manager(ctx: "Context", unit: str) -> bool:
+    """Best-effort recovery for a synchronous runfile failure."""
+    result = ctx.run_root(
+        "systemctl",
+        "start",
+        unit,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    restored = result.returncode == 0
+    ctx.log.info(f"display manager restore: {unit}: {'ok' if restored else 'failed'}")
+    return restored
+
+
 def _nouveau_loaded(ctx: "Context") -> bool:
     result = ctx.run_root(
         "bash",
@@ -588,9 +603,9 @@ def _driver_handoff_result() -> StepResult | None:
             user_actions=[
                 UserAction(
                     text=(
-                        "The desktop was restored. Inspect the driver log, remove the "
-                        "failure marker after correcting the cause, then run the "
-                        "installer again."
+                        "The worker attempted to restore the desktop. Inspect the "
+                        "driver log, remove the failure marker after correcting the "
+                        "cause, then run the installer again."
                     ),
                     command=f"sudo rm -f {DRIVER_HANDOFF_STATUS_PATH}",
                     path=str(DRIVER_HANDOFF_LOG_PATH),
@@ -1199,6 +1214,7 @@ class Step1Prerequisites:
                 ],
             )
 
+        active_display_manager = _active_display_manager(ctx)
         if not _stop_display_manager(ctx):
             return StepResult(
                 status=StepStatus.USER_ACTION_REQUIRED,
@@ -1235,9 +1251,27 @@ class Step1Prerequisites:
             text=True,
         )
         if result.returncode != 0:
+            if active_display_manager is None:
+                restored = True
+                restore_state = "not needed"
+            else:
+                restored = _start_display_manager(ctx, active_display_manager)
+                restore_state = "succeeded" if restored else "failed"
+            actions = []
+            if not restored:
+                actions.append(
+                    UserAction(
+                        text="Restart the graphical login or reboot the workstation.",
+                        command=f"sudo systemctl start {active_display_manager}",
+                    )
+                )
             return StepResult(
                 status=StepStatus.FAILED,
-                message=f"NVIDIA driver installer exited {result.returncode}",
+                message=(
+                    f"NVIDIA driver installer exited {result.returncode}; "
+                    f"desktop restore {restore_state}"
+                ),
+                user_actions=actions,
             )
         ctx.report_installed("nvidia-driver", DRIVER_VERSION)
 

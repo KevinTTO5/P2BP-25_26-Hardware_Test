@@ -70,7 +70,7 @@ python3 -m pytest tests/ -q
 Current result on an **arm64 macOS** development machine:
 
 ```
-5 failed, 1260 passed, 7 skipped
+5 failed, 1262 passed, 7 skipped
 ```
 
 **The 5 failures are environmental, not regressions (REQUIRED to know before
@@ -123,8 +123,10 @@ to be edited next, so its shape is worth stating.
 1. **Launch A** (driver not loaded) — base packages, CUDA repo and toolkit,
    nouveau and distro-driver cleanup, then the NVIDIA driver `.run`. A
    desktop launch hands the disruptive work to a persistent root-owned
-   systemd worker, which restores the desktop on failure or reboots
-   automatically on success. TTY and SSH launches remain synchronous.
+   systemd worker, which records whether desktop recovery succeeds after a
+   failure or reboots automatically after driver success. TTY and SSH
+   launches remain synchronous and also recover the display manager when the
+   runfile fails.
 2. **Launch B** (driver loaded) — TensorRT, cuDNN, Mosquitto.
 
 Both reboot points return `USER_ACTION_REQUIRED`, **never**

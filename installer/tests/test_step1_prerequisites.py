@@ -92,6 +92,7 @@ class FakeRunner:
         gpu_present: bool = True,
         secure_boot_enabled: bool = False,
         gdm_stops: bool = True,
+        gdm_starts: bool = True,
         nouveau_loaded: bool = False,
         distro_nvidia_packages: tuple = (),
         driver_run_returncode: int = 0,
@@ -113,6 +114,7 @@ class FakeRunner:
         self.gpu_present = gpu_present
         self.secure_boot_enabled = secure_boot_enabled
         self.gdm_stops = gdm_stops
+        self.gdm_starts = gdm_starts
         self.nouveau_loaded = nouveau_loaded
         self.distro_nvidia_packages = list(distro_nvidia_packages)
         self.driver_run_returncode = driver_run_returncode
@@ -166,6 +168,8 @@ class FakeRunner:
             return _rc(args, 0 if self.gdm_stops else 1)
         if cmd == "systemctl" and args[1] == "start" and "--no-block" in args:
             return _rc(args, 0 if self.handoff_start_ok else 1)
+        if cmd == "systemctl" and args[1] == "start":
+            return _rc(args, 0 if self.gdm_starts else 1)
         if cmd == "pkill":
             return _rc(args, 0)
         if cmd == "dpkg-query":
@@ -455,12 +459,25 @@ def test_launch_a_ends_in_user_action_required_after_a_successful_driver_run(tmp
 
 
 def test_launch_a_fails_when_driver_run_exits_nonzero(tmp_path):
-    ctx, _ = _make_ctx(tmp_path, driver_run_returncode=1)
+    ctx, runner = _make_ctx(tmp_path, driver_run_returncode=1)
     _stage_driver_run(ctx)
 
     result = s1.Step1Prerequisites()._run_launch_a(ctx)
 
     assert result.status is StepStatus.FAILED
+    assert "desktop restore succeeded" in result.message
+    assert any(c[:2] == ("systemctl", "start") for c in runner.calls)
+
+
+def test_sync_runfile_failure_reports_when_desktop_restore_fails(tmp_path):
+    ctx, _ = _make_ctx(tmp_path, driver_run_returncode=1, gdm_starts=False)
+    _stage_driver_run(ctx)
+
+    result = s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    assert result.status is StepStatus.FAILED
+    assert "desktop restore failed" in result.message
+    assert result.user_actions[0].command == "sudo systemctl start gdm3"
 
 
 # ---------------------------------------------------------------------------

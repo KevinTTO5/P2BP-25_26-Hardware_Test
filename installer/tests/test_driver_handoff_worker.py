@@ -17,7 +17,9 @@ def _write_executable(path: pathlib.Path, body: str) -> None:
     path.chmod(0o755)
 
 
-def _run_worker(tmp_path: pathlib.Path, *, runfile_rc: int):
+def _run_worker(
+    tmp_path: pathlib.Path, *, runfile_rc: int, restore_ok: bool = True
+):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     systemctl_log = tmp_path / "systemctl.log"
@@ -29,6 +31,7 @@ def _run_worker(tmp_path: pathlib.Path, *, runfile_rc: int):
 printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
 if [[ "$1 $2 $3" == "is-active --quiet gdm3" ]]; then exit 0; fi
 if [[ "$1" == "is-active" ]]; then exit 1; fi
+if [[ "$1 $2" == "start gdm3" && "$RESTORE_OK" != "1" ]]; then exit 1; fi
 exit 0
 """,
     )
@@ -55,6 +58,7 @@ exit "$RUNFILE_RC"
         "SYSTEMCTL_LOG": str(systemctl_log),
         "RUNFILE_LOG": str(runfile_log),
         "RUNFILE_RC": str(runfile_rc),
+        "RESTORE_OK": "1" if restore_ok else "0",
     }
     result = subprocess.run(
         [
@@ -93,3 +97,13 @@ def test_worker_restores_the_desktop_after_a_runfile_failure(tmp_path):
     calls = systemctl_log.read_text()
     assert "start gdm3" in calls
     assert "--no-block reboot" not in calls
+
+
+def test_worker_records_when_desktop_restore_fails(tmp_path):
+    result, status, systemctl_log, _ = _run_worker(
+        tmp_path, runfile_rc=7, restore_ok=False
+    )
+
+    assert result.returncode == 7
+    assert status.read_text().strip() == "failed:runfile:7:desktop-restore"
+    assert "start gdm3" in systemctl_log.read_text()
