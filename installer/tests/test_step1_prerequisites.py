@@ -53,14 +53,24 @@ def _safe_system_paths(monkeypatch, tmp_path):
     """Belt and braces: point every real system path this module writes at a
     scratch dir so a bug under test can never reach the real filesystem."""
     monkeypatch.setattr(s1, "CUDA_PROFILE_PATH", tmp_path / "etc-profile.d" / "cuda.sh")
-    monkeypatch.setattr(s1, "NOUVEAU_BLACKLIST_PATH", tmp_path / "etc-modprobe.d" / "blacklist-nouveau.conf")
+    monkeypatch.setattr(
+        s1,
+        "NOUVEAU_BLACKLIST_PATH",
+        tmp_path / "etc-modprobe.d" / "blacklist-nouveau.conf",
+    )
     monkeypatch.setattr(s1, "MOSQUITTO_CONF_DIR", tmp_path / "etc-mosquitto" / "conf.d")
     handoff_root = tmp_path / "var-lib" / "driver-handoff"
     monkeypatch.setattr(s1, "DRIVER_HANDOFF_ROOT", handoff_root)
-    monkeypatch.setattr(s1, "DRIVER_HANDOFF_WORKER_PATH", handoff_root / "install-driver.sh")
-    monkeypatch.setattr(s1, "DRIVER_HANDOFF_RUNFILE_PATH", handoff_root / s1.DRIVER_RUN_FILENAME)
+    monkeypatch.setattr(
+        s1, "DRIVER_HANDOFF_WORKER_PATH", handoff_root / "install-driver.sh"
+    )
+    monkeypatch.setattr(
+        s1, "DRIVER_HANDOFF_RUNFILE_PATH", handoff_root / s1.DRIVER_RUN_FILENAME
+    )
     monkeypatch.setattr(s1, "DRIVER_HANDOFF_STATUS_PATH", handoff_root / "status")
-    monkeypatch.setattr(s1, "DRIVER_HANDOFF_LOG_PATH", handoff_root / "driver-install.log")
+    monkeypatch.setattr(
+        s1, "DRIVER_HANDOFF_LOG_PATH", handoff_root / "driver-install.log"
+    )
     monkeypatch.setattr(s1, "DRIVER_HANDOFF_UNIT_DIR", tmp_path / "systemd")
     boot_id_path = tmp_path / "boot-id"
     boot_id_path.write_text("boot-a\n")
@@ -105,7 +115,10 @@ class FakeRunner:
         mosquitto_active: bool = True,
         display_manager_active: bool = True,
         handoff_start_ok: bool = True,
-        cudnn_install_result: Optional[str] = s1.CUDNN_VERSION,
+        cudnn_install_result: Optional[str] = s1.CUDNN_APT_VERSION,
+        apt_fail_on: Optional[str] = None,
+        keyring_install_ok: bool = True,
+        cuda_install_provides_nvcc: bool = True,
         kernel_release: str = "6.8.0-generic",
     ) -> None:
         self.calls: list[tuple] = []
@@ -128,6 +141,9 @@ class FakeRunner:
         self.display_manager_active = display_manager_active
         self.handoff_start_ok = handoff_start_ok
         self.cudnn_install_result = cudnn_install_result
+        self.apt_fail_on = apt_fail_on
+        self.keyring_install_ok = keyring_install_ok
+        self.cuda_install_provides_nvcc = cuda_install_provides_nvcc
         self.kernel_release = kernel_release
 
     def __call__(self, *args: Any, **kwargs: Any) -> subprocess.CompletedProcess:
@@ -158,6 +174,8 @@ class FakeRunner:
                         package, status = entry, "install ok installed"
                     lines.append(f"{status}|{package}")
                 return _ok(args, "\n".join(lines))
+            if "cuda-keyring.deb" in script:
+                return _rc(args, 0 if self.keyring_install_ok else 1)
             return _ok(args)
         if cmd == "mokutil":
             state = "enabled" if self.secure_boot_enabled else "disabled"
@@ -177,14 +195,24 @@ class FakeRunner:
             version = self.dpkg_versions.get(pkg)
             return _ok(args, version) if version else _rc(args, 1)
         if cmd == "apt-get":
+            if self.apt_fail_on and any(self.apt_fail_on in tok for tok in args):
+                return _rc(args, 100)
             if args[1] == "install":
                 for tok in args[4:]:
                     pkg = tok.split("=")[0]
-                    if pkg == s1.CUDNN_APT_GLOB:
-                        if self.cudnn_install_result:
-                            self.dpkg_versions[s1.CUDNN_QUERY_PACKAGE] = self.cudnn_install_result
-                        continue
-                    version = tok.split("=")[1] if "=" in tok else self.dpkg_versions.get(pkg, "1.0")
+                    if pkg in s1.CUDNN_PACKAGES and self.cudnn_install_result:
+                        version = self.cudnn_install_result
+                    else:
+                        version = (
+                            tok.split("=")[1]
+                            if "=" in tok
+                            else self.dpkg_versions.get(pkg, "1.0")
+                        )
+                    if (
+                        pkg == s1.CUDA_TOOLKIT_PACKAGE
+                        and self.cuda_install_provides_nvcc
+                    ):
+                        self.nvcc_release = s1.CUDA_VERSION
                     self.dpkg_versions[pkg] = version
             return _ok(args)
         if cmd == "update-initramfs":
@@ -200,12 +228,19 @@ class FakeRunner:
             return _ok(args)
         if cmd == "nvidia-smi":
             if any("driver_version" in a for a in args):
-                return _ok(args, self.driver_version) if self.driver_version else _rc(args, 1)
+                return (
+                    _ok(args, self.driver_version)
+                    if self.driver_version
+                    else _rc(args, 1)
+                )
             return _ok(args, "RTX PRO 4500 Blackwell, 8.9")
-        if cmd == "nvcc":
+        if cmd == s1.CUDA_NVCC_PATH:
             if not self.nvcc_release:
                 return _rc(args, 1)
-            return _ok(args, f"Cuda compilation tools, release {self.nvcc_release}, V{self.nvcc_release}.100")
+            return _ok(
+                args,
+                f"Cuda compilation tools, release {self.nvcc_release}, V{self.nvcc_release}.100",
+            )
         if cmd == "gst-inspect-1.0":
             if not self.gstreamer_version:
                 return _rc(args, 1)
@@ -281,11 +316,15 @@ class FakeContext:
     def run_root(self, *args: Any, **kwargs: Any) -> subprocess.CompletedProcess:
         return self.runner(*args, **kwargs)
 
-    def run_as_user(self, *args: Any, **kwargs: Any) -> subprocess.CompletedProcess:  # pragma: no cover
+    def run_as_user(
+        self, *args: Any, **kwargs: Any
+    ) -> subprocess.CompletedProcess:  # pragma: no cover
         return self.runner(*args, **kwargs)
 
 
-def _make_ctx(tmp_path: pathlib.Path, **runner_kwargs: Any) -> tuple[FakeContext, FakeRunner]:
+def _make_ctx(
+    tmp_path: pathlib.Path, **runner_kwargs: Any
+) -> tuple[FakeContext, FakeRunner]:
     runner = FakeRunner(**runner_kwargs)
     ctx = FakeContext(install_dir=tmp_path / "opt" / "mv3dt", runner=runner)
     ctx.install_dir.mkdir(parents=True, exist_ok=True)
@@ -304,7 +343,9 @@ def _runfile_bytes(version: str = s1.DRIVER_VERSION) -> bytes:
     )
 
 
-def _stage_driver_run(ctx: FakeContext, version: str = s1.DRIVER_VERSION) -> pathlib.Path:
+def _stage_driver_run(
+    ctx: FakeContext, version: str = s1.DRIVER_VERSION
+) -> pathlib.Path:
     path = s1._driver_run_path(ctx)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(_runfile_bytes(version))
@@ -412,7 +453,9 @@ def _patch_mosquitto_success(ctx: FakeContext):
     return _restore
 
 
-def test_launch_a_returns_user_action_required_early_when_nouveau_cleanup_needed(tmp_path):
+def test_launch_a_returns_user_action_required_early_when_nouveau_cleanup_needed(
+    tmp_path,
+):
     """STEP-1 section 5 step 5: nouveau loaded -> USER_ACTION_REQUIRED
     (reboot instructions) *before* the Secure Boot check or the .run
     installer are ever reached. Not REBOOT_REQUIRED -- see this module's
@@ -430,7 +473,9 @@ def test_launch_a_returns_user_action_required_early_when_nouveau_cleanup_needed
     assert not any(c[0] == "mokutil" for c in runner.calls)
 
 
-def test_launch_a_returns_user_action_required_early_when_distro_driver_purged(tmp_path):
+def test_launch_a_returns_user_action_required_early_when_distro_driver_purged(
+    tmp_path,
+):
     ctx, runner = _make_ctx(
         tmp_path, nouveau_loaded=False, distro_nvidia_packages=("nvidia-driver-550",)
     )
@@ -486,7 +531,9 @@ def test_sync_runfile_failure_reports_when_desktop_restore_fails(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_confirmed_reboot_still_lets_launch_b_run_on_next_dispatch(tmp_path, monkeypatch):
+def test_confirmed_reboot_still_lets_launch_b_run_on_next_dispatch(
+    tmp_path, monkeypatch
+):
     """End-to-end against the actual merged `mv3dt_installer.reboot` and
     `mv3dt_installer.app` modules (not a re-derivation of their logic):
 
@@ -653,7 +700,9 @@ def test_launch_a_replaces_a_staged_driver_of_the_wrong_version(tmp_path):
 
     # Rejected the stale file, fetched the pinned one, and carried on.
     assert len([c for c in runner.calls if c[0] == "curl"]) == 1
-    assert s1._driver_run_embedded_version(s1._driver_run_path(ctx)) == s1.DRIVER_VERSION
+    assert (
+        s1._driver_run_embedded_version(s1._driver_run_path(ctx)) == s1.DRIVER_VERSION
+    )
     assert result.status is StepStatus.USER_ACTION_REQUIRED
     assert "reboot" in result.message.lower()
 
@@ -713,7 +762,9 @@ def test_apt_install_reported_reports_installed_for_a_new_package(tmp_path):
     assert ctx.already_installed == []
 
 
-def test_apt_install_reported_reports_already_installed_when_version_unchanged(tmp_path):
+def test_apt_install_reported_reports_already_installed_when_version_unchanged(
+    tmp_path,
+):
     ctx, runner = _make_ctx(tmp_path, dpkg_versions={"curl": "8.5.0-1"})
     s1._apt_install_reported(ctx, ["curl"])
     assert ("curl", "8.5.0-1") in ctx.already_installed
@@ -728,10 +779,43 @@ def test_apt_install_reported_uses_pinned_apt_args_for_tensorrt(tmp_path):
         assert (pkg, s1.TENSORRT_VERSION) in ctx.installed
 
 
+def test_launch_a_apt_failure_stops_before_cuda_and_does_not_report(tmp_path):
+    ctx, runner = _make_ctx(tmp_path, apt_fail_on="build-essential")
+
+    result = s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    assert result.status is StepStatus.FAILED
+    assert not any("cuda-keyring.deb" in " ".join(call) for call in runner.calls)
+    assert ctx.installed == []
+    assert ctx.already_installed == []
+
+
+def test_launch_a_cuda_keyring_failure_stops_before_cleanup(tmp_path):
+    ctx, runner = _make_ctx(tmp_path, keyring_install_ok=False)
+
+    result = s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    assert result.status is StepStatus.FAILED
+    assert "keyring" in result.message
+    assert not any(call[0] == "update-initramfs" for call in runner.calls)
+    assert not any(str(call[0]).endswith(".run") for call in runner.calls)
+
+
+def test_launch_a_nvidia_purge_failure_is_failed(tmp_path):
+    ctx, _ = _make_ctx(
+        tmp_path,
+        distro_nvidia_packages=("nvidia-driver-550",),
+        apt_fail_on="nvidia-driver-550",
+    )
+
+    result = s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    assert result.status is StepStatus.FAILED
+    assert "apt purge failed" in result.message
+
+
 def test_launch_b_pins_cudnn_version_at_apt_install(tmp_path):
-    """Secondary review fix: cuDNN must be apt-pinned like TensorRT, not
-    installed via a bare unpinned `libcudnn9*` glob -- so a version
-    mismatch fails fast at apt-install time, not only later at verify()."""
+    """CUDA 13 cuDNN uses concrete packages at the exact apt version."""
     ctx, runner = _make_ctx(
         tmp_path,
         driver_version=s1.DRIVER_VERSION,
@@ -745,10 +829,93 @@ def test_launch_b_pins_cudnn_version_at_apt_install(tmp_path):
     restore()
 
     install_calls = [c for c in runner.calls if c[0] == "apt-get" and c[1] == "install"]
-    pinned_cudnn_arg = f"{s1.CUDNN_QUERY_PACKAGE}={s1.CUDNN_VERSION}"
-    assert any(pinned_cudnn_arg in call for call in install_calls)
-    # The rest of the cuDNN family is still picked up via the glob.
-    assert any(s1.CUDNN_APT_GLOB in call for call in install_calls)
+    cudnn_call = next(
+        call for call in install_calls if s1.CUDNN_QUERY_PACKAGE in " ".join(call)
+    )
+    assert all(
+        f"{pkg}={s1.CUDNN_APT_VERSION}" in cudnn_call for pkg in s1.CUDNN_PACKAGES
+    )
+    assert not any("*" in arg for arg in cudnn_call)
+
+
+def test_launch_b_recovers_missing_cuda_and_writes_profile(tmp_path):
+    ctx, runner = _make_ctx(
+        tmp_path,
+        driver_version=s1.DRIVER_VERSION,
+        nvcc_release="",
+        gstreamer_version=s1.GSTREAMER_VERSION,
+        mosquitto_active=True,
+    )
+    restore = _patch_mosquitto_success(ctx)
+    try:
+        result = s1.Step1Prerequisites()._run_launch_b(ctx)
+    finally:
+        restore()
+
+    assert result.status is StepStatus.COMPLETE
+    assert any(
+        call[:2] == ("apt-get", "install") and s1.CUDA_TOOLKIT_PACKAGE in call
+        for call in runner.calls
+    )
+    assert s1.CUDA_HOME in s1.CUDA_PROFILE_PATH.read_text()
+
+
+def test_launch_b_cuda_install_failure_stops_before_tensorrt(tmp_path):
+    ctx, runner = _make_ctx(
+        tmp_path,
+        driver_version=s1.DRIVER_VERSION,
+        nvcc_release="",
+        apt_fail_on=s1.CUDA_TOOLKIT_PACKAGE,
+    )
+
+    result = s1.Step1Prerequisites()._run_launch_b(ctx)
+
+    assert result.status is StepStatus.FAILED
+    assert not any(s1.TENSORRT_PACKAGES[0] in call for call in runner.calls)
+    assert ctx.installed == []
+
+
+def test_launch_b_cudnn_failure_stops_without_reporting_or_mosquitto(
+    tmp_path, monkeypatch
+):
+    ctx, _ = _make_ctx(
+        tmp_path,
+        driver_version=s1.DRIVER_VERSION,
+        nvcc_release=s1.CUDA_VERSION,
+        apt_fail_on=s1.CUDNN_QUERY_PACKAGE,
+    )
+    mosquitto_called = False
+
+    def fake_run_bundled_script(*args, **kwargs):
+        nonlocal mosquitto_called
+        mosquitto_called = True
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(shellout, "run_bundled_script", fake_run_bundled_script)
+
+    result = s1.Step1Prerequisites()._run_launch_b(ctx)
+
+    assert result.status is StepStatus.FAILED
+    assert not mosquitto_called
+    assert not any(pkg in s1.CUDNN_PACKAGES for pkg, _ in ctx.installed)
+    assert all(version != "unknown" for _, version in ctx.installed)
+
+
+def test_verify_probes_nvcc_at_pinned_absolute_path(tmp_path, monkeypatch):
+    ctx, runner = _make_ctx(
+        tmp_path,
+        driver_version=s1.DRIVER_VERSION,
+        nvcc_release=s1.CUDA_VERSION,
+        gstreamer_version=s1.GSTREAMER_VERSION,
+        dpkg_versions=_fully_pinned_versions(),
+        mosquitto_active=True,
+    )
+    monkeypatch.setattr(s1, "_mosquitto_conf_matches_bundled", lambda ctx: True)
+
+    result = s1.Step1Prerequisites().verify(ctx)
+
+    assert result.status is StepStatus.COMPLETE
+    assert any(call[0] == s1.CUDA_NVCC_PATH for call in runner.calls)
 
 
 # ---------------------------------------------------------------------------
@@ -759,7 +926,7 @@ def test_launch_b_pins_cudnn_version_at_apt_install(tmp_path):
 def _fully_pinned_versions() -> dict:
     return {
         "libnvinfer10": s1.TENSORRT_VERSION,
-        s1.CUDNN_QUERY_PACKAGE: s1.CUDNN_VERSION,
+        s1.CUDNN_QUERY_PACKAGE: s1.CUDNN_APT_VERSION,
     }
 
 
@@ -779,7 +946,9 @@ def test_verify_complete_when_every_pin_matches(tmp_path, monkeypatch):
     assert result.status is StepStatus.COMPLETE
 
 
-def test_verify_user_action_required_when_driver_version_mismatches(tmp_path, monkeypatch):
+def test_verify_user_action_required_when_driver_version_mismatches(
+    tmp_path, monkeypatch
+):
     ctx, _ = _make_ctx(
         tmp_path,
         driver_version="550.00.00",  # wrong pin
@@ -836,7 +1005,9 @@ def test_verify_never_returns_complete_on_a_single_mismatch(tmp_path, monkeypatc
 # ---------------------------------------------------------------------------
 
 
-def test_mosquitto_reports_installed_when_broker_absent_and_conf_missing(tmp_path, monkeypatch):
+def test_mosquitto_reports_installed_when_broker_absent_and_conf_missing(
+    tmp_path, monkeypatch
+):
     ctx, runner = _make_ctx(tmp_path, dpkg_versions={})  # mosquitto absent
 
     def fake_run_bundled_script(*args, **kwargs):
@@ -859,7 +1030,9 @@ def test_mosquitto_reports_installed_when_broker_absent_and_conf_missing(tmp_pat
     assert ctx.already_installed == []
 
 
-def test_mosquitto_reports_already_installed_when_nothing_changed(tmp_path, monkeypatch):
+def test_mosquitto_reports_already_installed_when_nothing_changed(
+    tmp_path, monkeypatch
+):
     ctx, runner = _make_ctx(tmp_path, dpkg_versions={"mosquitto": "2.0.18-1"})
 
     # Pre-seed the drop-in so it already matches the bundled asset exactly.
@@ -882,7 +1055,9 @@ def test_mosquitto_reports_already_installed_when_nothing_changed(tmp_path, monk
     assert ctx.installed == []
 
 
-def test_mosquitto_reports_installed_conf_when_drop_in_differs_from_bundled(tmp_path, monkeypatch):
+def test_mosquitto_reports_installed_conf_when_drop_in_differs_from_bundled(
+    tmp_path, monkeypatch
+):
     ctx, runner = _make_ctx(tmp_path, dpkg_versions={"mosquitto": "2.0.18-1"})
 
     # A stale drop-in on disk, different from the bundled asset.
@@ -938,7 +1113,9 @@ def test_mosquitto_forwards_non_interactive_flag(tmp_path, monkeypatch):
     assert seen_args["args"] == ["--non-interactive"]
 
 
-def test_mosquitto_omits_non_interactive_flag_when_interactive(tmp_path, monkeypatch):
+def test_mosquitto_uses_non_interactive_child_when_parent_is_interactive(
+    tmp_path, monkeypatch
+):
     ctx, _ = _make_ctx(tmp_path)
     ctx.non_interactive = False
     seen_args = {}
@@ -951,7 +1128,7 @@ def test_mosquitto_omits_non_interactive_flag_when_interactive(tmp_path, monkeyp
 
     s1.Step1Prerequisites()._run_mosquitto(ctx)
 
-    assert seen_args["args"] == []
+    assert seen_args["args"] == ["--non-interactive"]
 
 
 # ---------------------------------------------------------------------------
@@ -985,7 +1162,7 @@ def test_purge_ignores_packages_dpkg_only_knows_the_name_of(tmp_path):
         tmp_path, distro_nvidia_packages=_NOT_INSTALLED_ON_STOCK_UBUNTU
     )
 
-    assert s1._purge_distro_nvidia_packages(ctx) is False
+    assert s1._purge_distro_nvidia_packages(ctx) == (False, None)
     assert [c for c in runner.calls if c[0] == "apt-get" and c[1] == "purge"] == []
 
 
@@ -999,7 +1176,7 @@ def test_purge_removes_installed_and_config_files_packages(tmp_path):
         ),
     )
 
-    assert s1._purge_distro_nvidia_packages(ctx) is True
+    assert s1._purge_distro_nvidia_packages(ctx) == (True, None)
     purge = [c for c in runner.calls if c[0] == "apt-get" and c[1] == "purge"][0]
     assert "nvidia-driver-550" in purge
     assert "libnvidia-gl-550" in purge  # a real leftover purging does clear
@@ -1041,9 +1218,7 @@ def test_every_fetch_uses_a_tool_step_1_actually_installs(tmp_path):
 
     s1.Step1Prerequisites()._run_launch_a(ctx)
 
-    fetchers = {
-        c[0] for c in runner.calls if c[0] in ("curl", "wget")
-    }
+    fetchers = {c[0] for c in runner.calls if c[0] in ("curl", "wget")}
     # Anything embedded in a `bash -c` fragment counts too.
     for call in runner.calls:
         if call[0] == "bash":
@@ -1063,7 +1238,8 @@ def test_display_manager_stop_warns_before_the_screen_goes_black(tmp_path, monke
     """The black screen must never be the first the operator hears of it."""
     seen: list[str] = []
     monkeypatch.setattr(
-        s1.waitui, "countdown",
+        s1.waitui,
+        "countdown",
         lambda *a, **kw: seen.append(kw.get("description", "")),
     )
     ctx, _ = _make_ctx(tmp_path)
@@ -1111,7 +1287,9 @@ def test_guard_allows_an_ssh_session(tmp_path, monkeypatch):
     assert s1._session_hazard(ctx) is None
 
 
-def test_guard_allows_a_desktop_terminal_when_no_display_manager_runs(tmp_path, monkeypatch):
+def test_guard_allows_a_desktop_terminal_when_no_display_manager_runs(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr(s1, "_controlling_tty", lambda: "/dev/pts/1")
     monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: False)
     ctx, _ = _make_ctx(tmp_path, display_manager_active=False)
@@ -1143,9 +1321,7 @@ def test_launch_a_hands_desktop_install_to_systemd(tmp_path, monkeypatch):
     assert s1.DRIVER_HANDOFF_WORKER_PATH.is_file()
     assert s1._verify_driver_run(s1.DRIVER_HANDOFF_RUNFILE_PATH) is None
     assert (s1.DRIVER_HANDOFF_UNIT_DIR / s1.DRIVER_HANDOFF_UNIT_NAME).is_file()
-    assert any(
-        c[:3] == ("systemctl", "start", "--no-block") for c in runner.calls
-    )
+    assert any(c[:3] == ("systemctl", "start", "--no-block") for c in runner.calls)
     # The foreground process never tears down the desktop or runs the file.
     assert not [c for c in runner.calls if c[0] == "pkill"]
     assert not [c for c in runner.calls if str(c[0]).endswith(".run")]
@@ -1154,18 +1330,14 @@ def test_launch_a_hands_desktop_install_to_systemd(tmp_path, monkeypatch):
 def test_launch_a_reports_a_systemd_schedule_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(s1, "_controlling_tty", lambda: "/dev/pts/1")
     monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: False)
-    ctx, _ = _make_ctx(
-        tmp_path, display_manager_active=True, handoff_start_ok=False
-    )
+    ctx, _ = _make_ctx(tmp_path, display_manager_active=True, handoff_start_ok=False)
     _stage_driver_run(ctx)
 
     result = s1.Step1Prerequisites()._run_launch_a(ctx)
 
     assert result.status is StepStatus.FAILED
     assert "systemd could not start" in result.message
-    assert s1.DRIVER_HANDOFF_STATUS_PATH.read_text().startswith(
-        "failed:systemd-start:"
-    )
+    assert s1.DRIVER_HANDOFF_STATUS_PATH.read_text().startswith("failed:systemd-start:")
 
 
 @pytest.mark.parametrize("state", ["scheduled", "running"])
@@ -1227,13 +1399,16 @@ def test_sshd_ancestor_walk_handles_a_comm_containing_parens(monkeypatch, tmp_pa
     (proc / "10").mkdir(parents=True)
     (proc / "10" / "stat").write_text("10 (weird (name) here) S 1 10 10 0 -1 0")
 
-    monkeypatch.setattr(s1.pathlib, "Path", lambda p: proc / str(p).replace("/proc/", ""))
+    monkeypatch.setattr(
+        s1.pathlib, "Path", lambda p: proc / str(p).replace("/proc/", "")
+    )
     assert s1._has_sshd_ancestor(10) is False
 
 
 def test_controlling_tty_falls_back_past_a_redirected_stdin(monkeypatch):
     """A closed or redirected stdin must not look like "no console": the
     guard would then refuse an operator sitting on a real tty."""
+
     def fake_ttyname(fd):
         if fd == 0:
             raise OSError("not a tty")
