@@ -71,6 +71,7 @@ from mv3dt_installer import config as config_mod
 from mv3dt_installer import ngc as ngc_mod
 from mv3dt_installer import onboarding
 from mv3dt_installer import privilege
+from mv3dt_installer import progress as progress_mod
 from mv3dt_installer import reboot as reboot_mod
 from mv3dt_installer import report
 from mv3dt_installer import shellout
@@ -83,7 +84,14 @@ from mv3dt_installer.state import (
     StateMachine,
     default_state,
 )
-from mv3dt_installer.steps import STEP_REGISTRY, Step, StepResult, StepStatus
+from mv3dt_installer.steps import (
+    STEP_REGISTRY,
+    Step,
+    StepResult,
+    StepStatus,
+    phase_label,
+    step_phases,
+)
 
 __all__ = [
     "build_parser",
@@ -92,6 +100,7 @@ __all__ = [
     "NgcHandle",
     "WebappHandle",
     "RebootHandle",
+    "ProgressHandle",
     "build_context",
     "SUBCOMMAND_REGISTRY",
     "register_subcommand",
@@ -292,6 +301,154 @@ class RebootHandle:
         return StepStatus.REBOOT_REQUIRED
 
 
+class _UnboundStep:
+    """Stand-in for "no step is running yet" (doc 08 §3.1).
+
+    `ProgressHandle` is built with the `Context`, long before the dispatch
+    loop binds a step to it, and `mv3dt-installer amc ...` never binds one
+    at all. Rather than special-casing `step is None` inside every method,
+    the unbound handle points at this: a step with no `phases` attribute,
+    which the `steps` accessors already define as "one unnamed phase". The
+    bounds check for an unbound handle is then the same code as for a real
+    step, so the two cannot disagree.
+    """
+
+    id = "(no step)"
+
+
+_UNBOUND_STEP = _UnboundStep()
+
+
+@dataclass
+class ProgressHandle:
+    """Doc 08 §9's `ctx.progress`: the only route a step has to the
+    terminal.
+
+    Steps call `phase`, `task` and `bytes`; they never write to stdout or
+    stderr themselves and never import `progress.py` (doc 08 §9). All three
+    are optional -- a step that calls none of them behaves exactly as it did
+    before this handle existed, which is what lets the seven steps adopt
+    phases one at a time (doc 08 §3.1).
+
+    The handle also carries the renderer that `Context.run_root` feeds
+    streamed command output to (doc 08 §4.2), so there is one renderer per
+    run and not one per concern.
+    """
+
+    renderer: progress_mod.Progress
+    step: Any = None
+
+    # -- framework-side (the dispatch loop, doc 08 §3.2) -------------------
+
+    def begin_step(self, step: Step, index: int) -> None:
+        """Bind `step` as the running one and announce it.
+
+        Called by the framework, not by a step. Binding is what gives
+        `phase()` a declaration to index against, and the labels handed to
+        the renderer come from `steps.step_phases` so a step that declared
+        none still gets its banner.
+        """
+        self.step = step
+        self.renderer.begin_step(index, step.title, step_phases(step))
+
+    def end_step(self) -> None:
+        """Collapse the running step's last phase and unbind it."""
+        self.renderer.end_step()
+        self.step = None
+
+    def line(self, text: str) -> None:
+        """One line of command output (doc 08 §4.2).
+
+        This is the `shellout.LineSink` method `run_streamed` calls; it is
+        not part of the step-author contract, which is why doc 08 §9 lists
+        only `phase`, `task` and `bytes`.
+        """
+        self.renderer.line(text)
+
+    # -- the step-author contract (doc 08 §9) ------------------------------
+
+    def phase(self, number: int) -> None:
+        """Advance to the step's declared phase `number` (1-based).
+
+        The bounds check is `steps.phase_label`'s, deliberately: it checks
+        against the step's own `phases` declaration, and doc 08 §9 requires
+        an out-of-range index to raise rather than render a wrong
+        denominator -- an operator has no way to tell a wrong denominator
+        from a right one.
+
+        A step that declared no phases has exactly one, unnamed (doc 08
+        §3.1), so `phase(1)` is legal there and renders nothing.
+        """
+        step = self.step if self.step is not None else _UNBOUND_STEP
+        if phase_label(step, number) is None:
+            return
+        self.renderer.phase(number)
+
+    def task(self, name: str) -> None:
+        """Name the operation now running inside the current phase."""
+        self.renderer.task(name)
+
+    def bytes(self, done: int, total: int | None) -> None:
+        """Drive a real bar from a real denominator (doc 08 §5)."""
+        self.renderer.bytes(done, total)
+
+
+def _stderr_is_tty() -> bool:
+    """Whether live output has anywhere to go (doc 08 §7).
+
+    Deliberately tolerant: under pytest, and behind PyInstaller's console
+    handling, `sys.stderr` may be a substitute object without `isatty`, or
+    one whose `isatty` raises on a closed stream. Either way the answer is
+    "not a terminal", which is the safe direction -- it suppresses live
+    rendering rather than writing escapes into a pipe.
+    """
+    isatty = getattr(sys.stderr, "isatty", None)
+    if isatty is None:
+        return False
+    try:
+        return bool(isatty())
+    except Exception:
+        return False
+
+
+def _should_stream(stream: Optional[bool], kwargs: dict) -> bool:
+    """Resolve `run_root`'s `stream=` into a yes/no (doc 08 §4.1).
+
+    `stream=None` is AUTO: stream when stderr is a terminal *and* the caller
+    asked for captured text output. Both halves matter. Without capture the
+    child already inherits the terminal and its output is live anyway, and
+    routing it through the tee would turn a `None` `.stdout` into a string.
+    Without text mode the caller wants `bytes` back, and the tee is
+    line-oriented and text-only.
+
+    `stream=False` is the escape hatch doc 08 §4.1 names: today's behaviour
+    for a probe whose output would be noise.
+
+    `stream=True` forces streaming even off a tty (plain lines, per §7), but
+    only for a call the tee can serve without changing the shape of the
+    returned `CompletedProcess`. Asking to stream a binary or uncaptured
+    call is an authoring mistake, and a loud one here beats a caller
+    receiving a `str` where it indexed `bytes`.
+    """
+    if stream is False:
+        return False
+
+    captured = bool(kwargs.get("capture_output"))
+    text = bool(kwargs.get("text") or kwargs.get("universal_newlines"))
+    streamable = captured and text
+
+    if stream is None:
+        return streamable and _stderr_is_tty()
+
+    if not streamable:
+        raise ValueError(
+            "run_root(stream=True) requires capture_output=True and text=True; "
+            "the streaming runner returns text and cannot change the shape of "
+            "the CompletedProcess its caller expects"
+        )
+    return True
+
+
 def _missing_executable_result(
     args: tuple, kwargs: dict
 ) -> subprocess.CompletedProcess:
@@ -335,6 +492,7 @@ class Context:
     webapp: WebappHandle
     asset_path: Callable[..., pathlib.Path]
     reboot: RebootHandle
+    progress: ProgressHandle
     non_interactive: bool
 
     def run_as_user(self, *args: str, **kwargs: Any) -> subprocess.CompletedProcess:
@@ -343,18 +501,51 @@ class Context:
         through this rather than running unwrapped as root."""
         return privilege.run_as_user(*args, **kwargs)
 
-    def run_root(self, *args: str, **kwargs: Any) -> subprocess.CompletedProcess:
+    def run_root(
+        self, *args: str, stream: Optional[bool] = None, **kwargs: Any
+    ) -> subprocess.CompletedProcess:
         """Doc 00 §12.3's "run_root(...) convenience". `privilege.py`
         defines no such helper because by the time any step executes, the
         whole process already runs as root (`privilege.require_root()`
         gates `main()`, below) -- "running as root" at that point means
-        nothing more than a plain `subprocess.run` with no user-switching,
-        so that's exactly what this does.
+        nothing more than a plain `subprocess.run` with no user-switching.
+
+        This is also doc 08 §4.1's single seam for live output. Every one of
+        the 72 `capture_output=True` call sites across the step modules
+        reaches a subprocess through here, so routing *this* method through
+        `shellout.run_streamed` gives all seven steps live output without
+        editing one of them -- and without changing what any of them
+        receives back. The return value is a `CompletedProcess` with
+        `.stdout` and `.stderr` populated exactly as before, streamed or
+        not; that equivalence is the whole reason the seam is here rather
+        than at the call sites.
+
+        `stream=None` is auto (see `_should_stream`): stream when there is a
+        terminal to stream to and the caller captured text. `stream=False`
+        restores the plain `subprocess.run` path for a probe whose output
+        would be noise.
 
         A missing executable is treated the same as a `check=False` step
         already treats a nonzero exit -- see `_missing_executable_result`.
+        The tee runner raises `FileNotFoundError` from `Popen` just as
+        `subprocess.run` does, so both paths land in the same handler.
         """
         try:
+            if _should_stream(stream, kwargs):
+                # `redact_capture=False` for the same reason
+                # `run_bundled_script` uses it: the returned buffer is
+                # parsed by its caller, and a step that greps its own
+                # output must get back exactly what the child printed, the
+                # way `subprocess.run` handed it over. The terminal and the
+                # transcript are scrubbed regardless (doc 08 §4.2), so
+                # showing a command live still cannot be how a secret
+                # becomes visible.
+                return shellout.run_streamed(
+                    args,
+                    renderer=self.progress,
+                    redact_capture=False,
+                    **kwargs,
+                )
             return subprocess.run(args, **kwargs)
         except FileNotFoundError:
             return _missing_executable_result(args, kwargs)
@@ -386,6 +577,19 @@ def build_context(
         ),
         asset_path=shellout.asset_path,
         reboot=RebootHandle(),
+        # One renderer per run, built here so `run_root`'s streamed output
+        # and a step's own `ctx.progress` calls land in the same region
+        # instead of fighting over the cursor. `non_interactive` is passed
+        # through because doc 08 §7 requires it to suppress everything live,
+        # the same as a pipe does; `STEP_IDS` is the denominator in
+        # "Step 3/7" and is known at startup (doc 08 §3).
+        progress=ProgressHandle(
+            renderer=progress_mod.Progress(
+                total_steps=len(STEP_IDS),
+                out=sys.stderr,
+                non_interactive=non_interactive,
+            )
+        ),
         non_interactive=non_interactive,
     )
 

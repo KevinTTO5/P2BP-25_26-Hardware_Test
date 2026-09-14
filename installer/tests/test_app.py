@@ -1477,3 +1477,359 @@ def test_main_subcommand_dispatch_does_not_run_onboarding_or_reboot_reconcile(
         state_path=tmp_path / "state.json",
     )
     assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# doc 08 §9 -- the `ctx.progress` handle
+# ---------------------------------------------------------------------------
+
+
+class _RecordingRenderer:
+    """Stands in for `progress.Progress` so these tests assert on the calls
+    the handle makes, not on how the renderer draws them (that is
+    test_progress.py's job)."""
+
+    def __init__(self) -> None:
+        self.steps: list = []
+        self.phases: list = []
+        self.tasks: list = []
+        self.byte_calls: list = []
+        self.lines: list = []
+        self.ended = 0
+
+    def begin_step(self, index, title, phases=()):
+        self.steps.append((index, title, tuple(phases)))
+
+    def end_step(self):
+        self.ended += 1
+
+    def phase(self, number):
+        self.phases.append(number)
+
+    def task(self, name):
+        self.tasks.append(name)
+
+    def bytes(self, done, total):
+        self.byte_calls.append((done, total))
+
+    def line(self, text):
+        self.lines.append(text)
+
+
+class _PhasedStep(_DummyStep):
+    phases = ("first", "second")
+
+
+def _recording_ctx(tmp_path: Path, **kwargs):
+    """A real `Context` whose renderer records instead of drawing."""
+    ctx, _cfg = _minimal_ctx(tmp_path, **kwargs)
+    recorder = _RecordingRenderer()
+    ctx.progress.renderer = recorder
+    return ctx, recorder
+
+
+def test_build_context_exposes_a_progress_handle(tmp_path):
+    ctx, _cfg = _minimal_ctx(tmp_path)
+
+    assert isinstance(ctx.progress, app.ProgressHandle)
+    assert isinstance(ctx.progress.renderer, app.progress_mod.Progress)
+    # Nothing is bound until the dispatch loop binds it.
+    assert ctx.progress.step is None
+
+
+def test_progress_step_banner_denominator_is_the_step_count(tmp_path, capsys):
+    """Doc 08 §3: the "of 7" an operator has never been told."""
+    ctx, _cfg = _minimal_ctx(tmp_path)
+    step = _DummyStep("step1_prerequisites", "Prerequisites", 1)
+
+    ctx.progress.begin_step(step, 1)
+
+    assert f"[ 1/{len(STEP_IDS)} ] Prerequisites" in capsys.readouterr().err
+
+
+def test_progress_phase_indexes_the_steps_own_declaration(tmp_path):
+    ctx, recorder = _recording_ctx(tmp_path)
+    step = _PhasedStep("step1_prerequisites", "Prerequisites", 1)
+
+    ctx.progress.begin_step(step, 1)
+    ctx.progress.phase(2)
+
+    assert recorder.steps == [(1, "Prerequisites", ("first", "second"))]
+    assert recorder.phases == [2]
+
+
+def test_progress_phase_out_of_range_raises(tmp_path):
+    """Doc 08 §9: a wrong denominator on screen is worse than a traceback,
+    because the operator cannot tell it is wrong."""
+    ctx, recorder = _recording_ctx(tmp_path)
+    step = _PhasedStep("step1_prerequisites", "Prerequisites", 1)
+    ctx.progress.begin_step(step, 1)
+
+    with pytest.raises(IndexError):
+        ctx.progress.phase(3)
+    with pytest.raises(IndexError):
+        ctx.progress.phase(0)
+
+    assert recorder.phases == []
+
+
+def test_progress_phase_out_of_range_raises_before_any_step_is_bound(tmp_path):
+    ctx, recorder = _recording_ctx(tmp_path)
+
+    # An unbound handle is one unnamed phase, so 1 is legal and 2 is not.
+    ctx.progress.phase(1)
+    with pytest.raises(IndexError):
+        ctx.progress.phase(2)
+
+    assert recorder.phases == []
+
+
+def test_progress_phase_is_a_no_op_for_a_step_declaring_none(tmp_path):
+    """Doc 08 §3.1's backward compatibility: a step that has not adopted
+    phases still runs, in one unnamed phase."""
+    ctx, recorder = _recording_ctx(tmp_path)
+    step = _DummyStep("step4_calib_output_wiring", "Calibration wiring", 4)
+
+    ctx.progress.begin_step(step, 4)
+    ctx.progress.phase(1)
+
+    assert recorder.steps == [(4, "Calibration wiring", ())]
+    assert recorder.phases == []
+    with pytest.raises(IndexError):
+        ctx.progress.phase(2)
+
+
+def test_progress_task_and_bytes_delegate(tmp_path):
+    ctx, recorder = _recording_ctx(tmp_path)
+
+    ctx.progress.task("downloading driver")
+    ctx.progress.bytes(412, 606)
+    ctx.progress.bytes(0, None)
+
+    assert recorder.tasks == ["downloading driver"]
+    assert recorder.byte_calls == [(412, 606), (0, None)]
+
+
+def test_progress_end_step_unbinds_the_step(tmp_path):
+    ctx, recorder = _recording_ctx(tmp_path)
+    ctx.progress.begin_step(_PhasedStep("step1", "Prereqs", 1), 1)
+
+    ctx.progress.end_step()
+
+    assert recorder.ended == 1
+    assert ctx.progress.step is None
+
+
+def test_step_making_no_progress_calls_dispatches_unchanged(tmp_path, monkeypatch):
+    """Doc 08 §9's load-bearing rule: omitting all three calls is legal and
+    yields today's behaviour, which is what lets the seven steps adopt this
+    one at a time."""
+    ctx, cfg = _minimal_ctx(tmp_path)
+    recorder = _RecordingRenderer()
+    ctx.progress.renderer = recorder
+    sm = StateMachine(tmp_path / "state.json")
+    step = _DummyStep("step1_prerequisites", "Prerequisites", 1)
+    monkeypatch.setattr(app, "STEP_REGISTRY", [step])
+
+    rc = app._dispatch(sm, ctx, cfg)
+
+    assert rc == 0
+    assert step.report_calls == 1
+    assert (recorder.steps, recorder.phases, recorder.lines) == ([], [], [])
+
+
+# ---------------------------------------------------------------------------
+# doc 08 §4.1 -- streaming run_root
+# ---------------------------------------------------------------------------
+
+
+_ECHO = "import sys; print('out-line'); print('err-line', file=sys.stderr)"
+
+
+def _run_echo(ctx, **kwargs):
+    return ctx.run_root(
+        sys.executable, "-c", _ECHO, capture_output=True, text=True, **kwargs
+    )
+
+
+def test_should_stream_auto_needs_a_tty_and_captured_text(monkeypatch):
+    """Doc 08 §4.1's AUTO rule, stated as a table."""
+    captured_text = {"capture_output": True, "text": True}
+
+    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
+    assert app._should_stream(None, captured_text) is True
+    assert app._should_stream(None, {"capture_output": True}) is False
+    assert app._should_stream(None, {"text": True}) is False
+    assert app._should_stream(None, {}) is False
+    assert app._should_stream(False, captured_text) is False
+
+    monkeypatch.setattr(app, "_stderr_is_tty", lambda: False)
+    assert app._should_stream(None, captured_text) is False
+    # An explicit request still streams off a tty -- plain lines, per §7.
+    assert app._should_stream(True, captured_text) is True
+
+
+def test_should_stream_rejects_forcing_a_shape_the_tee_cannot_return():
+    with pytest.raises(ValueError):
+        app._should_stream(True, {"capture_output": True})
+    with pytest.raises(ValueError):
+        app._should_stream(True, {})
+
+
+def test_run_root_streams_to_the_progress_renderer_on_a_tty(tmp_path, monkeypatch):
+    ctx, recorder = _recording_ctx(tmp_path)
+    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
+
+    result = _run_echo(ctx)
+
+    assert result.returncode == 0
+    assert result.stdout == "out-line\n"
+    assert result.stderr == "err-line\n"
+    assert "out-line" in recorder.lines
+    assert "err-line" in recorder.lines
+
+
+def test_run_root_stream_false_suppresses_live_output(tmp_path, monkeypatch):
+    """The escape hatch in doc 08 §4.1: a probe whose output is noise."""
+    ctx, recorder = _recording_ctx(tmp_path)
+    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
+
+    result = _run_echo(ctx, stream=False)
+
+    assert result.stdout == "out-line\n"
+    assert result.stderr == "err-line\n"
+    assert recorder.lines == []
+
+
+def test_run_root_auto_does_not_stream_off_a_tty(tmp_path, monkeypatch):
+    ctx, recorder = _recording_ctx(tmp_path)
+    monkeypatch.setattr(app, "_stderr_is_tty", lambda: False)
+
+    result = _run_echo(ctx)
+
+    assert result.stdout == "out-line\n"
+    assert recorder.lines == []
+
+
+def test_run_root_returns_the_same_completedprocess_either_way(tmp_path, monkeypatch):
+    """The compatibility contract behind doc 08 §4.1: 72 `capture_output`
+    call sites and every test asserting on `.stdout` keep working because
+    the two paths return the same thing."""
+    ctx, _recorder = _recording_ctx(tmp_path)
+
+    monkeypatch.setattr(app, "_stderr_is_tty", lambda: False)
+    plain = _run_echo(ctx)
+    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
+    streamed = _run_echo(ctx)
+
+    assert isinstance(streamed, type(plain))
+    assert (streamed.returncode, streamed.stdout, streamed.stderr) == (
+        plain.returncode,
+        plain.stdout,
+        plain.stderr,
+    )
+
+
+def test_run_root_streaming_reports_a_nonzero_exit_the_same_way(tmp_path, monkeypatch):
+    ctx, _recorder = _recording_ctx(tmp_path)
+    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
+
+    result = ctx.run_root(
+        sys.executable,
+        "-c",
+        "import sys; sys.exit(3)",
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 3
+    assert result.stdout == ""
+
+
+def test_run_root_streaming_still_honours_check(tmp_path, monkeypatch):
+    import subprocess
+
+    ctx, _recorder = _recording_ctx(tmp_path)
+    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        ctx.run_root(
+            sys.executable,
+            "-c",
+            "import sys; sys.exit(3)",
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_run_root_streaming_passes_through_popen_kwargs(tmp_path, monkeypatch):
+    ctx, _recorder = _recording_ctx(tmp_path)
+    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
+
+    result = ctx.run_root(
+        sys.executable,
+        "-c",
+        "import os; print(os.getcwd())",
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == os.path.realpath(str(tmp_path))
+
+
+def test_run_root_missing_executable_still_127_when_streaming(tmp_path, monkeypatch):
+    """The `_missing_executable_result` path survives the new route: the
+    tee runner raises `FileNotFoundError` out of `Popen` exactly as
+    `subprocess.run` did."""
+    ctx, _recorder = _recording_ctx(tmp_path)
+    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
+
+    result = ctx.run_root(
+        "this-binary-does-not-exist-on-any-path",
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 127
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_stderr_is_tty_tolerates_a_substitute_stream(monkeypatch):
+    class _NoIsatty:
+        pass
+
+    class _Raising:
+        def isatty(self):
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr(sys, "stderr", _NoIsatty())
+    assert app._stderr_is_tty() is False
+    monkeypatch.setattr(sys, "stderr", _Raising())
+    assert app._stderr_is_tty() is False
+
+
+def test_run_root_streaming_redacts_the_terminal_not_the_parsed_buffer(
+    tmp_path, monkeypatch
+):
+    """Doc 08 §4.2: showing a command live must not be how a secret becomes
+    visible. The buffer a step parses is still the child's own text, the
+    way `subprocess.run` handed it over."""
+    ctx, recorder = _recording_ctx(tmp_path)
+    monkeypatch.setattr(app, "_stderr_is_tty", lambda: True)
+    monkeypatch.setenv("NGC_API_KEY", "nvapi-secret-value")
+
+    result = ctx.run_root(
+        sys.executable,
+        "-c",
+        "print('key is nvapi-secret-value')",
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout == "key is nvapi-secret-value\n"
+    assert recorder.lines == ["key is <redacted>"]
