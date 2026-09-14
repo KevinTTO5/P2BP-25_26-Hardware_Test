@@ -15,7 +15,9 @@ root" requirement (a dedicated test below does confirm that gate exists).
 
 from __future__ import annotations
 
+import io
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -1767,26 +1769,62 @@ def test_dispatch_takes_the_region_down_before_report_writes(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(
-    "outcome",
+    "outcome, printer",
     [
-        StepResult(status=StepStatus.REBOOT_REQUIRED, message="reboot pls"),
-        StepResult(status=StepStatus.USER_ACTION_REQUIRED, message="do a thing"),
-        StepResult(status=StepStatus.FAILED, message="boom"),
+        (
+            StepResult(status=StepStatus.REBOOT_REQUIRED, message="reboot pls"),
+            "show_reboot_required",
+        ),
+        (
+            StepResult(status=StepStatus.USER_ACTION_REQUIRED, message="do a thing"),
+            "show_user_action_block",
+        ),
+        (StepResult(status=StepStatus.FAILED, message="boom"), None),
     ],
     ids=["reboot", "user-action", "failed"],
 )
-def test_dispatch_ends_the_step_on_every_halting_status(
-    tmp_path, monkeypatch, capsys, outcome
+def test_dispatch_ends_the_step_before_every_halting_block(
+    tmp_path, monkeypatch, outcome, printer
 ):
     """Each halting branch prints its own block, so every one of them needs
-    the region down first -- not just the `COMPLETE` path."""
+    the region down first, not just the `COMPLETE` path.
+
+    Asserted as an ordering and not as a call count. A count is satisfied
+    just as happily when `end_step` runs *after* the block, which is the one
+    thing this test exists to rule out: on a tty that ordering tears the
+    block through with the erase. The technique is the one
+    `test_dispatch_takes_the_region_down_before_report_writes` uses, applied
+    to the three halting printers instead of to `report()`.
+    """
+    events: list[str] = []
+
+    class _OrderedRenderer(_RecordingRenderer):
+        def end_step(self):
+            events.append("end_step")
+            super().end_step()
+
     step = _DummyStep("step1_prerequisites", "Prerequisites", 1, verify=outcome)
-    ctx, cfg, sm, recorder = _dispatch_ctx(tmp_path, [step], monkeypatch)
+    ctx, cfg = _minimal_ctx(tmp_path)
+    recorder = _OrderedRenderer()
+    ctx.progress.renderer = recorder
+    monkeypatch.setattr(app, "STEP_REGISTRY", [step])
     monkeypatch.setattr(app.reboot_mod, "current_boot_id", lambda: "boot-abc")
+    sm = StateMachine(path=tmp_path / "state.json")
+
+    if printer is None:
+        # The FAILED branch has no block printer of its own; its one
+        # `log.error` line is the block.
+        monkeypatch.setattr(
+            app.log, "error", lambda *a, **k: events.append("block")
+        )
+    else:
+        monkeypatch.setattr(
+            app.privilege, printer, lambda *a, **k: events.append("block")
+        )
 
     app._dispatch(sm, ctx, cfg)
-    capsys.readouterr()
 
+    assert events == ["end_step", "block"]
     assert recorder.steps == [(1, "Prerequisites", ())]
     assert recorder.ended == 1
 
@@ -1810,23 +1848,64 @@ def test_dispatch_ends_the_step_when_a_step_raises(tmp_path, monkeypatch):
     assert recorder.ended == 1
 
 
-def test_dispatch_banner_degrades_to_a_plain_line_off_a_tty(
-    tmp_path, monkeypatch, capsys
+class _TtyStream(io.StringIO):
+    """A stream that claims to be a terminal, so a test can put the renderer
+    in live mode deliberately instead of depending on the harness."""
+
+    def isatty(self):
+        return True
+
+
+def test_dispatch_banner_degrades_to_a_plain_line_when_non_interactive(
+    tmp_path, monkeypatch
 ):
     """Doc 08 §7: a pipe, a CI run and `--non-interactive` all get the phase
-    line plain, and not one escape sequence. Exercised against the real
-    renderer, since it is the renderer that decides."""
+    line plain, and not one escape sequence.
+
+    The stream reports a tty, so `live` is false because of the flag and not
+    because pytest replaced stderr. Without that, the assertion passes on a
+    renderer that is drawing at full tilt: `_colour_enabled()` is false under
+    `capsys` whatever the renderer does, and a first draw emits no escape
+    anyway, so both halves of the old assertion held with live rendering on.
+    """
+    stream = _TtyStream()
+    monkeypatch.setattr(sys, "stderr", stream)
+
+    # The control: the same stream with the flag off really does put the
+    # renderer in live mode, so `live is False` below is the flag's doing.
+    live_ctx, _ = _minimal_ctx(tmp_path, non_interactive=False)
+    assert live_ctx.progress.renderer.live is True
+
     ctx, cfg = _minimal_ctx(tmp_path, non_interactive=True)
     assert ctx.progress.renderer.live is False
     step = _DummyStep("step1_prerequisites", "Prerequisites", 1)
     monkeypatch.setattr(app, "STEP_REGISTRY", [step])
     sm = StateMachine(path=tmp_path / "state.json")
 
+    stream.truncate(0)
+    stream.seek(0)
     assert app._dispatch(sm, ctx, cfg) == 0
 
-    err = capsys.readouterr().err
-    assert f"[ 1/{len(STEP_IDS)} ] Prerequisites" in err
-    assert "\033" not in err
+    written = stream.getvalue()
+    banner = f"[ 1/{len(STEP_IDS)} ] Prerequisites"
+    assert banner in written
+    # Exactly once: doc 08 §4.2's one-writer rule, and the shape defect 1 in
+    # §12.2 describes on the live path.
+    assert written.count(banner) == 1
+
+    # No cursor arithmetic: nothing moved the cursor up and nothing cleared
+    # below it, which is what a live region is made of and what §7 forbids
+    # here.
+    assert "\033[J" not in written
+    assert not re.search(r"\033\[\d+A", written)
+
+    # Not yet the stronger "not one escape sequence" §7 asks for: `logs`
+    # still colours its level label, because `logs._colour_enabled()` keys on
+    # `sys.stderr.isatty()` alone and never learns about `--non-interactive`.
+    # That is a `logs.py` defect, not a renderer one, and `logs.py` belongs to
+    # U5b; this assertion tightens to a bare `"\033" not in written` once it
+    # is fixed.
+    assert "\033[32m" in written
 
 
 # ---------------------------------------------------------------------------
