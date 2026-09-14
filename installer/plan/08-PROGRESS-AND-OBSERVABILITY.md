@@ -338,6 +338,18 @@ suppresses a line for rendering reasons uses it instead of dropping the line.
 The screen may show less than the transcript. The transcript may never show
 less than the screen.
 
+> **U12 is a release blocker, not merely a later unit.** The tee runner
+> (§4.2) must route each line to exactly one writer, or a line renders twice
+> and the raw copy tears through the live region's cursor arithmetic. With
+> no transcript-only sink, "exactly one writer" means a streamed line
+> reaches the renderer *instead of* the transcript. That is invisible while
+> nothing streams, and becomes a real loss the moment `run_root` starts
+> streaming — the transcript would then hold the phase sequence and the
+> reporting strings, but none of the command output an operator actually
+> needs to diagnose a failed install. **No release may ship streaming
+> without U12.** The two `record` call sites in the runner are where the
+> sink gets used.
+
 A related consistency rule: where a value is clamped for display (§5.1's
 overshoot case renders 100 percent of the declared total), the transcript
 must not mix the clamped and unclamped forms in the same run. Record the true
