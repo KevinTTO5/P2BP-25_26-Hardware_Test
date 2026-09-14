@@ -461,7 +461,7 @@ Open decision for the human:
 | U2 Phase declaration API on the step interface | `feat/installer-progress-phase-api` | `mv3dt_installer/steps/__init__.py`, `tests/test_steps_protocol.py` | — | 1 |
 | U3 Tee runner: stream, capture and redact in one pass | `feat/installer-progress-streaming` | `mv3dt_installer/shellout.py`, `tests/test_shellout.py` | U1 | 2 |
 | U4 `Context.progress` handle and streaming `run_root` | `feat/installer-progress-context` | `mv3dt_installer/app.py`, `tests/test_app.py` | U1, U2, U3 | 3 |
-| U5 Step and phase banner in the dispatch loop | `feat/installer-progress-banner` | `mv3dt_installer/app.py`, `tests/test_app.py` | U4 | 4 |
+| U5 Step and phase banner in the dispatch loop, and two defects below | `feat/installer-progress-banner` | `mv3dt_installer/app.py`, `tests/test_app.py`, `mv3dt_installer/progress.py`, `mv3dt_installer/logs.py`, their tests | U4, U12 | 5 |
 | U6 Download byte-progress adapter | `feat/installer-progress-downloads` | `mv3dt_installer/progress.py`, `tests/test_progress.py` | U1, U3 | 3 |
 | U7 apt `Status-Fd` percentage adapter | `feat/installer-progress-apt` | `mv3dt_installer/progress.py`, `tests/test_progress.py` | U6 | 4 |
 | U8 Phases and task naming, Steps 1-3 | `feat/installer-progress-steps-1-3` | `mv3dt_installer/steps/step1_prerequisites.py`, `step2_deepstream_sdk.py`, `step3_amc_launcher.py`, their tests | U5, U7 | 6 |
@@ -469,6 +469,33 @@ Open decision for the human:
 | U10 Failure context block and inferred-refusal evidence | `feat/installer-progress-failure-context` | `mv3dt_installer/report.py`, `tests/test_report.py` | U5 | 5 |
 | U11 Verbosity flag and doc 00 section 8 update | `feat/installer-progress-verbosity` | `mv3dt_installer/app.py`, `installer/plan/00-FRAMEWORK-AND-BOOTSTRAP.md`, `tests/test_app.py` | U5 | 5 |
 | U12 Transcript-only sink, so live rendering never costs the record | `feat/installer-progress-transcript-sink` | `mv3dt_installer/logs.py`, `tests/test_logs.py`, `mv3dt_installer/shellout.py`, `tests/test_shellout.py`, `mv3dt_installer/progress.py`, `tests/test_progress.py` | U3 | 4 |
+
+### 12.2 Known defects U5 carries
+
+Both were found in review of a unit that could not fix them, so they are
+recorded here rather than left in a PR comment.
+
+1. **The step banner prints twice on a tty.** `Progress.begin_step` calls
+   `log.info(banner)` and then writes the same banner to its own output
+   stream. When that stream is stderr, which is the default and what the
+   installer uses, the operator sees it twice. Measured, not inferred. The
+   one-writer rule in §4.2 applies here as much as to a streamed line: the
+   transcript copy should go through the transcript-only sink U12 adds
+   (§7.1), leaving exactly one write to the screen.
+2. **`logs._ANSI_RE` is narrower than `progress.sanitise`.** It matches
+   plain CSI and OSC but misses lone `ESC`, C1 forms (`\x9b`, `\x9d`), bare
+   `BEL`, `CR`, backspace, `NUL` and `DEL`. It is safe today because both of
+   U12's callers pre-sanitise, but `_emit` shares the same strip, and two
+   step call sites pass raw command output straight into `log.info`
+   (`step1_prerequisites.py` for `nvidia-smi`, `step2_deepstream_sdk.py` for
+   an stderr tail), so those still carry C1 and `CR` into the transcript.
+   `progress` imports `logs`, so `sanitise` cannot be reused without a
+   cycle; widening the local class to `[\x00-\x08\x0b-\x1f\x7f-\x9f]`
+   alongside the escape pattern closes it. The comment above it currently
+   claims a guarantee the regex does not deliver, which is the part that
+   most needs fixing: a wrong comment outlives a narrow regex.
+
+---
 
 ### 12.1 Serialization points
 
