@@ -46,11 +46,18 @@ Three properties this module owes its callers:
    write either: `apt`, `dpkg` and `curl` colour and carriage-return their
    own output, so everything a caller hands in is sanitised on the way in.
 3. **The phase sequence survives in the transcript (section 3.3).** Every
-   phase transition emits a `log.info` line whether or not anything is
-   being drawn, because a post-mortem of a failed install has only the
+   phase transition reaches the record whether or not anything is being
+   drawn, because a post-mortem of a failed install has only the
    transcript to work from. A line this module suppresses to protect the
    live region goes to `logs.transcript` instead of being dropped (section
    7.1): the screen may show less than the transcript, never the reverse.
+4. **One writer per line, and one owner of the cursor (section 4.2).** A
+   line the region draws is not printed a second time, or the operator
+   sees it twice and the second copy moves a cursor the region is
+   counting rows on. The same hazard applies to log calls this module
+   never makes: a live renderer registers itself with `logs` so that a
+   step's own `log.info` scrolls above the region instead of through it
+   (section 12.2 defect 3).
 
 The renderer never sleeps and starts no thread, so there is no `sleep` to
 inject: the caller drives redraws by calling `tick()`, and `clock` is
@@ -72,7 +79,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Iterable, List, Sequence
 
-from .logs import log, transcript
+from .logs import log, set_live_writer, transcript
 
 __all__ = [
     "Progress",
@@ -478,6 +485,14 @@ class Progress:
         self._last_line: str | None = None
         self._frame = 0
         self._drawn = 0
+        # Bound once, because a bound method is rebuilt on every attribute
+        # access: registering `self._write_around_region` twice registers
+        # two unequal-by-identity objects, and nothing could ever un-claim
+        # the stream again.
+        self._writer = self._write_around_region
+        self._writing_foreign = False
+
+        self._claim_stream()
 
     @property
     def live(self) -> bool:
@@ -498,6 +513,11 @@ class Progress:
         """Announce a step and adopt its declared phase labels (3.1)."""
         self._close_phase()
         self._erase()
+        # A step is where a region opens, so this is where ownership of the
+        # cursor is asserted. `__init__` registers too; re-asserting here
+        # settles it in favour of the renderer that is actually drawing,
+        # should a second one ever be built on the same stream.
+        self._claim_stream()
 
         self._step_index = int(index)
         self._step_title = title
@@ -509,7 +529,7 @@ class Progress:
         self._reset_task()
 
         banner = render_step_banner(index, self._total_steps, title)
-        log.info(banner)
+        self._record(banner)
         if self._live:
             _write(self._out, "\n" + banner + "\n\n")
 
@@ -676,9 +696,9 @@ class Progress:
         self._phase_label = label
         self._phase_started = self._clock()
 
-        # Section 3.3: drawn or not, the transition is logged, so the
-        # transcript carries the full phase sequence of a run.
-        log.info(f"{self._position()}: {label}")
+        # Section 3.3: drawn or not, the transition reaches the record, so
+        # the transcript carries the full phase sequence of a run.
+        self._record(f"{self._position()}: {label}")
         self._draw()
 
     def _close_phase(self) -> None:
@@ -692,10 +712,74 @@ class Progress:
             return
 
         self._completed.append((label, elapsed))
-        log.info(f"{self._position()} done: {label} ({format_duration(elapsed)})")
+        self._record(
+            f"{self._position()} done: {label} ({format_duration(elapsed)})"
+        )
         if self._live:
             self._erase()
             _write(self._out, render_phase_done(label, elapsed) + "\n")
+
+    def _record(self, message: str) -> None:
+        """Put one line in the record, and on screen only if nothing draws it.
+
+        The transcript gets it either way, which is what sections 3.3 and
+        7.1 require of a phase transition: the screen may show less than
+        the transcript, the transcript may never show less than the
+        screen. The screen gets it from `log.info` only when there is no
+        live region, because on a tty the region already draws this line
+        and a second write of the same text is both a duplicate the
+        operator reads twice and a foreign write to the cursor the region
+        is counting rows on (section 4.2, section 12.2 defect 1).
+        """
+        if self._live:
+            transcript("info", message)
+        else:
+            log.info(message)
+
+    def _claim_stream(self) -> None:
+        """Route `logs`' printed lines through this renderer (12.2 defect 3).
+
+        A live region is erased by counting the rows it drew and moving the
+        cursor up that many, so a log line written straight to the same
+        stream moves the cursor without this renderer knowing: the count is
+        then short by however many rows that line took, and the clear-below
+        eats real output. The seven step modules hold 121 direct log calls
+        between them, so this is the common case rather than a corner of
+        it. Only a live renderer claims the stream; off a tty there is no
+        cursor arithmetic to protect and `logs` keeps printing for itself.
+        """
+        if self._live:
+            set_live_writer(self._out, self._writer)
+
+    def _write_around_region(self, level: str, text: str) -> None:
+        """Write one line that did not come from here, above the region.
+
+        The `line()` verbose path's sandwich, reused: erase the region,
+        let the line scroll into place as permanent output, redraw. Both
+        halves are no-ops off a tty, so this degrades to a plain write.
+
+        An error is the exception, and it is the whole point of taking the
+        level. `die()` logs and exits, and the dispatch loop logs a FAILED
+        step and moves on, so redrawing underneath either one leaves a
+        spinner frozen below the fatal line as the last thing the operator
+        sees. The region comes down instead and stays down until something
+        draws again, so the error is the bottom of the screen.
+        """
+        if self._writing_foreign:
+            # Nothing on the `_draw` path logs today, so this cannot
+            # happen; if a future helper ever logs, it degrades to a plain
+            # write rather than recursing until the stack runs out.
+            _write(self._out, text + "\n")
+            return
+
+        self._writing_foreign = True
+        try:
+            self._erase()
+            _write(self._out, text + "\n")
+            if level != "error":
+                self._draw()
+        finally:
+            self._writing_foreign = False
 
     def _position(self) -> str:
         where = f"phase {self._phase_number}/{len(self._phases)}"

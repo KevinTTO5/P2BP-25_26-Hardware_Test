@@ -45,6 +45,16 @@ def _force_no_colour(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_live_writer():
+    """A live renderer registers itself with `logs`; none may outlive its
+    test. The registration is scoped to the stream it was made for, so a
+    stale one is inert anyway, but nothing here depends on that."""
+    logs.clear_live_writer()
+    yield
+    logs.clear_live_writer()
+
+
+@pytest.fixture(autouse=True)
 def _forbid_real_sleep(monkeypatch):
     """No test in this file may block on the real clock."""
 
@@ -108,6 +118,51 @@ def _last_frame(out: FakeTty) -> list[str]:
         if lines[index].startswith("  ▸ "):
             return lines[index:]
     return lines
+
+
+# Cursor-up and clear-below, the two escapes the renderer erases with.
+_CSI = re.compile(r"\033\[(\d*)([A-Za-z])")
+
+
+def _screen(raw: str) -> list[str]:
+    """Replay a byte stream the way a terminal would, and return its rows.
+
+    A StringIO accumulates everything ever written to it, including text
+    the renderer went on to erase, so it cannot answer "is this line still
+    on screen". This applies the cursor moves instead: `ESC[nA` walks up n
+    rows, `ESC[J` clears from the cursor to the end of the screen, and
+    everything else is written at the cursor. Colour is ignored -- it does
+    not move the cursor.
+    """
+    rows = [""]
+    row = col = 0
+    index = 0
+    while index < len(raw):
+        match = _CSI.match(raw, index)
+        if match:
+            count = int(match.group(1) or 1)
+            code = match.group(2)
+            if code == "A":
+                row = max(row - count, 0)
+            elif code == "J":
+                rows[row] = rows[row][:col]
+                del rows[row + 1 :]
+            index = match.end()
+            continue
+        char = raw[index]
+        index += 1
+        if char == "\n":
+            row += 1
+            col = 0
+            while len(rows) <= row:
+                rows.append("")
+        elif char == "\r":
+            col = 0
+        else:
+            line = rows[row].ljust(col)
+            rows[row] = line[:col] + char + line[col + 1 :]
+            col += 1
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -430,8 +485,17 @@ def test_a_step_without_declared_phases_still_renders_and_ends_cleanly():
     assert "✓" not in rendered
 
 
-def test_phase_transitions_are_logged_even_while_they_are_drawn(capsys):
-    """Section 3.3: the transcript carries the phase sequence regardless."""
+def test_phase_transitions_are_recorded_even_while_they_are_drawn(
+    tmp_path, capsys
+):
+    """Section 3.3: the record carries the phase sequence regardless.
+
+    On a tty the region draws every one of these lines, so the copy that
+    keeps the record complete is the transcript-only one and nothing is
+    printed a second time (section 4.2, section 12.2 defect 1). This test
+    asserted `log.info`'s screen copy before that defect was fixed.
+    """
+    run_file = logs.open_transcript(log_dir=tmp_path / "logs")
     out, clock = FakeTty(), FakeClock()
     bar = _tty_progress(clock, out)
 
@@ -440,11 +504,12 @@ def test_phase_transitions_are_logged_even_while_they_are_drawn(capsys):
     clock.advance(12)
     bar.phase(2)
 
-    err = capsys.readouterr().err
-    assert "[ 1/7 ] Prerequisites" in err
-    assert "step 1/7 phase 1/3: base packages" in err
-    assert "step 1/7 phase 1/3 done: base packages (12s)" in err
-    assert "step 1/7 phase 2/3: CUDA repo and toolkit" in err
+    recorded = run_file.read_text(encoding="utf-8")
+    assert "[ 1/7 ] Prerequisites" in recorded
+    assert "step 1/7 phase 1/3: base packages" in recorded
+    assert "step 1/7 phase 1/3 done: base packages (12s)" in recorded
+    assert "step 1/7 phase 2/3: CUDA repo and toolkit" in recorded
+    assert capsys.readouterr().err == ""
 
 
 def test_phase_lines_reach_the_transcript_without_control_characters(tmp_path):
@@ -461,6 +526,273 @@ def test_phase_lines_reach_the_transcript_without_control_characters(tmp_path):
     assert "\033" not in transcript
     assert "\r" not in transcript
     assert "step 1/7 phase 1/3 done: base packages (12s)" in transcript
+
+
+# ---------------------------------------------------------------------------
+# Progress -- one writer per line, one owner of the cursor (section 12.2)
+#
+# Every test here puts the renderer and `logs` on the *same* stream, which
+# is the installer's real arrangement (stderr) and the one the two defects
+# need: with two different streams nothing can double up and nothing can
+# move a cursor the other is counting rows on.
+# ---------------------------------------------------------------------------
+
+
+def _stderr_progress(monkeypatch, screen, clock, **kwargs) -> progress.Progress:
+    """A renderer drawing to the same stream `logs` prints to."""
+    monkeypatch.setattr(sys, "stderr", screen)
+    kwargs.setdefault("terminal_width", lambda: _COLUMNS)
+    return progress.Progress(
+        total_steps=7, out=sys.stderr, clock=clock, **kwargs
+    )
+
+
+def test_the_step_banner_reaches_a_tty_exactly_once(tmp_path, monkeypatch):
+    """Section 12.2 defect 1, counted rather than inferred.
+
+    `begin_step` used to `log.info` the banner and then draw the same text
+    to its own stream. Both are stderr in a real run, so the operator read
+    the banner twice; the transcript copy now goes through the
+    transcript-only sink instead (section 7.1).
+    """
+    screen, clock = FakeTty(), FakeClock()
+    run_file = logs.open_transcript(log_dir=tmp_path / "logs")
+    bar = _stderr_progress(monkeypatch, screen, clock)
+
+    bar.begin_step(3, "DeepStream SDK", _PHASES)
+
+    banner = progress.render_step_banner(3, 7, "DeepStream SDK")
+    assert screen.getvalue().count(banner) == 1
+    assert banner in run_file.read_text(encoding="utf-8")
+
+
+def test_a_phase_transition_is_drawn_on_a_tty_and_not_printed_as_well(
+    tmp_path, monkeypatch
+):
+    """The same defect in `_start_phase` and `_close_phase`.
+
+    Their text is the position line, which the region states in its own
+    form (an active row, then a collapsed one), so on a tty the printed
+    copy was pure duplication. It has to stay in the record, though:
+    section 3.3 wants every transition in the transcript.
+    """
+    screen, clock = FakeTty(), FakeClock()
+    run_file = logs.open_transcript(log_dir=tmp_path / "logs")
+    bar = _stderr_progress(monkeypatch, screen, clock)
+
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(1)
+    clock.advance(12)
+    bar.phase(2)
+
+    written = screen.getvalue()
+    recorded = run_file.read_text(encoding="utf-8")
+    for line in (
+        "step 1/7 phase 1/3: base packages",
+        "step 1/7 phase 1/3 done: base packages (12s)",
+        "step 1/7 phase 2/3: CUDA repo and toolkit",
+    ):
+        assert written.count(line) == 0
+        assert line in recorded
+    # The region still says where the run is, in its own vocabulary.
+    assert "✓ base packages" in _ANSI.sub("", written)
+
+
+def test_a_foreign_log_line_is_not_eaten_by_the_next_erase(monkeypatch):
+    """Section 12.2 defect 3, measured on an emulated screen.
+
+    A step's own `log.info` goes to stderr, which is where the region is
+    drawn. Before the fix that write moved the cursor down one row without
+    the renderer knowing, so the next erase moved up one row too few and
+    the clear-below consumed the log line itself. Step 5 alone makes 45 of
+    these calls.
+    """
+    screen, clock = FakeTty(), FakeClock()
+    bar = _stderr_progress(monkeypatch, screen, clock)
+
+    bar.begin_step(5, "Per-project executables", _PHASES)
+    bar.phase(1)
+    logs.log.info("created /opt/mv3dt/projects/demo")
+    bar.tick()
+    bar.tick()
+
+    rows = [_ANSI.sub("", row) for row in _screen(screen.getvalue())]
+    assert any("created /opt/mv3dt/projects/demo" in row for row in rows)
+
+
+def test_a_foreign_log_line_leaves_the_live_region_below_it(monkeypatch):
+    """The line scrolls above the region; the region is redrawn under it.
+
+    The `line()` verbose path's sandwich, so the operator keeps both the
+    permanent line and a region that still tracks the run.
+    """
+    screen, clock = FakeTty(), FakeClock()
+    bar = _stderr_progress(monkeypatch, screen, clock)
+
+    bar.begin_step(5, "Per-project executables", _PHASES)
+    bar.phase(1)
+    logs.log.warn("config/demo.yml already exists, leaving it alone")
+    bar.tick()
+
+    rows = [_ANSI.sub("", row) for row in _screen(screen.getvalue())]
+    warned = next(
+        index
+        for index, row in enumerate(rows)
+        if "config/demo.yml already exists" in row
+    )
+    active = next(
+        index for index, row in enumerate(rows) if row.startswith("  ▸ ")
+    )
+    assert active > warned
+
+
+def test_a_foreign_log_line_still_reaches_the_transcript(tmp_path, monkeypatch):
+    """Routing the printed copy must not cost the recorded one (section 7.1)."""
+    screen, clock = FakeTty(), FakeClock()
+    run_file = logs.open_transcript(log_dir=tmp_path / "logs")
+    bar = _stderr_progress(monkeypatch, screen, clock)
+
+    bar.begin_step(5, "Per-project executables", _PHASES)
+    logs.log.error("no such project: demo")
+
+    assert "[error] no such project: demo" in run_file.read_text(
+        encoding="utf-8"
+    )
+
+
+def _visible(screen: FakeTty) -> list[str]:
+    """The rows still on screen, stripped of colour and trailing blanks."""
+    rows = [_ANSI.sub("", row).rstrip() for row in _screen(screen.getvalue())]
+    while rows and not rows[-1]:
+        rows.pop()
+    return rows
+
+
+def test_a_fatal_error_is_the_last_thing_on_the_screen(monkeypatch):
+    """An error takes the region down with it.
+
+    `die` logs and exits, so anything drawn after the error line is the
+    last thing the operator ever sees: a bar and a spinner frozen at
+    whatever frame they happened to be on, under the message explaining
+    that the install is over. The region comes down instead.
+    """
+    screen, clock = FakeTty(), FakeClock()
+    bar = _stderr_progress(monkeypatch, screen, clock)
+    bar.begin_step(2, "DeepStream SDK", _PHASES)
+    bar.phase(1)
+    bar.task("apt-get install deepstream-7.1")
+
+    with pytest.raises(SystemExit):
+        logs.die("apt-get returned 100")
+
+    rows = _visible(screen)
+    assert rows[-1] == "[error] apt-get returned 100"
+    assert not any(
+        frame in row for row in rows[-3:] for frame in progress.SPINNER_FRAMES
+    )
+
+
+def test_a_failed_step_does_not_leave_a_frozen_region_below_it(monkeypatch):
+    """The dispatch loop's FAILED branch has the same shape as `die`.
+
+    It logs the failure and returns without an `end_step()`, so the same
+    rule has to hold for a plain `log.error` and not only for `die`.
+    """
+    screen, clock = FakeTty(), FakeClock()
+    bar = _stderr_progress(monkeypatch, screen, clock)
+    bar.begin_step(2, "DeepStream SDK", _PHASES)
+    bar.phase(1)
+
+    logs.log.error("step 2 failed: NGC login rejected the API key")
+
+    rows = _visible(screen)
+    assert rows[-1] == "[error] step 2 failed: NGC login rejected the API key"
+
+
+def test_a_warning_still_leaves_the_region_drawing_below_it(monkeypatch):
+    """Only an error ends the run, so only an error ends the region."""
+    screen, clock = FakeTty(), FakeClock()
+    bar = _stderr_progress(monkeypatch, screen, clock)
+    bar.begin_step(2, "DeepStream SDK", _PHASES)
+    bar.phase(1)
+
+    logs.log.warn("no NGC key configured, skipping the login check")
+
+    rows = _visible(screen)
+    assert rows[-1] != "[warn ] no NGC key configured, skipping the login check"
+    assert any(row.startswith("  ▸ ") for row in rows)
+
+
+def test_the_region_comes_back_when_the_run_carries_on_after_an_error(
+    monkeypatch
+):
+    """Down is not gone: a step that logs an error and keeps working gets
+    its region back on the next redraw."""
+    screen, clock = FakeTty(), FakeClock()
+    bar = _stderr_progress(monkeypatch, screen, clock)
+    bar.begin_step(2, "DeepStream SDK", _PHASES)
+    bar.phase(1)
+
+    logs.log.error("retrying the download")
+    bar.tick()
+
+    rows = _visible(screen)
+    error_at = rows.index("[error] retrying the download")
+    assert any(row.startswith("  ▸ ") for row in rows[error_at:])
+
+
+def test_the_stream_can_be_given_back_by_naming_the_renderer_s_writer(
+    monkeypatch
+):
+    """The un-claim path, with the callable a renderer actually registers.
+
+    `Progress` binds its writer once, because a bound method read twice is
+    two objects: registering the attribute directly would leave nothing
+    able to name the registration afterwards.
+    """
+    screen, clock = FakeTty(), FakeClock()
+    bar = _stderr_progress(monkeypatch, screen, clock)
+    bar.begin_step(2, "DeepStream SDK", _PHASES)
+
+    logs.clear_live_writer(bar._writer)
+    screen.truncate(0)
+    screen.seek(0)
+    logs.log.info("straight to the stream now")
+
+    assert _ANSI.sub("", screen.getvalue()) == (
+        "[info ] straight to the stream now\n"
+    )
+
+
+def test_a_renderer_off_a_tty_leaves_logs_printing_for_itself(monkeypatch):
+    """Nothing is drawn, so there is no cursor arithmetic to protect."""
+    screen, clock = FakeTty(), FakeClock()
+    bar = _stderr_progress(monkeypatch, screen, clock, non_interactive=True)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    screen.truncate(0)
+    screen.seek(0)
+
+    logs.log.info("plain line")
+
+    # Colour is `logs`' own business (and argv's, section 12.2 defect 4);
+    # what matters here is that no erase or redraw wrapped the line.
+    assert _ANSI.sub("", screen.getvalue()) == "[info ] plain line\n"
+
+
+def test_a_renderer_drawing_elsewhere_does_not_capture_the_log_stream(capsys):
+    """The claim is scoped to the stream it was made for.
+
+    A renderer drawing to a file, a pipe or a test double shares no cursor
+    with `logs`, so log lines keep going to stderr untouched.
+    """
+    out, clock = FakeTty(), FakeClock()
+    _tty_progress(clock, out).begin_step(1, "Prerequisites", _PHASES)
+    capsys.readouterr()
+
+    logs.log.info("goes to stderr, not into the region")
+
+    assert "goes to stderr, not into the region" in capsys.readouterr().err
+    assert "goes to stderr" not in out.getvalue()
 
 
 # ---------------------------------------------------------------------------
