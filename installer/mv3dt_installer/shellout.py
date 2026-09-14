@@ -44,7 +44,10 @@ Four properties this module owes its callers:
    for a given line -- the renderer when there is one, `logs.log` when there
    is not, nobody under `stream=False` -- because a second raw write to the
    same stream duplicates the line and tears through the live region's
-   cursor arithmetic. Control characters are stripped with
+   cursor arithmetic. The transcript is not the terminal, so it is outside
+   that count: every line reaches it in every mode (doc 08 §7.1), via
+   `logs.log` where that writes the terminal anyway and `logs.transcript`
+   where nothing does. Control characters are stripped with
    `progress.sanitise` and nothing else: this module deliberately keeps no
    stripper of its own, so there is one definition of "clean" rather than
    two that agree today and drift later.
@@ -92,7 +95,7 @@ import time
 from typing import Any, Mapping, Protocol, Sequence
 
 from . import progress
-from .logs import log
+from .logs import log, transcript
 
 # Default prefix for the run-scoped staging directory created by
 # stage_assets() / run_bundled_script().
@@ -229,6 +232,13 @@ class LineSink(Protocol):
 _STDOUT = "stdout"
 _STDERR = "stderr"
 
+# The level each stream's output is recorded under, whichever sink carries
+# it. A child's stderr is not necessarily an error, but it is the half an
+# operator reads first when a step fails, and warn is the level this module
+# has always given it. One mapping rather than two, so a transcript line
+# cannot come out labelled differently depending on who wrote it.
+_LEVELS = {_STDOUT: "info", _STDERR: "warn"}
+
 # How long to wait for a reader thread to notice a killed child before giving
 # up on it. The threads are daemons, so a wedged reader can never hold the
 # installer open; this only keeps the ordinary case tidy.
@@ -357,13 +367,16 @@ def run_streamed(
       before streaming existed, so `run_bundled_script` keeps the behaviour
       it has always had.
     - nobody, under `stream=False`. The escape hatch for a probe whose
-      output would be noise: it is captured and returned, and that is all.
+      output would be noise: it is shown to no one, captured and returned.
 
-    Known gap, to close with U12 (doc 08 §7.1): a streamed line does not
-    reach the transcript, because `logs` has no transcript-only sink yet and
-    its one writer also prints to stderr. U12 adds that sink; the fix here is
-    the two `_record` calls below. No call site streams with a renderer until
-    U4, so nothing regresses in the meantime.
+    **The transcript is not one of those writers** (doc 08 §7.1). It is a
+    file, not the terminal, so recording a line there duplicates nothing and
+    disturbs no cursor arithmetic -- and a run that shows less on screen must
+    not therefore hold less in the record. Where `logs.log` writes the
+    terminal it appends to the transcript as it always did; on the other two
+    paths `logs.transcript` appends without printing, so a line the renderer
+    drew and a line `stream=False` showed nobody are both in the record an
+    operator reads after a failed install.
 
     **Redaction comes first.** Each line is scrubbed by value and by key (see
     the module docstring) before it reaches the terminal or the transcript.
@@ -418,12 +431,13 @@ def run_streamed(
         label = os.path.basename(str(command[0])) if command else "command"
 
     sink = _resolve_sink(renderer, stream=stream, verbose=verbose, out=out)
-    # `logs` writes the terminal and the transcript together, so it is only
-    # safe to call when nothing else is writing the terminal, and only when
-    # the caller did not ask for silence.
+    # `logs.log` writes the terminal and the transcript together, so it is
+    # only safe to call when nothing else is writing the terminal, and only
+    # when the caller did not ask for silence. Where it is not called, the
+    # transcript-only sink takes the line instead -- see `_consume`.
     record: dict | None = None
     if sink is None and stream:
-        record = {_STDOUT: log.info, _STDERR: log.warn}
+        record = {name: getattr(log, level) for name, level in _LEVELS.items()}
     stdin = subprocess.PIPE if input is not None else popen_kwargs.pop("stdin", None)
 
     proc = subprocess.Popen(
@@ -474,10 +488,17 @@ def run_streamed(
         # sanitises its own input too, and that second pass is a no-op on an
         # already-clean string.
         rendered = progress.sanitise(scrubbed)
+        recorded = f"[{label}] {rendered}"
         if sink is not None:
             sink.line(rendered)
-        elif record is not None:
-            record[name](f"[{label}] {rendered}")
+        if record is not None:
+            # Terminal and transcript in one call, as before.
+            record[name](recorded)
+        else:
+            # Nothing wrote the terminal that `logs.log` may write too -- the
+            # renderer owns it, or `stream=False` asked for silence. Silence
+            # was asked of the screen, never of the record (doc 08 §7.1).
+            transcript(_LEVELS[name], recorded)
 
     def _drain() -> None:
         """Consume whatever the readers queued before the child was killed.
