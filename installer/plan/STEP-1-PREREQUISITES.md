@@ -56,7 +56,7 @@ DeepStream SDK, ensure you have Ubuntu 24.04, GStreamer 1.24.2, NVIDIA driver
 |-----------|----------------|----------------|----------------|----------------------------------|
 | NVIDIA driver | `595.58.03` | `.run` installer (`NVIDIA-Linux-x86_64-595.58.03.run`) | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` | `verify_pinned("NVIDIA driver", <actual>, "595.58.03")` |
 | CUDA Toolkit | `13.2` (`cuda-toolkit-13-2`) | NVIDIA `ubuntu2404/x86_64` apt repo | `/usr/local/cuda-13.2/bin/nvcc --version` → `release X.Y` | `verify_pinned("CUDA (nvcc release)", <actual>, "13.2")` |
-| cuDNN | `9.20.0.48` (apt `9.20.0.48-1`) | NVIDIA CUDA 13 apt packages | `dpkg-query -W -f='${Version}' libcudnn9-cuda-13` | `verify_pinned("cuDNN (libcudnn9-cuda-13)", <actual>, "9.20.0.48-1")` |
+| cuDNN | `9.20.0.48` (apt `9.20.0.48-1`) | NVIDIA CUDA 13 apt packages | `dpkg-query -W -f='${Version}' libcudnn9-cuda-13` | `verify_pinned("cuDNN (libcudnn9-cuda-13)", <normalized>, "9.20.0.48")` |
 | TensorRT | `10.16.0.72-1+cuda13.2` | apt (all `libnvinfer*` pinned) | `dpkg -l \| grep libnvinfer10` | `verify_pinned("TensorRT (libnvinfer10)", <actual>, "10.16.0.72-1+cuda13.2")` |
 | GStreamer | `1.24.2` | apt (`gstreamer1.0-*`) | `gst-inspect-1.0 --version` | `verify_pinned("GStreamer", <actual>, "1.24.2")` |
 | OS | Ubuntu 24.04 / `x86_64` | (precondition) | `lsb_release -rs`, `uname -m` | preflight check, not `verify_pinned` |
@@ -84,7 +84,10 @@ concrete `libcudnn9-cuda-13` runtime package to apt version `9.20.0.48-1`.
 Pinning both meta-package layers prevents their greater-than-or-equal
 dependency from resolving a newer cuDNN release. The concrete runtime package
 is the presence and version probe; the virtual `libcudnn9` name and shell
-globs are not valid install or verification targets on Ubuntu 24.04.
+globs are not valid install or verification targets on Ubuntu 24.04. The
+probe normalizes only the exact apt value `9.20.0.48-1` to the DeepStream
+component pin `9.20.0.48`; a different Debian revision remains unnormalized
+and fails verification. Dependency reporting uses the component pin.
 
 ### 2.2 Reporting each pin
 
@@ -98,7 +101,9 @@ strings from
   `already installed <dependency> version <version>`
 
 The "already installed" path is taken when a probe (see §7.2) finds the
-component present **at the exact pinned version**. Examples:
+component present **at the exact pinned version**. A transaction that upgrades
+or otherwise changes an existing package reports `installed`, not `already
+installed`. Examples:
 
 ```
 installed cuda-toolkit-13-2 version 13.2
@@ -647,7 +652,8 @@ nvidia-smi --query-gpu=driver_version --format=csv,noheader
 /usr/local/cuda-13.2/bin/nvcc --version   (parse "release X.Y")
         -> verify_pinned("CUDA (nvcc release)", <out>, "13.2")
 dpkg-query -W -f='${Version}' libcudnn9-cuda-13
-        -> verify_pinned("cuDNN (libcudnn9-cuda-13)", <out>, "9.20.0.48-1")
+        -> normalize exact "9.20.0.48-1" to "9.20.0.48"
+        -> verify_pinned("cuDNN (libcudnn9-cuda-13)", <normalized>, "9.20.0.48")
 dpkg -s libnvinfer10   (Version:)
         -> verify_pinned("TensorRT (libnvinfer10)", <out>, "10.16.0.72-1+cuda13.2")
 gst-inspect-1.0 --version   (parse "version X.Y.Z")
@@ -793,7 +799,9 @@ Step 1 is `COMPLETE` iff **all** of these pass:
 - [ ] `nvidia-smi` runs (driver loaded) and driver_version == `595.58.03`.
 - [ ] `/usr/local/cuda-13.2/bin/nvcc --version` release == `13.2`; new shells
       also receive CUDA on `PATH` via `/etc/profile.d/cuda.sh`.
-- [ ] `dpkg-query -W -f='${Version}' libcudnn9-cuda-13` == `9.20.0.48-1`.
+- [ ] `dpkg-query -W -f='${Version}' libcudnn9-cuda-13` is exactly apt
+      `9.20.0.48-1`, normalized to the DeepStream pin `9.20.0.48` for the
+      verification and dependency report.
 - [ ] `dpkg -s libnvinfer10` Version == `10.16.0.72-1+cuda13.2` (and the full
       `libnvinfer*` set from §2.1 all at that version).
 - [ ] `gst-inspect-1.0 --version` == `1.24.2`.

@@ -779,6 +779,21 @@ def test_apt_install_reported_uses_pinned_apt_args_for_tensorrt(tmp_path):
         assert (pkg, s1.TENSORRT_VERSION) in ctx.installed
 
 
+def test_apt_install_reported_reports_upgrade_as_installed(tmp_path):
+    package = s1.TENSORRT_PACKAGES[0]
+    ctx, _ = _make_ctx(tmp_path, dpkg_versions={package: "10.0.0"})
+
+    result = s1._apt_install_reported(
+        ctx,
+        [package],
+        apt_args=[f"{package}={s1.TENSORRT_VERSION}"],
+    )
+
+    assert result is None
+    assert (package, s1.TENSORRT_VERSION) in ctx.installed
+    assert ctx.already_installed == []
+
+
 def test_launch_a_apt_failure_stops_before_cuda_and_does_not_report(tmp_path):
     ctx, runner = _make_ctx(tmp_path, apt_fail_on="build-essential")
 
@@ -836,6 +851,7 @@ def test_launch_b_pins_cudnn_version_at_apt_install(tmp_path):
         f"{pkg}={s1.CUDNN_APT_VERSION}" in cudnn_call for pkg in s1.CUDNN_PACKAGES
     )
     assert not any("*" in arg for arg in cudnn_call)
+    assert all((pkg, s1.CUDNN_VERSION) in ctx.installed for pkg in s1.CUDNN_PACKAGES)
 
 
 def test_launch_b_recovers_missing_cuda_and_writes_profile(tmp_path):
@@ -901,6 +917,21 @@ def test_launch_b_cudnn_failure_stops_without_reporting_or_mosquitto(
     assert all(version != "unknown" for _, version in ctx.installed)
 
 
+def test_launch_b_rejects_wrong_cudnn_revision_after_apt(tmp_path):
+    ctx, _ = _make_ctx(
+        tmp_path,
+        driver_version=s1.DRIVER_VERSION,
+        nvcc_release=s1.CUDA_VERSION,
+        cudnn_install_result=f"{s1.CUDNN_VERSION}-2",
+    )
+
+    result = s1.Step1Prerequisites()._run_launch_b(ctx)
+
+    assert result.status is StepStatus.FAILED
+    assert s1.CUDNN_APT_VERSION in result.message
+    assert not any(pkg in s1.CUDNN_PACKAGES for pkg, _ in ctx.installed)
+
+
 def test_verify_probes_nvcc_at_pinned_absolute_path(tmp_path, monkeypatch):
     ctx, runner = _make_ctx(
         tmp_path,
@@ -944,6 +975,36 @@ def test_verify_complete_when_every_pin_matches(tmp_path, monkeypatch):
     result = s1.Step1Prerequisites().verify(ctx)
 
     assert result.status is StepStatus.COMPLETE
+
+
+def test_cudnn_probe_normalizes_only_the_exact_apt_revision(tmp_path):
+    ctx, runner = _make_ctx(
+        tmp_path,
+        dpkg_versions={s1.CUDNN_QUERY_PACKAGE: s1.CUDNN_APT_VERSION},
+    )
+
+    assert s1._cudnn_installed_version(ctx) == s1.CUDNN_VERSION
+
+    runner.dpkg_versions[s1.CUDNN_QUERY_PACKAGE] = f"{s1.CUDNN_VERSION}-2"
+    assert s1._cudnn_installed_version(ctx) == f"{s1.CUDNN_VERSION}-2"
+
+
+def test_verify_rejects_wrong_cudnn_debian_revision(tmp_path, monkeypatch):
+    versions = _fully_pinned_versions()
+    versions[s1.CUDNN_QUERY_PACKAGE] = f"{s1.CUDNN_VERSION}-2"
+    ctx, _ = _make_ctx(
+        tmp_path,
+        driver_version=s1.DRIVER_VERSION,
+        nvcc_release=s1.CUDA_VERSION,
+        gstreamer_version=s1.GSTREAMER_VERSION,
+        dpkg_versions=versions,
+        mosquitto_active=True,
+    )
+    monkeypatch.setattr(s1, "_mosquitto_conf_matches_bundled", lambda ctx: True)
+
+    result = s1.Step1Prerequisites().verify(ctx)
+
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
 
 
 def test_verify_user_action_required_when_driver_version_mismatches(

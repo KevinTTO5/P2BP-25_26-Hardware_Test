@@ -244,7 +244,10 @@ def _dpkg_version(ctx: "Context", package: str) -> str | None:
 
 
 def _cudnn_installed_version(ctx: "Context") -> str | None:
-    return _dpkg_version(ctx, CUDNN_QUERY_PACKAGE)
+    raw = _dpkg_version(ctx, CUDNN_QUERY_PACKAGE)
+    if raw == CUDNN_APT_VERSION:
+        return CUDNN_VERSION
+    return raw
 
 
 def _driver_version(ctx: "Context") -> str:
@@ -812,6 +815,7 @@ def _apt_install_reported(
     query_packages: Sequence[str],
     *,
     apt_args: Sequence[str] | None = None,
+    reported_version: str | None = None,
 ) -> StepResult | None:
     """Install `query_packages` (or `apt_args`, if the apt invocation needs
     version-pinned `pkg=version` arguments) in one apt transaction, then
@@ -819,6 +823,12 @@ def _apt_install_reported(
     before/after `dpkg-query` presence probe (STEP-1 section 2.2 / 7.2)."""
     before = {pkg: _dpkg_version(ctx, pkg) for pkg in query_packages}
     argv = list(apt_args) if apt_args is not None else list(query_packages)
+    requested = {
+        package: version
+        for arg in argv
+        if "=" in arg
+        for package, version in [arg.split("=", 1)]
+    }
     result = progress_exec.apt(
         ctx,
         "install",
@@ -844,11 +854,20 @@ def _apt_install_reported(
                 status=StepStatus.FAILED,
                 message=f"apt reported success but {pkg} is not installed",
             )
+        if pkg in requested and version != requested[pkg]:
+            return StepResult(
+                status=StepStatus.FAILED,
+                message=(
+                    f"apt installed {pkg} version {version}; "
+                    f"expected {requested[pkg]}"
+                ),
+            )
     for pkg, version in after.items():
-        if before[pkg] is None:
-            ctx.report_installed(pkg, version)
+        display_version = reported_version or version
+        if before[pkg] == version:
+            ctx.report_already_installed(pkg, display_version)
         else:
-            ctx.report_already_installed(pkg, version)
+            ctx.report_installed(pkg, display_version)
     return None
 
 
@@ -901,15 +920,16 @@ def _install_cuda_toolkit(ctx: "Context") -> StepResult | None:
             status=StepStatus.FAILED,
             message=f"apt install failed for {CUDA_TOOLKIT_PACKAGE} (exit {install.returncode})",
         )
-    if _dpkg_version(ctx, CUDA_TOOLKIT_PACKAGE) is None:
+    after = _dpkg_version(ctx, CUDA_TOOLKIT_PACKAGE)
+    if after is None:
         return StepResult(
             status=StepStatus.FAILED,
             message=f"apt reported success but {CUDA_TOOLKIT_PACKAGE} is not installed",
         )
-    if before is None:
-        ctx.report_installed(CUDA_TOOLKIT_PACKAGE, CUDA_VERSION)
-    else:
+    if before == after:
         ctx.report_already_installed(CUDA_TOOLKIT_PACKAGE, CUDA_VERSION)
+    else:
+        ctx.report_installed(CUDA_TOOLKIT_PACKAGE, CUDA_VERSION)
     return None
 
 
@@ -1387,7 +1407,12 @@ class Step1Prerequisites:
 
         ctx.progress.task(f"cuDNN {CUDNN_VERSION}")
         cudnn_args = [f"{package}={CUDNN_APT_VERSION}" for package in CUDNN_PACKAGES]
-        failure = _apt_install_reported(ctx, CUDNN_PACKAGES, apt_args=cudnn_args)
+        failure = _apt_install_reported(
+            ctx,
+            CUDNN_PACKAGES,
+            apt_args=cudnn_args,
+            reported_version=CUDNN_VERSION,
+        )
         if failure is not None:
             return failure
 
@@ -1456,7 +1481,7 @@ class Step1Prerequisites:
             ctx.verify_pinned(
                 f"cuDNN ({CUDNN_QUERY_PACKAGE})",
                 _cudnn_installed_version(ctx) or "",
-                CUDNN_APT_VERSION,
+                CUDNN_VERSION,
             ),
             ctx.verify_pinned(
                 "TensorRT (libnvinfer10)",
