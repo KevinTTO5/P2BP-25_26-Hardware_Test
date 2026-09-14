@@ -44,7 +44,9 @@ Three properties this module owes its callers:
 3. **The phase sequence survives in the transcript (section 3.3).** Every
    phase transition emits a `log.info` line whether or not anything is
    being drawn, because a post-mortem of a failed install has only the
-   transcript to work from.
+   transcript to work from. A line this module suppresses to protect the
+   live region goes to `logs.transcript` instead of being dropped (section
+   7.1): the screen may show less than the transcript, never the reverse.
 
 The renderer never sleeps and starts no thread, so there is no `sleep` to
 inject: the caller drives redraws by calling `tick()`, and `clock` is
@@ -65,7 +67,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Iterable, List, Sequence
 
-from .logs import log
+from .logs import log, transcript
 
 __all__ = [
     "Progress",
@@ -90,6 +92,7 @@ __all__ = [
     "default_content_length_probe",
     "content_length",
     "render_download_log_line",
+    "render_download_done_line",
     "follow_download",
 ]
 
@@ -688,10 +691,11 @@ class Progress:
 # for every future download whatever tool fetches it.
 DEFAULT_DOWNLOAD_POLL_S = 0.5
 
-# Off a tty nothing is drawn at all (section 7), so the only record of a
-# multi-minute download is the transcript. One plain line this often keeps
-# event 3 in section 2 -- "it has hung, I will interrupt it" -- from coming
-# back on a piped or CI run.
+# Off a tty nothing is drawn at all (section 7), so this line is the only
+# sign of life a multi-minute download gives. One plain line this often
+# keeps event 3 in section 2 -- "it has hung, I will interrupt it" -- from
+# coming back on a piped or CI run. It paces the transcript at the same rate
+# on a tty, where the line is recorded rather than printed (section 7.1).
 DOWNLOAD_LOG_INTERVAL_S = 30.0
 
 # Floor on `poll_s`, so a caller passing 0 cannot turn this into a busy loop
@@ -817,6 +821,25 @@ def render_download_log_line(
     return f"{name}: {format_bytes(done)} after {format_duration(elapsed)}"
 
 
+def render_download_done_line(
+    name: str, done: int, total: int | None, elapsed: float
+) -> str:
+    """The closing line for a finished transfer (section 7.1).
+
+    Unlike the periodic lines this one is **never clamped**, and says so.
+    Those clamp to the declared total because a bar reading 115% looks like
+    a bug in the installer rather than in the server; a transcript that
+    ended "100% of 606 MB" and then "620 MB" would leave an operator with no
+    way to tell which of the two numbers was real. So the true byte count is
+    what is recorded, it is labelled as received, and a total it disagrees
+    with -- short or over -- is named beside it as the declared one.
+    """
+    line = f"{name}: received {format_bytes(done)} in {format_duration(elapsed)}"
+    if total and total > 0 and done != total:
+        line += f" ({format_bytes(total)} declared)"
+    return line
+
+
 def follow_download(
     path: "pathlib.Path | str",
     total: int | None,
@@ -854,8 +877,8 @@ def follow_download(
     interval = max(float(poll_s), _MIN_DOWNLOAD_POLL_S)
     log_every = max(float(log_interval_s), 0.0)
     # Sanitised for the same reason `task()` sanitises: this name reaches
-    # the transcript through `log.info`, which section 7 requires to stay
-    # free of escapes.
+    # the transcript, which section 7 requires to stay free of escapes,
+    # whichever of the two sinks below carries it there.
     name = sanitise(task or pathlib.Path(path).name)
 
     if renderer is not None:
@@ -869,8 +892,22 @@ def follow_download(
 
     # Off a tty the drawn region does not exist, so the periodic line is
     # the only signal; on a tty it would fight the live region's cursor
-    # arithmetic, so it is suppressed.
+    # arithmetic, so it is kept off the screen.
     speak = renderer is None or not renderer.live
+
+    def say(message: str) -> None:
+        """Emit one progress line, to the screen when there is room for it.
+
+        Suppressed for rendering reasons is not the same as dropped
+        (section 7.1). An interactive install is the one an operator runs by
+        hand and asks about afterwards, and without this its transcript
+        reads: task name, nothing at all for the length of a
+        multi-hundred-megabyte transfer, phase done.
+        """
+        if speak:
+            log.info(message)
+        else:
+            transcript("info", message)
 
     started = clock()
     next_log_at = 0.0
@@ -899,16 +936,15 @@ def follow_download(
             # needs a frame advance per poll to look alive.
             renderer.tick()
 
-        if speak and elapsed >= next_log_at:
-            log.info(render_download_log_line(name, done, denominator, elapsed))
+        if elapsed >= next_log_at:
+            say(render_download_log_line(name, done, denominator, elapsed))
             next_log_at = elapsed + log_every
 
         if not running:
             break
         sleep(interval)
 
-    if speak:
-        log.info(f"{name}: {format_bytes(done)} in {format_duration(elapsed)}")
+    say(render_download_done_line(name, done, denominator, elapsed))
 
     return DownloadOutcome(
         bytes_done=done, total=denominator, elapsed_s=elapsed, polls=polls

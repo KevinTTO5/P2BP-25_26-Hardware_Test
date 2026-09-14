@@ -1295,7 +1295,7 @@ def test_follow_download_off_a_tty_logs_a_plain_line_on_an_interval(capsys):
     # keeps a multi-minute download distinguishable from a hang.
     assert "driver.run.part: 0 B / 606 MB (0%) after 0s" in err
     assert "driver.run.part: 303 MB / 606 MB (50%) after 40s" in err
-    assert "driver.run.part: 606 MB in 1m20s" in err
+    assert "driver.run.part: received 606 MB in 1m20s" in err
     assert "\033" not in err
     # Throttled to the interval, not one line per poll.
     assert err.count("after") == 3
@@ -1388,3 +1388,117 @@ def test_render_download_log_line_agrees_with_the_drawn_row():
 def test_render_download_log_line_holds_at_99_until_the_last_byte():
     line = progress.render_download_log_line("d.part", 605_999_999, 606_000_000, 1)
     assert _percents(line) == [99]
+
+
+# ---------------------------------------------------------------------------
+# follow_download -- suppressed on screen is still recorded (section 7.1)
+# ---------------------------------------------------------------------------
+
+
+def test_the_interactive_periodic_line_reaches_the_transcript(tmp_path, capsys):
+    """The gap section 7.1 names. On a tty the periodic line stays off the
+    screen so it cannot fight the live region -- and lands in the transcript
+    anyway, so an interactive install's record is not the task name, nothing
+    for six minutes, then the phase-done line."""
+    run_file = logs.open_transcript(log_dir=tmp_path / "logs")
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+
+    transfer = FakeTransfer([0, 151_500_000, 303_000_000, 454_500_000, 606_000_000])
+    progress.follow_download(
+        "/var/cache/driver.run.part",
+        606_000_000,
+        is_running=transfer.running,
+        renderer=bar,
+        poll_s=20.0,
+        log_interval_s=30.0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+
+    transcript = run_file.read_text(encoding="utf-8")
+    assert "[info ] driver.run.part: 0 B / 606 MB (0%) after 0s" in transcript
+    assert "[info ] driver.run.part: 303 MB / 606 MB (50%) after 40s" in transcript
+    assert "[info ] driver.run.part: received 606 MB in 1m20s" in transcript
+    assert "\033" not in transcript
+    # Throttled in the record exactly as it is on a plain stream.
+    assert transcript.count("after") == 3
+    # And still nothing on the terminal, which the renderer owns.
+    assert "after" not in capsys.readouterr().err
+
+
+def test_the_off_tty_line_is_recorded_once_not_twice(tmp_path, capsys):
+    """`log.info` already writes both destinations, so the plain path must
+    not also call the transcript-only sink: that would double every line in
+    the record."""
+    run_file = logs.open_transcript(log_dir=tmp_path / "logs")
+    clock = FakeClock()
+    transfer = FakeTransfer([0, 1000])
+
+    progress.follow_download(
+        "/var/cache/sdk.tar.part",
+        None,
+        is_running=transfer.running,
+        renderer=_plain_progress(clock),
+        poll_s=1.0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+
+    transcript = run_file.read_text(encoding="utf-8")
+    assert transcript.count("sdk.tar.part: 0 B after 0s") == 1
+    assert capsys.readouterr().err.count("sdk.tar.part: 0 B after 0s") == 1
+
+
+def test_the_recorded_overshoot_is_the_true_number_and_says_so(tmp_path):
+    """The consistency bug in section 7.1: the periodic lines clamp to the
+    declared total, so a final line carrying the raw count with no label left
+    the transcript reading 100% of 606 MB and then 620 MB, with nothing to
+    say which was real."""
+    run_file = logs.open_transcript(log_dir=tmp_path / "logs")
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+
+    transfer = FakeTransfer([0, 400_000_000, 620_000_000])
+    outcome = progress.follow_download(
+        "/var/cache/driver.run.part",
+        606_000_000,
+        is_running=transfer.running,
+        renderer=bar,
+        poll_s=2.0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+
+    transcript = run_file.read_text(encoding="utf-8")
+    assert "received 620 MB" in transcript
+    assert "(606 MB declared)" in transcript
+    assert outcome.bytes_done == 620_000_000
+    # The drawn row is still clamped: 115% reads as a bug in the installer
+    # rather than in the server.
+    assert "620 MB" not in _ANSI.sub("", out.getvalue())
+
+
+def test_render_download_done_line_names_a_total_it_disagrees_with():
+    assert progress.render_download_done_line("d.part", 606_000_000, 606_000_000, 80) == (
+        "d.part: received 606 MB in 1m20s"
+    )
+    assert progress.render_download_done_line("d.part", 620_000_000, 606_000_000, 80) == (
+        "d.part: received 620 MB in 1m20s (606 MB declared)"
+    )
+    # A transfer that stopped short is the same disagreement, and worth the
+    # same line: the caller is about to checksum a truncated file.
+    assert "(606 MB declared)" in progress.render_download_done_line(
+        "d.part", 12_000_000, 606_000_000, 80
+    )
+    # No denominator, nothing to disagree with.
+    assert progress.render_download_done_line("d.part", 12_000_000, None, 80) == (
+        "d.part: received 12.0 MB in 1m20s"
+    )

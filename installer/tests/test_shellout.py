@@ -731,9 +731,10 @@ def test_without_a_renderer_logs_writes_the_line_once(tmp_path, capsys):
     assert result.stdout == "out-line\n"
 
 
-def test_stream_false_writes_the_childs_output_nowhere(tmp_path, capsys):
-    """The escape hatch for a probe whose output would be noise: captured and
-    returned, and that is all -- no terminal, no transcript, no renderer."""
+def test_stream_false_shows_the_operator_nothing(tmp_path, capsys):
+    """The escape hatch for a probe whose output would be noise: nothing is
+    drawn and nothing is printed. The silence is asked of the screen, and the
+    transcript still gets the line (doc 08 §7.1)."""
     run_file = _transcript(tmp_path)
     sink = _RecordingSink()
 
@@ -743,7 +744,9 @@ def test_stream_false_writes_the_childs_output_nowhere(tmp_path, capsys):
 
     assert sink.lines == []
     assert capsys.readouterr().err == ""
-    assert run_file.read_text() == ""
+    transcript = run_file.read_text()
+    assert "[info ] [sh] probe-output" in transcript
+    assert "[warn ] [sh] probe-warning" in transcript
     assert result.stdout == "probe-output\n"
     assert result.stderr == "probe-warning\n"
 
@@ -891,7 +894,10 @@ def test_undecodable_output_is_replaced_rather_than_fatal(tmp_path, capsys):
     assert result.stdout.endswith(" after\n")
     assert "�" in result.stdout  # the replacement character, not a crash
     assert sink.lines and "before" in sink.lines[0]
-    assert run_file.read_text() == ""  # a renderer owns this line, not logs
+    # The renderer owns the terminal, so `logs.log` never printed it -- but
+    # the replaced byte is in the record all the same.
+    assert "[info ] [python" in run_file.read_text()
+    assert "\ufffd" in run_file.read_text()
     assert capsys.readouterr().err == ""
 
 
@@ -1364,3 +1370,96 @@ def test_bundled_script_logs_its_output_when_no_renderer_is_given(
     assert result.stdout == "seen\n"
     assert capsys.readouterr().err.count("[quiet.sh] seen") == 1
     assert "[info ] [quiet.sh] seen" in run_file.read_text()
+
+
+# ---------------------------------------------------------------------------
+# run_streamed -- the transcript never shows less than the screen (doc 08 7.1)
+# ---------------------------------------------------------------------------
+
+
+def test_a_rendered_line_still_lands_in_the_transcript(tmp_path, capsys):
+    """The loss U12 exists to close. A renderer owns the terminal, so `logs`
+    must not print -- but the transcript is a file, not the terminal, so the
+    line belongs in it. Without this an interactive install's record holds
+    the phase sequence and none of the command output a failure is diagnosed
+    from."""
+    run_file = _transcript(tmp_path)
+    sink = _RecordingSink()
+
+    shellout.run_streamed(
+        _sh("echo drawn-line; echo drawn-warning >&2"), renderer=sink
+    )
+
+    transcript = run_file.read_text()
+    assert "[info ] [sh] drawn-line" in transcript
+    assert "[warn ] [sh] drawn-warning" in transcript
+    # Still exactly one writer for the terminal: the renderer drew the line,
+    # and nothing printed it behind its back.
+    assert sorted(sink.lines) == ["drawn-line", "drawn-warning"]
+    terminal = capsys.readouterr().err
+    assert "drawn-line" not in terminal
+    assert "drawn-warning" not in terminal
+
+
+def test_every_mode_records_the_same_line(tmp_path, capsys):
+    """Three renderings of one child, one record. The screen may show less
+    than the transcript; the transcript may never show less than the
+    screen."""
+    program = _sh("echo one-line")
+    modes = {
+        "renderer": dict(renderer=_RecordingSink()),
+        "logs": {},
+        "suppressed": dict(stream=False),
+    }
+
+    for mode, kwargs in modes.items():
+        logs._transcript_path = None
+        run_file = _transcript(tmp_path / mode)
+        shellout.run_streamed(program, **kwargs)
+        assert "[info ] [sh] one-line" in run_file.read_text(), mode
+
+    # Only the `logs` mode wrote the terminal, and it wrote the line once.
+    assert capsys.readouterr().err.count("one-line") == 1
+
+
+@pytest.mark.parametrize("secret_key", shellout._REDACT_KEYS)
+def test_a_secret_is_scrubbed_on_the_transcript_only_path(
+    tmp_path, capsys, secret_key
+):
+    """Redaction is not weakened by the new sink. A line that reaches the
+    transcript without passing through `logs.log` is scrubbed by the same
+    pass, on the renderer path and the suppressed one alike."""
+    secret = "super-secret-value"
+    child = _sh(f'echo "{secret_key}=${secret_key}"; echo "bare ${secret_key}" >&2')
+    env = {secret_key: secret, "PATH": os.environ["PATH"]}
+
+    for mode, kwargs in (
+        ("renderer", dict(renderer=_RecordingSink())),
+        ("suppressed", dict(stream=False)),
+    ):
+        logs._transcript_path = None
+        run_file = _transcript(tmp_path / mode)
+        shellout.run_streamed(child, env=env, **kwargs)
+
+        transcript = run_file.read_text()
+        assert secret not in transcript, mode
+        # Scrubbed, not swallowed: the shape of the output survives.
+        assert f"{secret_key}={shellout._REDACTED}" in transcript, mode
+
+    assert secret not in capsys.readouterr().err
+
+
+def test_no_escape_reaches_the_transcript_on_the_renderer_path(tmp_path, capsys):
+    """Doc 00 section 8.2's rule, on the path where `logs` is not the writer.
+    The line is sanitised before either destination sees it, so the record a
+    renderer's run leaves behind is as escape-free as a plain run's."""
+    run_file = _transcript(tmp_path)
+    sink = _RecordingSink()
+
+    shellout.run_streamed(_ANSI_CHILD, renderer=sink)
+
+    transcript = run_file.read_text()
+    assert "\x1b" not in transcript
+    assert "\x07" not in transcript
+    assert "[info ] [sh] green-line" in transcript
+    assert capsys.readouterr().err == ""

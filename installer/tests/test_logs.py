@@ -176,3 +176,89 @@ def test_open_transcript_returns_path_object(tmp_path):
     import pathlib
 
     assert isinstance(run_file, pathlib.Path)
+
+
+# ---------------------------------------------------------------------------
+# transcript() -- the transcript-only sink (doc 08 §7.1)
+# ---------------------------------------------------------------------------
+
+
+def test_transcript_writes_the_line_to_the_transcript_only(tmp_path, capsys):
+    """The whole point of the sink: the record gets the line, the screen does
+    not. A caller reaches for it when something else already owns the
+    terminal, so a print here would be the duplicate writer it exists to
+    avoid."""
+    run_file = logs.open_transcript(log_dir=tmp_path / "logs")
+
+    logs.transcript("info", "drawn by the renderer, not by logs")
+
+    assert run_file.read_text(encoding="utf-8") == (
+        "[info ] drawn by the renderer, not by logs\n"
+    )
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == ""
+
+
+def test_transcript_labels_every_level_the_way_log_does(tmp_path):
+    run_file = logs.open_transcript(log_dir=tmp_path / "logs")
+
+    logs.transcript("info", "an info line")
+    logs.transcript("warn", "a warn line")
+    logs.transcript("error", "an error line")
+
+    assert run_file.read_text(encoding="utf-8").splitlines() == [
+        "[info ] an info line",
+        "[warn ] a warn line",
+        "[error] an error line",
+    ]
+
+
+def test_transcript_and_log_append_to_one_file_in_order(tmp_path):
+    """A run mixes the two sinks line by line, so a post-mortem reads the
+    sequence the installer actually produced rather than two interleaved
+    halves."""
+    run_file = logs.open_transcript(log_dir=tmp_path / "logs")
+
+    logs.log.info("printed and recorded")
+    logs.transcript("info", "recorded only")
+    logs.log.warn("printed and recorded again")
+
+    assert run_file.read_text(encoding="utf-8").splitlines() == [
+        "[info ] printed and recorded",
+        "[info ] recorded only",
+        "[warn ] printed and recorded again",
+    ]
+
+
+def test_transcript_strips_ansi_from_a_line_it_did_not_write(tmp_path):
+    """Section 7's no-escape rule holds on this path too. Command output is
+    exactly what reaches it -- apt and curl colour their own lines -- and an
+    escape in the transcript corrupts the one artifact a failed install
+    leaves behind."""
+    run_file = logs.open_transcript(log_dir=tmp_path / "logs")
+
+    logs.transcript("warn", "\033[32mSetting up\033[0m libnvinfer10")
+
+    contents = run_file.read_text(encoding="utf-8")
+    assert "\033" not in contents
+    assert contents == "[warn ] Setting up libnvinfer10\n"
+
+
+def test_transcript_before_open_transcript_is_a_no_op(capsys):
+    """No transcript open (autouse fixture resets state): the sink is silent
+    rather than an error, exactly as log.* is."""
+    logs.transcript("info", "nowhere to put this yet")
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == ""
+
+
+def test_transcript_is_unaffected_by_a_coloured_stderr(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    run_file = logs.open_transcript(log_dir=tmp_path / "logs")
+
+    logs.transcript("info", "still plain")
+
+    assert run_file.read_text(encoding="utf-8") == "[info ] still plain\n"

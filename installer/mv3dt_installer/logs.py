@@ -13,6 +13,8 @@ Public API:
     log.info(msg)      -- level "info", coloured green when stderr is a tty.
     log.warn(msg)       -- level "warn", coloured yellow when stderr is a tty.
     log.error(msg)      -- level "error", coloured red when stderr is a tty.
+    transcript(level, msg) -- append one line to the transcript *only*,
+        printing nothing (doc 08 §7.1).
     die(msg)             -- log.error(msg) then sys.exit(1); never returns.
     open_transcript(log_dir=None) -- open/create the per-run transcript file
         and wire subsequent log.*() calls to also append to it. Returns the
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import datetime
 import pathlib
+import re
 import sys
 import threading
 from typing import NoReturn
@@ -47,6 +50,17 @@ _LABELS = {
     "warn": "[warn ]",
     "error": "[error]",
 }
+
+# Escape sequences in a caller's message. The colour this module adds is
+# applied to the printed copy only, so it never reaches the transcript -- but
+# a message that came from somewhere else can carry escapes of its own (apt,
+# curl and dpkg all colour their output), and doc 00 §8.2 admits none of them
+# to the transcript whatever wrote them. Deliberately narrow: `progress`
+# owns the full control-character strip and imports this module, so the
+# broader pass cannot live here.
+_ANSI_RE = re.compile(
+    r"\033(?:\[[0-?]*[ -/]*[@-~]|\][^\a\033]*(?:\a|\033\\)?|[@-Z\\-_])"
+)
 
 # Guards access to _transcript_path and the transcript file append below, so
 # concurrent log calls (if the installer ever grows threads) don't interleave
@@ -76,17 +90,40 @@ def _append_transcript(plain_line: str) -> None:
         fh.write(plain_line + "\n")
 
 
+def _plain_line(level: str, msg: str) -> str:
+    """The transcript form of a line: level label, and no escapes ever."""
+    return f"{_LABELS[level]} {_ANSI_RE.sub('', msg)}"
+
+
 def _emit(level: str, msg: str) -> None:
     label = _LABELS[level]
-    plain_line = f"{label} {msg}"
     if _colour_enabled():
         colour = _COLOURS[level]
         print(f"{colour}{label}{_RESET} {msg}", file=sys.stderr)
     else:
-        print(plain_line, file=sys.stderr)
+        # Deliberately the caller's own text, not the stripped transcript
+        # form: what stderr shows is unchanged by the escape rule below.
+        print(f"{label} {msg}", file=sys.stderr)
     # The transcript never carries ANSI escapes, regardless of whether stderr
     # itself is coloured.
-    _append_transcript(plain_line)
+    _append_transcript(_plain_line(level, msg))
+
+
+def transcript(level: str, msg: str) -> None:
+    """Append one line to the transcript without printing it (doc 08 §7.1).
+
+    The transcript-only half of `_emit`, for a caller that has already shown
+    the line another way -- a live renderer drew it -- or that is deliberately
+    showing nothing at all. Suppressing a line to protect the redrawn region
+    must not also delete it from the auditable record: the screen may show
+    less than the transcript, the transcript may never show less than the
+    screen.
+
+    Identical to `log.<level>()` in everything but the print: the same level
+    label, the same escape stripping, the same lock, and the same no-op when
+    no transcript is open.
+    """
+    _append_transcript(_plain_line(level, msg))
 
 
 class _Log:
