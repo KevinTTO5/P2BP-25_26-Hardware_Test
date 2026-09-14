@@ -170,6 +170,16 @@ def run_root(self, *args: str, stream: bool | None = None, **kwargs: Any)
 the caller asked for captured output. `stream=False` restores today's
 behaviour for a probe whose output would be noise.
 
+> **Unsettled, owned by [U11](#12-unit-and-wave-decomposition):** this
+> tty-gating and §7's table disagree. §7 says a non-tty run still gets
+> per-line output, plain; auto as written streams nothing off a tty, so
+> `mv3dt-installer | tee install.log` shows the operator nothing while it
+> runs. The transcript still receives everything, so no record is lost, but
+> "piped to a file" is a normal way to run an installer and silence there
+> repeats the failure §2 documents. Settle it in U11, which owns `app.py`
+> next: either auto streams plain lines off a tty, or §7's table is narrowed
+> to mean the transcript only. Do not resolve it by editing a step.
+
 This is the decision that makes the change tractable. Rewriting 72 call
 sites would be seven PRs of mechanical edits across every step module;
 changing one method is one reviewable unit, and every existing test that
@@ -184,7 +194,15 @@ When streaming, `run_root`:
 3. Writes each line to the terminal, indented and dimmed, under the current
    phase banner.
 4. Appends each line to the in-memory buffer that becomes
-   `CompletedProcess.stdout` / `.stderr`.
+   `CompletedProcess.stdout` / `.stderr`. **This buffer is deliberately not
+   scrubbed**, and that is not an oversight in the list above: §4.1 requires
+   it to be byte-identical to what `subprocess.run` would have returned, and
+   72 call sites parse it. Scrubbing is substring replacement against
+   environment values, so a child printing `version abc123 build` with
+   `NGC_API_KEY=abc` set would come back as `version <redacted>123 build` and
+   silently break every one of those parsers. The buffer is in-memory and
+   reaches no durable artifact on its own; the destinations that persist —
+   the terminal and the transcript — are always scrubbed.
 5. Appends each line to the transcript, honouring the existing redaction
    rules in [`shellout.py`](../mv3dt_installer/shellout.py).
 
