@@ -1635,7 +1635,198 @@ def test_step_making_no_progress_calls_dispatches_unchanged(tmp_path, monkeypatc
 
     assert rc == 0
     assert step.report_calls == 1
-    assert (recorder.steps, recorder.phases, recorder.lines) == ([], [], [])
+    # The banner is the framework's and appears without the step asking for
+    # it (doc 08 §3.2); the three step-author calls stay untouched.
+    assert recorder.steps == [(1, "Prerequisites", ())]
+    assert (recorder.phases, recorder.tasks, recorder.byte_calls, recorder.lines) == (
+        [],
+        [],
+        [],
+        [],
+    )
+
+
+def test_unnamed_phase_transition_reaches_the_transcript_not_the_screen(
+    tmp_path, capsys
+):
+    """Doc 08 §3.3 and §7.1 together.
+
+    A step that has declared no phases has exactly one, unnamed, and there
+    is no label to draw beside it -- so nothing is rendered. §3.3 still
+    wants every transition in the record and §7.1 forbids paying for a
+    rendering decision with a hole in it, so the line goes to the
+    transcript-only sink rather than being dropped.
+    """
+    from mv3dt_installer import logs
+
+    logs.open_transcript(tmp_path / "logs")
+    ctx, recorder = _recording_ctx(tmp_path)
+    step = _DummyStep("step4_calib_output_wiring", "Calibration wiring", 4)
+    ctx.progress.begin_step(step, 4)
+    capsys.readouterr()  # discard the banner
+
+    ctx.progress.phase(1)
+
+    assert recorder.phases == []
+    assert capsys.readouterr().err == ""
+    written = logs._transcript_path.read_text(encoding="utf-8")
+    assert "step4_calib_output_wiring phase 1/1: (unnamed)" in written
+
+
+# ---------------------------------------------------------------------------
+# doc 08 §3.2 -- the step banner in the dispatch loop
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_ctx(tmp_path: Path, steps, monkeypatch, **kwargs):
+    """A recording `Context`, a `StateMachine` and a registry of `steps`."""
+    ctx, cfg = _minimal_ctx(tmp_path, **kwargs)
+    recorder = _RecordingRenderer()
+    ctx.progress.renderer = recorder
+    monkeypatch.setattr(app, "STEP_REGISTRY", list(steps))
+    return ctx, cfg, StateMachine(path=tmp_path / "state.json"), recorder
+
+
+def test_dispatch_announces_every_step_it_runs_with_its_position(
+    tmp_path, monkeypatch
+):
+    """Doc 08 §3.2's `[ 3/7 ] <title>`, and event 4 in §2 it closes.
+
+    Position is the one thing a step cannot know about itself, which is why
+    the banner is the dispatch loop's and not a step's.
+    """
+    steps = [
+        _PhasedStep("step1_prerequisites", "Prerequisites", 1),
+        _DummyStep("step2_deepstream_sdk", "DeepStream SDK", 2),
+        _DummyStep("step7_webapp_integration", "Web-app Integration", 7),
+    ]
+    ctx, cfg, sm, recorder = _dispatch_ctx(
+        tmp_path, steps, monkeypatch, webapp_integration="on"
+    )
+
+    assert app._dispatch(sm, ctx, cfg) == 0
+    # The declared phases travel with the banner, so the renderer can pair
+    # a later `phase(n)` with a label (doc 08 §3.1).
+    assert recorder.steps == [
+        (1, "Prerequisites", ("first", "second")),
+        (2, "DeepStream SDK", ()),
+        (3, "Web-app Integration", ()),
+    ]
+    assert recorder.ended == 3
+
+
+def test_dispatch_never_announces_a_step_it_skips(tmp_path, monkeypatch):
+    """A gate-off skip and an already-complete skip never begin a step, so
+    neither opens a region -- but both still occupy their slot, so the one
+    step that does run is announced with its true, absolute position. Were
+    the counter advanced only for steps that actually ran, a resumed
+    install would renumber the remainder and contradict `--status`."""
+    steps = [
+        _DummyStep("step1_prerequisites", "Prerequisites", 1),
+        _DummyStep("step6_remote_supervision", "Remote Supervision", 6),
+        _DummyStep("step7_webapp_integration", "Web-app Integration", 7),
+    ]
+    ctx, cfg, sm, recorder = _dispatch_ctx(
+        tmp_path,
+        steps,
+        monkeypatch,
+        remote_supervision="off",
+        webapp_integration="on",
+    )
+    sm.mark_complete("step1_prerequisites")
+
+    assert app._dispatch(sm, ctx, cfg) == 0
+    assert recorder.steps == [(3, "Web-app Integration", ())]
+    assert recorder.ended == 1
+
+
+def test_dispatch_takes_the_region_down_before_report_writes(tmp_path, monkeypatch):
+    """On a tty the live region is erased by cursor arithmetic over the rows
+    it drew, so a `report()` line emitted while it was still up would be torn
+    through by the erase."""
+    events: list[str] = []
+
+    class _OrderedRenderer(_RecordingRenderer):
+        def end_step(self):
+            events.append("end_step")
+            super().end_step()
+
+    class _ReportingStep(_DummyStep):
+        def report(self, ctx):
+            events.append("report")
+            super().report(ctx)
+
+    step = _ReportingStep("step1_prerequisites", "Prerequisites", 1)
+    ctx, cfg = _minimal_ctx(tmp_path)
+    ctx.progress.renderer = _OrderedRenderer()
+    monkeypatch.setattr(app, "STEP_REGISTRY", [step])
+    sm = StateMachine(path=tmp_path / "state.json")
+
+    assert app._dispatch(sm, ctx, cfg) == 0
+    assert events == ["end_step", "report"]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        StepResult(status=StepStatus.REBOOT_REQUIRED, message="reboot pls"),
+        StepResult(status=StepStatus.USER_ACTION_REQUIRED, message="do a thing"),
+        StepResult(status=StepStatus.FAILED, message="boom"),
+    ],
+    ids=["reboot", "user-action", "failed"],
+)
+def test_dispatch_ends_the_step_on_every_halting_status(
+    tmp_path, monkeypatch, capsys, outcome
+):
+    """Each halting branch prints its own block, so every one of them needs
+    the region down first -- not just the `COMPLETE` path."""
+    step = _DummyStep("step1_prerequisites", "Prerequisites", 1, verify=outcome)
+    ctx, cfg, sm, recorder = _dispatch_ctx(tmp_path, [step], monkeypatch)
+    monkeypatch.setattr(app.reboot_mod, "current_boot_id", lambda: "boot-abc")
+
+    app._dispatch(sm, ctx, cfg)
+    capsys.readouterr()
+
+    assert recorder.steps == [(1, "Prerequisites", ())]
+    assert recorder.ended == 1
+
+
+def test_dispatch_ends_the_step_when_a_step_raises(tmp_path, monkeypatch):
+    """A step that raises must leave the terminal in the same clean state as
+    one that merely fails -- otherwise the traceback lands inside a region
+    that is still counting rows."""
+
+    class _ExplodingStep(_DummyStep):
+        def run(self, ctx):
+            raise RuntimeError("boom")
+
+    step = _ExplodingStep("step1_prerequisites", "Prerequisites", 1)
+    ctx, cfg, sm, recorder = _dispatch_ctx(tmp_path, [step], monkeypatch)
+
+    with pytest.raises(RuntimeError):
+        app._dispatch(sm, ctx, cfg)
+
+    assert recorder.steps == [(1, "Prerequisites", ())]
+    assert recorder.ended == 1
+
+
+def test_dispatch_banner_degrades_to_a_plain_line_off_a_tty(
+    tmp_path, monkeypatch, capsys
+):
+    """Doc 08 §7: a pipe, a CI run and `--non-interactive` all get the phase
+    line plain, and not one escape sequence. Exercised against the real
+    renderer, since it is the renderer that decides."""
+    ctx, cfg = _minimal_ctx(tmp_path, non_interactive=True)
+    assert ctx.progress.renderer.live is False
+    step = _DummyStep("step1_prerequisites", "Prerequisites", 1)
+    monkeypatch.setattr(app, "STEP_REGISTRY", [step])
+    sm = StateMachine(path=tmp_path / "state.json")
+
+    assert app._dispatch(sm, ctx, cfg) == 0
+
+    err = capsys.readouterr().err
+    assert f"[ 1/{len(STEP_IDS)} ] Prerequisites" in err
+    assert "\033" not in err
 
 
 # ---------------------------------------------------------------------------
