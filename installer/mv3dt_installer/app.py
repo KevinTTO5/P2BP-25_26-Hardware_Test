@@ -62,7 +62,8 @@ import contextlib
 import pathlib
 import subprocess
 import sys
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from mv3dt_installer import __version__, build_stamp
@@ -345,6 +346,7 @@ class ProgressHandle:
 
     renderer: progress_mod.Progress
     step: Any = None
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     # -- framework-side (the dispatch loop, doc 08 §3.2) -------------------
 
@@ -356,13 +358,15 @@ class ProgressHandle:
         the renderer come from `steps.step_phases` so a step that declared
         none still gets its banner.
         """
-        self.step = step
-        self.renderer.begin_step(index, step.title, step_phases(step))
+        with self._lock:
+            self.step = step
+            self.renderer.begin_step(index, step.title, step_phases(step))
 
     def end_step(self) -> None:
         """Collapse the running step's last phase and unbind it."""
-        self.renderer.end_step()
-        self.step = None
+        with self._lock:
+            self.renderer.end_step()
+            self.step = None
 
     def line(self, text: str) -> None:
         """One line of command output (doc 08 §4.2).
@@ -371,7 +375,8 @@ class ProgressHandle:
         not part of the step-author contract, which is why doc 08 §9 lists
         only `phase`, `task` and `bytes`.
         """
-        self.renderer.line(text)
+        with self._lock:
+            self.renderer.line(text)
 
     # -- the step-author contract (doc 08 §9) ------------------------------
 
@@ -387,8 +392,10 @@ class ProgressHandle:
         A step that declared no phases has exactly one, unnamed (doc 08
         §3.1), so `phase(1)` is legal there and renders nothing.
         """
-        step = self.step if self.step is not None else _UNBOUND_STEP
-        if phase_label(step, number) is None:
+        with self._lock:
+            step = self.step if self.step is not None else _UNBOUND_STEP
+            label = phase_label(step, number)
+        if label is None:
             # The unnamed phase is the one transition the renderer cannot
             # draw: there is no label to put beside the tick, and a
             # collapsed `✓` with an empty label is worse than no row at
@@ -402,15 +409,34 @@ class ProgressHandle:
             step_id = getattr(step, "id", "?")
             transcript("info", f"{step_id} phase {number}/1: (unnamed)")
             return
-        self.renderer.phase(number)
+        with self._lock:
+            self.renderer.phase(number)
 
     def task(self, name: str) -> None:
         """Name the operation now running inside the current phase."""
-        self.renderer.task(name)
+        with self._lock:
+            self.renderer.task(name)
 
     def bytes(self, done: int, total: int | None) -> None:
         """Drive a real bar from a real denominator (doc 08 §5)."""
-        self.renderer.bytes(done, total)
+        with self._lock:
+            self.renderer.bytes(done, total)
+
+    @property
+    def live(self) -> bool:
+        """Whether the underlying renderer owns a live terminal region."""
+        with self._lock:
+            return self.renderer.live
+
+    def percent(self, value: int | None, note: str | None = None) -> None:
+        """Drive an apt percentage through the serialised renderer seam."""
+        with self._lock:
+            self.renderer.percent(value, note)
+
+    def tick(self) -> None:
+        """Advance a denominator-free spinner through the same seam."""
+        with self._lock:
+            self.renderer.tick()
 
 
 def _should_stream(stream: Optional[bool], kwargs: dict) -> bool:
@@ -514,11 +540,68 @@ class Context:
     progress: ProgressHandle
     non_interactive: bool
 
-    def run_as_user(self, *args: str, **kwargs: Any) -> subprocess.CompletedProcess:
+    def run_as_user(
+        self, *args: str, stream: Optional[bool] = None, **kwargs: Any
+    ) -> subprocess.CompletedProcess:
         """Doc 00 §9.2: anything that must run "as the user" (the `ngc`
         CLI, `docker` without sudo, files under the user's home) MUST go
-        through this rather than running unwrapped as root."""
+        through this rather than running unwrapped as root.
+
+        ``stream=True`` uses the same one-pass tee as ``run_root`` so an
+        observed invoking-user download retains all curl output in the
+        transcript. Other calls keep delegating to the established privilege
+        helper unchanged.
+        """
+        if stream is True:
+            _should_stream(stream, kwargs)
+            command = ("sudo", "-u", self.user.name, "-H", *args)
+            try:
+                return shellout.run_streamed(
+                    command,
+                    renderer=self.progress,
+                    redact_capture=False,
+                    **kwargs,
+                )
+            except FileNotFoundError:
+                return _missing_executable_result(command, kwargs)
         return privilege.run_as_user(*args, **kwargs)
+
+    def run_observed(
+        self,
+        run: Callable[[], subprocess.CompletedProcess],
+        observe: Callable[[Callable[[], bool]], Any],
+    ) -> subprocess.CompletedProcess:
+        """Run one existing privilege seam while a progress adapter watches.
+
+        The adapters deliberately own no subprocess.  This method supplies
+        the small amount of concurrency needed for them to observe a command
+        without changing the command's captured ``CompletedProcess`` result.
+        ``ProgressHandle`` serialises the renderer calls made here and by the
+        streamed command, so the renderer itself is never accessed
+        concurrently.
+        """
+        finished = threading.Event()
+        outcome: list[subprocess.CompletedProcess] = []
+        failure: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                outcome.append(run())
+            except BaseException as exc:
+                failure.append(exc)
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=worker, name="progress-command", daemon=True)
+        thread.start()
+        try:
+            observe(lambda: not finished.is_set())
+        finally:
+            thread.join()
+
+        if failure:
+            raise failure[0]
+        return outcome[0]
 
     def run_root(
         self, *args: str, stream: Optional[bool] = None, **kwargs: Any

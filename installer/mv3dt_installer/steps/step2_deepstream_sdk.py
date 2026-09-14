@@ -53,6 +53,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Callable, Optional
 
 from .. import config as config_mod
+from .. import progress_exec
 from .. import shellout
 from ..logs import log
 from . import StepResult, StepStatus, UserAction, register
@@ -423,8 +424,21 @@ def _ensure_artifact(
         log.info(f"DeepStream artifact already present: {artifact_path}")
         return True, "pre-placed", None
 
-    result = _run_as_user(
-        ctx, "curl", "-fsSL", "-o", artifact_name, url, cwd=str(artifact_dir)
+    result = progress_exec.download(
+        ctx,
+        artifact_path,
+        url,
+        lambda: _run_as_user(
+            ctx,
+            "curl",
+            "-fsSL",
+            "-o",
+            artifact_name,
+            url,
+            cwd=str(artifact_dir),
+            stream=True,
+        ),
+        task=artifact_name,
     )
     if result.returncode == 0 and artifact_path.is_file():
         log.info(f"Downloaded {artifact_name} to {artifact_dir}")
@@ -947,8 +961,13 @@ class Step2DeepStreamSdk:
             assert early is not None
             return early
 
-        result = _run_root(
-            ctx, "apt-get", "install", "-y", f"./{DEB_ARTIFACT}", cwd=str(artifact_dir)
+        result = progress_exec.apt(
+            ctx,
+            "install",
+            "-y",
+            f"./{DEB_ARTIFACT}",
+            runner=lambda *args, **kwargs: _run_root(ctx, *args, **kwargs),
+            cwd=str(artifact_dir),
         )
         if result.returncode != 0:
             return StepResult(

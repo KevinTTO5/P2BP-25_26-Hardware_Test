@@ -18,8 +18,12 @@ from __future__ import annotations
 import io
 import os
 import re
+import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -592,10 +596,90 @@ def test_context_run_as_user_delegates_to_privilege(tmp_path, monkeypatch):
     monkeypatch.setattr(app.privilege, "run_as_user", fake_run_as_user)
     ctx, _cfg = _minimal_ctx(tmp_path)
 
-    result = ctx.run_as_user("echo", "hi", check=True)
+    result = ctx.run_as_user(
+        "echo", "hi", check=True, capture_output=True, text=True
+    )
 
     assert result == "sentinel"
-    assert calls == [(("echo", "hi"), {"check": True})]
+    assert calls == [
+        (
+            ("echo", "hi"),
+            {"check": True, "capture_output": True, "text": True},
+        )
+    ]
+
+
+def test_context_run_as_user_streams_captured_text_through_sudo(tmp_path, monkeypatch):
+    ctx, _cfg = _minimal_ctx(tmp_path)
+    calls = []
+    completed = subprocess.CompletedProcess(["sudo"], 0, "out\n", "err\n")
+
+    def fake_run_streamed(command, **kwargs):
+        calls.append((command, kwargs))
+        return completed
+
+    monkeypatch.setattr(app.shellout, "run_streamed", fake_run_streamed)
+
+    result = ctx.run_as_user(
+        "curl",
+        "https://example.invalid",
+        capture_output=True,
+        text=True,
+        stream=True,
+    )
+
+    assert result is completed
+    assert calls[0][0] == (
+        "sudo",
+        "-u",
+        ctx.user.name,
+        "-H",
+        "curl",
+        "https://example.invalid",
+    )
+    assert calls[0][1]["renderer"] is ctx.progress
+    assert calls[0][1]["redact_capture"] is False
+    assert calls[0][1]["capture_output"] is True
+    assert calls[0][1]["text"] is True
+
+
+def test_run_observed_serialises_command_and_adapter_renderer_access():
+    entered = threading.Event()
+
+    class Renderer:
+        live = False
+
+        def __init__(self):
+            self.active = False
+            self.calls = []
+
+        def line(self, text):
+            assert self.active is False
+            self.active = True
+            entered.set()
+            time.sleep(0.02)
+            self.calls.append(("line", text))
+            self.active = False
+
+        def bytes(self, done, total):
+            assert self.active is False
+            self.calls.append(("bytes", done, total))
+
+    renderer = Renderer()
+    ctx = SimpleNamespace(progress=app.ProgressHandle(renderer))
+
+    def run():
+        ctx.progress.line("child output")
+        return subprocess.CompletedProcess(["command"], 0, "", "")
+
+    def observe(is_running):
+        assert entered.wait(timeout=1)
+        ctx.progress.bytes(1, 2)
+
+    result = app.Context.run_observed(ctx, run, observe)
+
+    assert result.returncode == 0
+    assert renderer.calls == [("line", "child output"), ("bytes", 1, 2)]
 
 
 # ---------------------------------------------------------------------------
