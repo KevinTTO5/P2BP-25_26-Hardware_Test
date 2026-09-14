@@ -812,3 +812,579 @@ def test_verbose_scrolls_every_line_verbatim_above_the_live_region():
         assert f"line {n}" in rendered
     # No rolling window underneath: the scrollback is the record instead.
     assert len(_last_frame(out)) == 2
+
+
+# ---------------------------------------------------------------------------
+# Download byte-progress adapter (section 5.1)
+# ---------------------------------------------------------------------------
+
+
+class FakeTransfer:
+    """A scripted download: one size per poll, then it stops.
+
+    `follow_download` samples "is it still running" *before* it reads the
+    size, so `running()` answers about the sample that has not been taken
+    yet -- it stays true until the next `size()` call would return the last
+    scripted value. That is exactly the ordering the adapter relies on to
+    guarantee its final frame shows the final size.
+    """
+
+    def __init__(self, sizes) -> None:
+        self.sizes = list(sizes)
+        self.index = -1
+        self.sleeps: list[float] = []
+
+    def running(self) -> bool:
+        return self.index + 1 < len(self.sizes) - 1
+
+    def size(self, path) -> int:
+        self.index = min(self.index + 1, len(self.sizes) - 1)
+        return self.sizes[self.index]
+
+    def sleeper(self, clock: FakeClock):
+        def _sleep(seconds: float) -> None:
+            self.sleeps.append(seconds)
+            clock.advance(seconds)
+
+        return _sleep
+
+
+def _percents(text: str) -> list[int]:
+    return [int(match) for match in re.findall(r"(\d+)%", text)]
+
+
+# -- part_size --------------------------------------------------------------
+
+
+def test_part_size_is_zero_before_the_transfer_creates_the_file(tmp_path):
+    assert progress.part_size(tmp_path / "driver.run.part") == 0
+
+
+def test_part_size_reports_the_bytes_on_disk(tmp_path):
+    part = tmp_path / "driver.run.part"
+    part.write_bytes(b"x" * 4096)
+    assert progress.part_size(part) == 4096
+
+
+def test_part_size_survives_a_path_it_cannot_stat(tmp_path):
+    # A directory where a file is expected, i.e. something is wrong -- but
+    # a polled measurement must never be the thing that fails an install.
+    (tmp_path / "driver.run.part").mkdir()
+    assert progress.part_size(tmp_path / "driver.run.part" / "x" / "y") == 0
+
+
+# -- content_length ---------------------------------------------------------
+
+
+def test_content_length_parses_the_declared_size():
+    assert progress.content_length("https://example/d", probe=lambda url: "606000000") == 606_000_000
+    assert progress.content_length("https://example/d", probe=lambda url: " 42 ") == 42
+    assert progress.content_length("https://example/d", probe=lambda url: 42) == 42
+
+
+def test_content_length_passes_the_url_to_the_injected_probe():
+    seen = []
+
+    def probe(url):
+        seen.append(url)
+        return "10"
+
+    progress.content_length("https://example/driver.run", probe=probe)
+    assert seen == ["https://example/driver.run"]
+
+
+@pytest.mark.parametrize(
+    "value", [None, "", "   ", "unknown", "12abc", "0", "-1", "1.5", []]
+)
+def test_content_length_degrades_to_no_denominator(value):
+    assert progress.content_length("https://example/d", probe=lambda url: value) is None
+
+
+def test_content_length_degrades_when_the_probe_itself_fails():
+    def probe(url):
+        raise ConnectionError("no route to host")
+
+    # A download that would have succeeded must not fail because a HEAD
+    # request did not.
+    assert progress.content_length("https://example/d", probe=probe) is None
+
+
+# -- the off-tty line -------------------------------------------------------
+
+
+def test_render_download_log_line_states_a_percentage_when_it_has_one():
+    line = progress.render_download_log_line(
+        "driver.run.part", 412_000_000, 606_000_000, 252
+    )
+    assert line == "driver.run.part: 412 MB / 606 MB (68%) after 4m12s"
+
+
+def test_render_download_log_line_omits_the_percentage_without_a_denominator():
+    for absent in (None, 0, -1):
+        line = progress.render_download_log_line("sdk.tar", 412_000_000, absent, 252)
+        assert line == "sdk.tar: 412 MB after 4m12s"
+
+
+def test_render_download_log_line_never_exceeds_one_hundred_percent():
+    line = progress.render_download_log_line("d.part", 620_000_000, 606_000_000, 10)
+    assert _percents(line) == [100]
+
+
+# -- follow_download, the normal case ---------------------------------------
+
+
+def test_follow_download_drives_the_bar_as_the_part_file_grows():
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+
+    transfer = FakeTransfer([0, 121_200_000, 412_000_000, 606_000_000])
+    outcome = progress.follow_download(
+        "/var/cache/driver.run.part",
+        606_000_000,
+        is_running=transfer.running,
+        renderer=bar,
+        poll_s=2.0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+
+    rendered = _ANSI.sub("", out.getvalue())
+    assert "20%" in rendered
+    assert "68%" in rendered
+    assert "412 MB / 606 MB" in rendered
+
+    row = _activity_row(out)
+    assert "100%" in row
+    assert "606 MB / 606 MB" in row
+
+    assert outcome.bytes_done == 606_000_000
+    assert outcome.total == 606_000_000
+    assert outcome.polls == 4
+    assert outcome.complete is True
+    # One sleep between polls and none after the transfer stopped.
+    assert transfer.sleeps == [2.0, 2.0, 2.0]
+    assert outcome.elapsed_s == pytest.approx(6.0)
+
+
+def test_follow_download_reports_rate_and_eta_from_the_polled_sizes():
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+
+    # 14.2 MB per two-second poll.
+    transfer = FakeTransfer([0, 28_400_000, 56_800_000, 85_200_000])
+    progress.follow_download(
+        "/var/cache/driver.run.part",
+        606_000_000,
+        is_running=transfer.running,
+        renderer=bar,
+        poll_s=2.0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+
+    row = _activity_row(out)
+    assert "14.2 MB/s" in row
+    # 520.8 MB left at 14.2 MB/s is 36.6s.
+    assert row.endswith("0:37")
+
+
+def test_follow_download_returns_the_final_size_without_a_renderer():
+    clock = FakeClock()
+    transfer = FakeTransfer([0, 500, 1000])
+    outcome = progress.follow_download(
+        "/var/cache/driver.run.part",
+        1000,
+        is_running=transfer.running,
+        poll_s=1.0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+    assert outcome.bytes_done == 1000
+    assert outcome.polls == 3
+    assert outcome.complete is True
+
+
+def test_follow_download_floors_the_poll_interval():
+    clock = FakeClock()
+    transfer = FakeTransfer([0, 1])
+    progress.follow_download(
+        "/var/cache/driver.run.part",
+        10,
+        is_running=transfer.running,
+        poll_s=0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+    # A caller passing 0 must not turn this into a busy loop.
+    assert transfer.sleeps == [progress._MIN_DOWNLOAD_POLL_S]
+
+
+def test_follow_download_names_the_task_on_the_renderer():
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+
+    transfer = FakeTransfer([0, 10])
+    progress.follow_download(
+        "/var/cache/driver.run.part",
+        None,
+        is_running=transfer.running,
+        renderer=bar,
+        task="downloading NVIDIA driver 595.58.03",
+        poll_s=1.0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+    assert "downloading NVIDIA driver 595.58.03" in _activity_row(out)
+
+
+# -- follow_download, the awkward cases -------------------------------------
+
+
+def test_follow_download_renders_zero_percent_before_the_part_file_exists(tmp_path):
+    """The transfer has been started but has not created its file yet."""
+    part = tmp_path / "driver.run.part"
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+
+    polls = []
+    sizes = iter([500, 1000])
+
+    def running():
+        polls.append(1)
+        return len(polls) < 3
+
+    def sleep(seconds):
+        clock.advance(seconds)
+        part.write_bytes(b"x" * next(sizes))
+
+    outcome = progress.follow_download(
+        part,
+        1000,
+        is_running=running,
+        renderer=bar,
+        poll_s=1.0,
+        clock=clock,
+        sleep=sleep,
+    )
+
+    rendered = _ANSI.sub("", out.getvalue())
+    # The first frame was drawn against a file that did not exist: 0
+    # percent, not a traceback.
+    assert "0%" in rendered
+    assert "0 B / 1.00 KB" in rendered
+    assert "50%" in rendered
+    assert outcome.bytes_done == 1000
+    assert outcome.complete is True
+
+
+def test_follow_download_on_a_stalled_transfer_reports_no_rate():
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+
+    # Connected, 28.4 MB in, and then nothing moves for a minute.
+    transfer = FakeTransfer([28_400_000] * 5)
+    progress.follow_download(
+        "/var/cache/driver.run.part",
+        606_000_000,
+        is_running=transfer.running,
+        renderer=bar,
+        poll_s=15.0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+
+    row = _activity_row(out)
+    # No forward motion means no rate at all -- not 0 B/s, and not an ETA
+    # extrapolated from a division that has nothing to divide.
+    assert "/s" not in row
+    assert ":" not in row
+    assert "28.4 MB / 606 MB" in row
+
+
+def test_follow_download_without_a_total_falls_back_to_the_spinner():
+    """Section 5.3: never a bar where no true denominator exists."""
+    for absent in (None, 0, -1):
+        out, clock = FakeTty(), FakeClock()
+        bar = _tty_progress(clock, out)
+        bar.begin_step(1, "Prerequisites", _PHASES)
+        bar.phase(3)
+
+        transfer = FakeTransfer([0, 5_000_000, 9_000_000])
+        outcome = progress.follow_download(
+            "/var/cache/sdk.tar.part",
+            absent,
+            is_running=transfer.running,
+            renderer=bar,
+            task="fetching SDK tarball",
+            poll_s=1.0,
+            clock=clock,
+            sleep=transfer.sleeper(clock),
+            size_of=transfer.size,
+        )
+
+        row = _activity_row(out)
+        assert progress.BAR_FILLED not in row
+        assert progress.BAR_EMPTY not in row
+        assert "%" not in row
+        assert "fetching SDK tarball" in row
+        assert outcome.total is None
+        assert outcome.complete is False
+
+
+def test_follow_download_without_a_total_clears_a_previous_denominator():
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+    # An earlier download left a real bar on screen.
+    bar.bytes(50_000_000, 100_000_000)
+    assert "50%" in _activity_row(out)
+
+    transfer = FakeTransfer([0, 10])
+    progress.follow_download(
+        "/var/cache/sdk.tar.part",
+        None,
+        is_running=transfer.running,
+        renderer=bar,
+        poll_s=1.0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+    # Not one stale bar frame survives into the spinner-driven transfer.
+    assert "%" not in _activity_row(out)
+
+
+def test_follow_download_animates_the_spinner_while_it_has_no_denominator():
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+
+    transfer = FakeTransfer([0, 1, 2, 3, 4])
+    progress.follow_download(
+        "/var/cache/sdk.tar.part",
+        None,
+        is_running=transfer.running,
+        renderer=bar,
+        task="fetching SDK tarball",
+        poll_s=1.0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+
+    rendered = _ANSI.sub("", out.getvalue())
+    frames = {frame for frame in progress.SPINNER_FRAMES if frame in rendered}
+    # A frozen spinner reads as a hung installer, which is the whole
+    # failure this doc exists to fix.
+    assert len(frames) >= 3
+
+
+def test_follow_download_never_renders_above_one_hundred_percent():
+    """A mis-declared Content-Length: more bytes arrived than were promised."""
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+
+    transfer = FakeTransfer([0, 400_000_000, 620_000_000])
+    outcome = progress.follow_download(
+        "/var/cache/driver.run.part",
+        606_000_000,
+        is_running=transfer.running,
+        renderer=bar,
+        poll_s=2.0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+
+    rendered = _ANSI.sub("", out.getvalue())
+    assert _percents(rendered)
+    assert max(_percents(rendered)) == 100
+    assert "620 MB" not in rendered
+
+    row = _activity_row(out)
+    assert "100%" in row
+    assert "606 MB / 606 MB" in row
+
+    # The outcome keeps the real number, so a caller can still notice the
+    # server sent something other than what it declared.
+    assert outcome.bytes_done == 620_000_000
+    assert outcome.total == 606_000_000
+
+
+def test_follow_download_samples_running_before_size_so_the_last_frame_is_final():
+    """The final size must land on screen, not one poll short of it."""
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+
+    order = []
+
+    def running():
+        order.append("running")
+        return len(order) < 3
+
+    def size(path):
+        order.append("size")
+        return 1000 if len(order) >= 4 else 400
+
+    progress.follow_download(
+        "/var/cache/driver.run.part",
+        1000,
+        is_running=running,
+        renderer=bar,
+        poll_s=1.0,
+        clock=clock,
+        sleep=lambda seconds: clock.advance(seconds),
+        size_of=size,
+    )
+
+    assert order[:4] == ["running", "size", "running", "size"]
+    assert "100%" in _activity_row(out)
+
+
+# -- follow_download, off a tty (section 7) ---------------------------------
+
+
+def _plain_progress(clock: FakeClock) -> progress.Progress:
+    return progress.Progress(total_steps=7, out=io.StringIO(), clock=clock)
+
+
+def test_follow_download_off_a_tty_logs_a_plain_line_on_an_interval(capsys):
+    clock = FakeClock()
+    bar = _plain_progress(clock)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+    capsys.readouterr()
+
+    transfer = FakeTransfer([0, 151_500_000, 303_000_000, 454_500_000, 606_000_000])
+    progress.follow_download(
+        "/var/cache/driver.run.part",
+        606_000_000,
+        is_running=transfer.running,
+        renderer=bar,
+        poll_s=20.0,
+        log_interval_s=30.0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+
+    err = capsys.readouterr().err
+    # Nothing is drawn off a tty, so these lines are the only thing that
+    # keeps a multi-minute download distinguishable from a hang.
+    assert "driver.run.part: 0 B / 606 MB (0%) after 0s" in err
+    assert "driver.run.part: 303 MB / 606 MB (50%) after 40s" in err
+    assert "driver.run.part: 606 MB in 1m20s" in err
+    assert "\033" not in err
+    # Throttled to the interval, not one line per poll.
+    assert err.count("after") == 3
+
+
+def test_follow_download_on_a_tty_leaves_the_live_region_alone(capsys):
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+    capsys.readouterr()
+
+    transfer = FakeTransfer([0, 500, 1000])
+    progress.follow_download(
+        "/var/cache/driver.run.part",
+        1000,
+        is_running=transfer.running,
+        renderer=bar,
+        poll_s=60.0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+
+    # A log line here would scroll under the redrawn region and
+    # desynchronise its cursor-up arithmetic.
+    assert "after" not in capsys.readouterr().err
+
+
+def test_follow_download_with_no_renderer_still_reaches_the_transcript(capsys):
+    clock = FakeClock()
+    transfer = FakeTransfer([0, 1000])
+    progress.follow_download(
+        "/var/cache/sdk.tar.part",
+        None,
+        is_running=transfer.running,
+        poll_s=1.0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+    err = capsys.readouterr().err
+    assert "sdk.tar.part: 0 B after 0s" in err
+    assert "%" not in err
+
+
+def test_progress_live_reports_whether_anything_is_being_drawn():
+    clock = FakeClock()
+    assert _tty_progress(clock, FakeTty()).live is True
+    assert _plain_progress(clock).live is False
+    assert progress.Progress(out=FakeTty(), non_interactive=True, clock=clock).live is False
+
+
+# -- composition ------------------------------------------------------------
+
+
+def test_an_unavailable_content_length_ends_up_as_a_spinner():
+    """The end-to-end section 5.3 path: no header, therefore no bar."""
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+
+    total = progress.content_length("https://example/driver.run", probe=lambda url: None)
+    assert total is None
+
+    transfer = FakeTransfer([0, 10, 20])
+    outcome = progress.follow_download(
+        "/var/cache/driver.run.part",
+        total,
+        is_running=transfer.running,
+        renderer=bar,
+        task="downloading NVIDIA driver 595.58.03",
+        poll_s=1.0,
+        clock=clock,
+        sleep=transfer.sleeper(clock),
+        size_of=transfer.size,
+    )
+
+    assert "%" not in _activity_row(out)
+    assert outcome.total is None
+
+
+def test_render_download_log_line_agrees_with_the_drawn_row():
+    drawn = progress.render_bytes_line(412_000_000, 606_000_000)
+    logged = progress.render_download_log_line("d.part", 412_000_000, 606_000_000, 1)
+    assert _percents(drawn) == _percents(logged) == [68]
+
+
+def test_render_download_log_line_holds_at_99_until_the_last_byte():
+    line = progress.render_download_log_line("d.part", 605_999_999, 606_000_000, 1)
+    assert _percents(line) == [99]

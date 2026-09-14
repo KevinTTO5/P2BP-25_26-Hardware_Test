@@ -680,19 +680,26 @@ def test_run_streamed_capture_matches_subprocess_run(capsys):
     trailing-newline handling included. 72 call sites depend on it."""
     program = _sh("echo one; echo two >&2; printf no-trailing-newline")
 
-    streamed = shellout.run_streamed(program)
+    streamed = shellout.run_streamed(program, stream=False)
     reference = subprocess.run(program, capture_output=True, text=True)
 
     assert streamed.stdout == reference.stdout
     assert streamed.stderr == reference.stderr
     assert streamed.returncode == reference.returncode
     assert streamed.args == program
-    capsys.readouterr()
+    assert capsys.readouterr().err == ""
 
 
-def test_run_streamed_reaches_all_three_destinations(tmp_path, capsys):
-    """One pass, three destinations: renderer, returned buffer, transcript."""
-    run_file = _transcript(tmp_path)
+# ---------------------------------------------------------------------------
+# run_streamed -- exactly one writer for the child's output
+# ---------------------------------------------------------------------------
+
+
+def test_a_renderer_is_the_only_writer_of_the_childs_output(tmp_path, capsys):
+    """With a renderer, the line is drawn once and not printed again behind
+    its back. A raw `print` to the same stream would both duplicate the line
+    and tear through the cursor arithmetic the live region redraws with."""
+    _transcript(tmp_path)
     sink = _RecordingSink()
 
     result = shellout.run_streamed(
@@ -702,10 +709,43 @@ def test_run_streamed_reaches_all_three_destinations(tmp_path, capsys):
     assert sorted(sink.lines) == ["visible-line", "warned-line"]
     assert result.stdout == "visible-line\n"
     assert result.stderr == "warned-line\n"
+    terminal = capsys.readouterr().err
+    assert "visible-line" not in terminal
+    assert "warned-line" not in terminal
+
+
+def test_without_a_renderer_logs_writes_the_line_once(tmp_path, capsys):
+    """Nothing streaming and no suppression: `logs.log` writes the line, which
+    is stderr plus the transcript -- exactly what this module did before
+    streaming existed, so `run_bundled_script` keeps its behaviour."""
+    run_file = _transcript(tmp_path)
+
+    result = shellout.run_streamed(_sh("echo out-line; echo err-line >&2"))
+
+    terminal = capsys.readouterr().err
+    assert terminal.count("out-line") == 1
+    assert terminal.count("err-line") == 1
     transcript = run_file.read_text()
-    assert "[info ] [sh] visible-line" in transcript
-    assert "[warn ] [sh] warned-line" in transcript
-    capsys.readouterr()
+    assert "[info ] [sh] out-line" in transcript
+    assert "[warn ] [sh] err-line" in transcript
+    assert result.stdout == "out-line\n"
+
+
+def test_stream_false_writes_the_childs_output_nowhere(tmp_path, capsys):
+    """The escape hatch for a probe whose output would be noise: captured and
+    returned, and that is all -- no terminal, no transcript, no renderer."""
+    run_file = _transcript(tmp_path)
+    sink = _RecordingSink()
+
+    result = shellout.run_streamed(
+        _sh("echo probe-output; echo probe-warning >&2"), renderer=sink, stream=False
+    )
+
+    assert sink.lines == []
+    assert capsys.readouterr().err == ""
+    assert run_file.read_text() == ""
+    assert result.stdout == "probe-output\n"
+    assert result.stderr == "probe-warning\n"
 
 
 def test_run_streamed_does_not_deadlock_when_one_stream_is_quiet(capsys):
@@ -714,6 +754,8 @@ def test_run_streamed_does_not_deadlock_when_one_stream_is_quiet(capsys):
     reader that drained stdout first would block the child forever. The
     `timeout` turns a regression into a failed assertion rather than a hung
     test run."""
+    sink = _RecordingSink()
+
     result = shellout.run_streamed(
         _py(
             "import sys\n"
@@ -722,6 +764,7 @@ def test_run_streamed_does_not_deadlock_when_one_stream_is_quiet(capsys):
             "sys.stderr.flush()\n"
             "sys.stdout.write('quiet-stdout-line\\n')\n"
         ),
+        renderer=sink,
         timeout=60,
     )
 
@@ -729,7 +772,8 @@ def test_run_streamed_does_not_deadlock_when_one_stream_is_quiet(capsys):
     assert result.stdout == "quiet-stdout-line\n"
     assert len(result.stderr.splitlines()) == 4000
     assert len(result.stderr) > 64 * 1024  # past any plausible pipe buffer
-    capsys.readouterr()
+    assert len(sink.lines) == 4001
+    assert capsys.readouterr().err == ""
 
 
 def test_run_streamed_keeps_both_streams_whole_and_in_order(capsys):
@@ -757,7 +801,7 @@ def test_run_streamed_keeps_both_streams_whole_and_in_order(capsys):
     assert len(sink.lines) == 40
     assert [t for t in sink.lines if t.startswith("out-")] == result.stdout.splitlines()
     assert [t for t in sink.lines if t.startswith("err-")] == result.stderr.splitlines()
-    capsys.readouterr()
+    assert capsys.readouterr().err == ""
 
 
 def test_run_streamed_handles_a_large_volume_of_output(capsys):
@@ -780,7 +824,7 @@ def test_run_streamed_handles_a_large_volume_of_output(capsys):
     assert lines[0] == "Setting up package-0000 (1.2.3)"
     assert lines[-1] == "Setting up package-2999 (1.2.3)"
     assert sink.lines == lines
-    capsys.readouterr()
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.parametrize("bad_exit", [1, 2, 42])
@@ -788,34 +832,104 @@ def test_run_streamed_returns_a_nonzero_exit_code_with_its_output(bad_exit, caps
     """A failing command still hands back everything it printed -- doc 08 §6.1
     needs the last lines of a failed command's output, and today they are
     discarded."""
+    sink = _RecordingSink()
+
     result = shellout.run_streamed(
-        _sh(f"echo before-failing; echo why-it-failed >&2; exit {bad_exit}")
+        _sh(f"echo before-failing; echo why-it-failed >&2; exit {bad_exit}"),
+        renderer=sink,
     )
 
     assert result.returncode == bad_exit
     assert result.stdout == "before-failing\n"
     assert result.stderr == "why-it-failed\n"
-    capsys.readouterr()
+    assert sorted(sink.lines) == ["before-failing", "why-it-failed"]
+    assert capsys.readouterr().err == ""
 
 
 def test_run_streamed_check_raises_like_subprocess_run(capsys):
     with pytest.raises(subprocess.CalledProcessError) as excinfo:
-        shellout.run_streamed(_sh("echo partial-output; exit 7"), check=True)
+        shellout.run_streamed(
+            _sh("echo partial-output; exit 7"), check=True, stream=False
+        )
 
     assert excinfo.value.returncode == 7
     assert excinfo.value.output == "partial-output\n"
-    capsys.readouterr()
+    assert capsys.readouterr().err == ""
 
 
 def test_run_streamed_check_passes_a_zero_exit_through(capsys):
-    result = shellout.run_streamed(_sh("echo fine"), check=True)
+    result = shellout.run_streamed(_sh("echo fine"), check=True, stream=False)
 
     assert result.stdout == "fine\n"
-    capsys.readouterr()
+    assert capsys.readouterr().err == ""
 
 
 # ---------------------------------------------------------------------------
-# run_streamed -- redaction across all three destinations (doc 08 §4.2)
+# run_streamed -- undecodable output (doc 08 §4.2)
+# ---------------------------------------------------------------------------
+
+
+_UNDECODABLE = _py(
+    "import sys\n"
+    "sys.stdout.buffer.write(b'before \\xff after\\n')\n"
+    "sys.stdout.buffer.flush()\n"
+)
+
+
+def test_undecodable_output_is_replaced_rather_than_fatal(tmp_path, capsys):
+    """The one deliberate divergence from `subprocess.run`, which would raise
+    and hand back nothing. `apt` and `dpkg` emit non-UTF-8 bytes in package
+    descriptions routinely, and killing a half-finished install over one is
+    the failure doc 08 §2 exists to prevent."""
+    run_file = _transcript(tmp_path)
+    sink = _RecordingSink()
+
+    result = shellout.run_streamed(_UNDECODABLE, renderer=sink, timeout=60)
+
+    assert result.returncode == 0
+    assert result.stdout.startswith("before ")
+    assert result.stdout.endswith(" after\n")
+    assert "�" in result.stdout  # the replacement character, not a crash
+    assert sink.lines and "before" in sink.lines[0]
+    assert run_file.read_text() == ""  # a renderer owns this line, not logs
+    assert capsys.readouterr().err == ""
+
+
+def test_strict_errors_raise_instead_of_reporting_a_clean_empty_result(capsys):
+    """A reader that dies must not look like EOF. With `errors="strict"` the
+    decode failure comes back as the exception `subprocess.run` would raise,
+    not as returncode 0 with empty output -- which is the shape that sends a
+    step down its "not installed" branch on a command that actually ran."""
+    with pytest.raises(UnicodeDecodeError):
+        shellout.run_streamed(_UNDECODABLE, errors="strict", timeout=60)
+
+    # Nothing was written out either: the line never decoded.
+    assert capsys.readouterr().err == ""
+
+
+def test_a_dead_reader_does_not_truncate_the_other_stream(capsys):
+    """The failure surfaces even though the child exits zero and the other
+    pipe closes cleanly. The child sleeps between the two writes so the order
+    the consumer sees them in is the child's, not the thread scheduler's."""
+    with pytest.raises(UnicodeDecodeError):
+        shellout.run_streamed(
+            _py(
+                "import sys, time\n"
+                "sys.stderr.write('diagnostic\\n'); sys.stderr.flush()\n"
+                "time.sleep(0.5)\n"
+                "sys.stdout.buffer.write(b'\\xff\\n')\n"
+            ),
+            errors="strict",
+            timeout=60,
+        )
+
+    # The healthy stream's line was still written out before the raise, which
+    # is what makes the failure diagnosable instead of merely fatal.
+    assert "diagnostic" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# run_streamed -- redaction (doc 08 §4.2)
 # ---------------------------------------------------------------------------
 
 
@@ -823,32 +937,53 @@ def test_run_streamed_check_passes_a_zero_exit_through(capsys):
 def test_streamed_secret_reaches_none_of_the_three_destinations(
     tmp_path, capsys, secret_key
 ):
-    """The rule streaming must not break: a secret in a child's output must
-    not appear on the terminal, in the transcript, or in the returned buffer.
-    Output becoming visible live is not a reason for a secret to become
-    visible with it."""
+    """The rule streaming must not break: a secret in a child's output reaches
+    neither the terminal nor the transcript, and with `redact_capture=True`
+    not the returned buffer either. Output becoming visible live is not a
+    reason for a secret to become visible with it."""
+    secret = "super-secret-value"
+    run_file = _transcript(tmp_path)
+
+    result = shellout.run_streamed(
+        _sh(f'echo "{secret_key}=${secret_key}"; echo "bare ${secret_key}" >&2'),
+        redact_capture=True,
+        env={secret_key: secret, "PATH": os.environ["PATH"]},
+    )
+
+    terminal = capsys.readouterr().err
+    transcript = run_file.read_text()
+
+    assert secret not in terminal
+    assert secret not in transcript
+    assert secret not in result.stdout
+    assert secret not in result.stderr
+    # Scrubbed, not swallowed: the shape of the output survives everywhere.
+    assert f"{secret_key}={shellout._REDACTED}" in terminal
+    assert f"{secret_key}={shellout._REDACTED}" in transcript
+    assert f"{secret_key}={shellout._REDACTED}" in result.stdout
+    assert shellout._REDACTED in result.stderr
+
+
+@pytest.mark.parametrize("secret_key", shellout._REDACT_KEYS)
+def test_streamed_secret_is_scrubbed_on_the_renderer_path_too(
+    tmp_path, capsys, secret_key
+):
+    """The other writer, same guarantee: a renderer never receives plaintext."""
     secret = "super-secret-value"
     run_file = _transcript(tmp_path)
     sink = _RecordingSink()
 
-    result = shellout.run_streamed(
+    shellout.run_streamed(
         _sh(f'echo "{secret_key}=${secret_key}"; echo "bare ${secret_key}" >&2'),
         renderer=sink,
         env={secret_key: secret, "PATH": os.environ["PATH"]},
     )
 
     rendered = "\n".join(sink.lines)
-    transcript = run_file.read_text()
-    terminal = capsys.readouterr().err
-
     assert secret not in rendered
-    assert secret not in transcript
-    assert secret not in terminal
-    assert secret not in result.stdout
-    assert secret not in result.stderr
-    # Scrubbed, not swallowed: the shape of the output survives.
-    assert f"{secret_key}={shellout._REDACTED}" in result.stdout
-    assert shellout._REDACTED in result.stderr
+    assert shellout._REDACTED in rendered
+    assert secret not in capsys.readouterr().err
+    assert secret not in run_file.read_text()
 
 
 def test_streamed_secret_is_scrubbed_without_a_key_prefix(tmp_path, capsys):
@@ -857,17 +992,17 @@ def test_streamed_secret_is_scrubbed_without_a_key_prefix(tmp_path, capsys):
     run_file = _transcript(tmp_path)
     sink = _RecordingSink()
 
-    result = shellout.run_streamed(
+    shellout.run_streamed(
         _sh('echo "curl -H \'Authorization: Bearer $NGC_API_KEY\'"'),
         renderer=sink,
         env={"NGC_API_KEY": "nvapi-plaintext-key", "PATH": os.environ["PATH"]},
     )
 
-    assert "nvapi-plaintext-key" not in result.stdout
-    assert "nvapi-plaintext-key" not in "\n".join(sink.lines)
+    rendered = "\n".join(sink.lines)
+    assert "nvapi-plaintext-key" not in rendered
+    assert "Authorization: Bearer" in rendered  # only the value goes
+    assert "nvapi-plaintext-key" not in capsys.readouterr().err
     assert "nvapi-plaintext-key" not in run_file.read_text()
-    assert "Authorization: Bearer" in result.stdout  # only the value goes
-    capsys.readouterr()
 
 
 def test_streamed_secret_inherited_from_the_parent_is_scrubbed(
@@ -878,46 +1013,56 @@ def test_streamed_secret_inherited_from_the_parent_is_scrubbed(
     lets `NGC_API_KEY` arrive. The caller does not have to remember."""
     monkeypatch.setenv("NGC_API_KEY", "inherited-plaintext-key")
     run_file = _transcript(tmp_path)
-    sink = _RecordingSink()
 
-    result = shellout.run_streamed(_sh('echo "token is $NGC_API_KEY"'), renderer=sink)
+    shellout.run_streamed(_sh('echo "token is $NGC_API_KEY"'))
 
-    assert "inherited-plaintext-key" not in result.stdout
-    assert "inherited-plaintext-key" not in "\n".join(sink.lines)
+    assert "inherited-plaintext-key" not in capsys.readouterr().err
     assert "inherited-plaintext-key" not in run_file.read_text()
-    capsys.readouterr()
 
 
-def test_streamed_redact_capture_false_keeps_the_buffer_verbatim(tmp_path, capsys):
-    """`run_bundled_script`'s documented exception: its callers parse the
-    fragment's real output, so only the buffer opts out. The terminal and the
-    transcript stay scrubbed."""
+def test_the_returned_buffer_is_not_redacted_by_default(tmp_path, capsys):
+    """§4.1 parity, and the reason the default is off: an inherited secret is
+    a substring of ordinary output more often than it looks. Scrubbing the
+    buffer would silently corrupt what 72 call sites parse."""
     run_file = _transcript(tmp_path)
-    sink = _RecordingSink()
+    monkeypatched_env = {"NGC_API_KEY": "abc", "PATH": os.environ["PATH"]}
 
     result = shellout.run_streamed(
+        _sh("echo version abc123 build"), env=monkeypatched_env
+    )
+
+    assert result.stdout == "version abc123 build\n"
+    # The terminal and the transcript are scrubbed all the same.
+    assert "abc123" not in capsys.readouterr().err
+    assert "abc123" not in run_file.read_text()
+
+
+def test_redact_capture_true_scrubs_the_buffer_as_well(capsys):
+    """The opt-in, for a caller that would rather lose fidelity than hold the
+    plaintext."""
+    result = shellout.run_streamed(
         _sh('echo "MQTT_PASSWORD=$MQTT_PASSWORD"'),
-        renderer=sink,
-        redact_capture=False,
+        redact_capture=True,
+        stream=False,
         env={"MQTT_PASSWORD": "hunter2", "PATH": os.environ["PATH"]},
     )
 
-    assert "hunter2" in result.stdout
-    assert "hunter2" not in "\n".join(sink.lines)
-    assert "hunter2" not in run_file.read_text()
-    capsys.readouterr()
+    assert "hunter2" not in result.stdout
+    assert f"MQTT_PASSWORD={shellout._REDACTED}" in result.stdout
+    assert capsys.readouterr().err == ""
 
 
-def test_streamed_blank_secret_does_not_shred_the_output(tmp_path, capsys):
+def test_streamed_blank_secret_does_not_shred_the_output(capsys):
     """An unset-but-present secret has an empty value; substituting it would
     match at every position."""
     result = shellout.run_streamed(
         _sh("echo ordinary-output-line"),
+        stream=False,
         env={"CAM_PASSWORD": "", "PATH": os.environ["PATH"]},
     )
 
     assert result.stdout == "ordinary-output-line\n"
-    capsys.readouterr()
+    assert capsys.readouterr().err == ""
 
 
 # ---------------------------------------------------------------------------
@@ -930,11 +1075,10 @@ _ANSI_CHILD = _sh(
 )
 
 
-def test_streamed_output_off_a_tty_is_plain_lines_with_no_escapes(tmp_path, capsys):
+def test_streamed_output_off_a_tty_is_plain_lines_with_no_escapes(capsys):
     """Section 7: off a tty there are no bars, no spinners and no escapes --
     just the lines. `progress.Progress` on a non-tty stream is exactly that
     path, so this exercises the real renderer rather than a double."""
-    run_file = _transcript(tmp_path)
     out = io.StringIO()  # a StringIO reports isatty() False
 
     result = shellout.run_streamed(
@@ -944,51 +1088,15 @@ def test_streamed_output_off_a_tty_is_plain_lines_with_no_escapes(tmp_path, caps
     # Exact, not merely escape-free: both sides sanitise with the same
     # function, so what the renderer writes is fully determined.
     assert out.getvalue() == "green-line\nplain\n"
-    assert "\x1b" not in run_file.read_text()
     # The buffer is what `subprocess.run` would have returned, escapes and all:
     # a parser is entitled to the child's own bytes.
     assert "\x1b[32m" in result.stdout
-    capsys.readouterr()
-
-
-def test_streamed_lines_carry_the_renderers_own_sanitising(tmp_path, capsys):
-    """One definition of "clean", not two. The line handed to the renderer is
-    exactly `progress.sanitise` of the child's output, so the terminal and the
-    transcript cannot disagree, and the renderer's own pass over it is a no-op
-    rather than a second, different strip."""
-    run_file = _transcript(tmp_path)
-    sink = _RecordingSink()
-
-    result = shellout.run_streamed(
-        _sh('printf "\033[32mgreen\033[0m\tcolumn\n"'), renderer=sink
-    )
-
-    expected = progress.sanitise("\x1b[32mgreen\x1b[0m\tcolumn\n")
-    assert sink.lines == [expected]
-    assert progress.sanitise(expected) == expected  # nothing changes twice
-    assert f"[info ] [sh] {expected}" in run_file.read_text()
-    # The buffer is untouched by any of it.
-    assert result.stdout == "\x1b[32mgreen\x1b[0m\tcolumn\n"
-    capsys.readouterr()
-
-
-def test_streamed_buffer_keeps_the_child_text_the_renderer_cleaned(capsys):
-    """The capture buffer is what `subprocess.run` would have returned, not
-    what the terminal showed: 72 call sites parse it and are entitled to the
-    child's own bytes."""
-    program = _sh('printf "\033[1mbold\033[0m\ttabbed\n"')
-
-    streamed = shellout.run_streamed(program, renderer=_RecordingSink())
-    reference = subprocess.run(program, capture_output=True, text=True)
-
-    assert streamed.stdout == reference.stdout
-    assert "\t" in streamed.stdout
-    capsys.readouterr()
+    assert capsys.readouterr().err == ""
 
 
 def test_streamed_control_characters_never_reach_the_transcript(tmp_path, capsys):
-    """Doc 00 §8.2's no-escape rule, which `logs.py` cannot enforce by itself
-    because it never sees the raw line."""
+    """Doc 00 §8.2's no-escape rule, on the path where `logs` is the writer.
+    It cannot enforce this itself: it never sees the raw line."""
     run_file = _transcript(tmp_path)
 
     shellout.run_streamed(_ANSI_CHILD)
@@ -997,7 +1105,43 @@ def test_streamed_control_characters_never_reach_the_transcript(tmp_path, capsys
     assert "\x1b" not in transcript
     assert "\x07" not in transcript
     assert "[info ] [sh] green-line" in transcript
-    capsys.readouterr()
+    assert "\x1b" not in capsys.readouterr().err
+
+
+def test_streamed_lines_carry_the_renderers_own_sanitising(tmp_path, capsys):
+    """One definition of "clean", not two. The line written out is exactly
+    `progress.sanitise` of the child's output, so the terminal and the
+    transcript cannot disagree, and the renderer's own pass over it is a no-op
+    rather than a second, different strip."""
+    run_file = _transcript(tmp_path)
+    sink = _RecordingSink()
+    program = _sh('printf "\\033[32mgreen\\033[0m\\tcolumn\\n"')
+    expected = progress.sanitise("\x1b[32mgreen\x1b[0m\tcolumn\n")
+
+    rendered = shellout.run_streamed(program, renderer=sink)
+    logged = shellout.run_streamed(program)
+
+    assert sink.lines == [expected]
+    assert progress.sanitise(expected) == expected  # nothing changes twice
+    assert f"[info ] [sh] {expected}" in run_file.read_text()
+    # The buffer is untouched by any of it, on either path.
+    assert rendered.stdout == "\x1b[32mgreen\x1b[0m\tcolumn\n"
+    assert logged.stdout == rendered.stdout
+    assert expected in capsys.readouterr().err
+
+
+def test_streamed_buffer_keeps_the_child_text_the_renderer_cleaned(capsys):
+    """The capture buffer is what `subprocess.run` would have returned, not
+    what the terminal showed: 72 call sites parse it and are entitled to the
+    child's own bytes."""
+    program = _sh('printf "\\033[1mbold\\033[0m\\ttabbed\\n"')
+
+    streamed = shellout.run_streamed(program, renderer=_RecordingSink())
+    reference = subprocess.run(program, capture_output=True, text=True)
+
+    assert streamed.stdout == reference.stdout
+    assert "\t" in streamed.stdout
+    assert capsys.readouterr().err == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1005,37 +1149,22 @@ def test_streamed_control_characters_never_reach_the_transcript(tmp_path, capsys
 # ---------------------------------------------------------------------------
 
 
-def test_stream_false_suppresses_live_output_but_still_captures(tmp_path, capsys):
-    """The escape hatch for a short probe whose output would be noise: nothing
-    live, everything still captured and recorded."""
-    run_file = _transcript(tmp_path)
-    sink = _RecordingSink()
-
-    result = shellout.run_streamed(
-        _sh("echo probe-output"), renderer=sink, stream=False
-    )
-
-    assert sink.lines == []
-    assert result.stdout == "probe-output\n"
-    assert "probe-output" in run_file.read_text()
-    capsys.readouterr()
-
-
-def test_no_renderer_and_no_verbose_streams_nothing(capsys):
-    """A caller holding no renderer has asked for nothing live; this is the
-    behaviour every call site had before streaming existed."""
+def test_no_renderer_and_no_verbose_writes_nothing_to_out(capsys):
+    """`out` is the fallback renderer's stream, not a second copy of the
+    output: without `verbose` there is no fallback renderer to write to it."""
     out = io.StringIO()
 
     result = shellout.run_streamed(_sh("echo quiet-output"), out=out)
 
     assert out.getvalue() == ""
     assert result.stdout == "quiet-output\n"
-    capsys.readouterr()
+    assert "quiet-output" in capsys.readouterr().err  # logs is the writer here
 
 
-def test_verbose_with_no_renderer_streams_every_line_verbatim(capsys):
+def test_verbose_with_no_renderer_streams_every_line_verbatim(tmp_path, capsys):
     """`--verbose` means everything, verbatim (doc 08 §8), even when the
     caller has no progress handle to hand over."""
+    _transcript(tmp_path)
     out = io.StringIO()
 
     shellout.run_streamed(
@@ -1045,10 +1174,9 @@ def test_verbose_with_no_renderer_streams_every_line_verbatim(capsys):
     )
 
     written = out.getvalue().splitlines()
-    assert "first-line" in written
-    assert "second-line" in written
-    assert "third-line" in written
-    capsys.readouterr()
+    assert sorted(written) == ["first-line", "second-line", "third-line"]
+    # The fallback renderer is the writer, so nothing is printed twice.
+    assert capsys.readouterr().err == ""
 
 
 def test_verbose_does_not_override_a_supplied_renderer(capsys):
@@ -1061,7 +1189,7 @@ def test_verbose_does_not_override_a_supplied_renderer(capsys):
 
     assert sink.lines == ["only-once"]
     assert out.getvalue() == ""
-    capsys.readouterr()
+    assert capsys.readouterr().err == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1074,9 +1202,27 @@ def test_run_streamed_rejects_caller_supplied_pipes(owned):
     """The runner owns both pipes; redirecting one would silently defeat the
     tee, so it is refused rather than half-honoured."""
     with pytest.raises(ValueError):
+        shellout.run_streamed(_sh("true"), **{owned: subprocess.DEVNULL})
+
+
+def test_run_streamed_rejects_stdin_together_with_input():
+    """`subprocess.run` raises `ValueError` for this; so does the seam that
+    replaces it, rather than a `TypeError` about duplicate keywords."""
+    with pytest.raises(ValueError):
         shellout.run_streamed(
-            _sh("true"), **{owned: subprocess.DEVNULL}
+            _sh("cat"), stdin=subprocess.PIPE, input="text", timeout=30
         )
+
+
+def test_run_streamed_closes_a_caller_supplied_stdin_pipe(capsys):
+    """`stdin=PIPE` with nothing to write would leave the child waiting on
+    input that is never coming. `subprocess.run` closes it; so does this."""
+    result = shellout.run_streamed(
+        _sh("cat; echo done"), stdin=subprocess.PIPE, timeout=30, stream=False
+    )
+
+    assert result.stdout == "done\n"
+    assert capsys.readouterr().err == ""
 
 
 def test_run_streamed_ignores_implied_capture_kwargs(capsys):
@@ -1084,11 +1230,11 @@ def test_run_streamed_ignores_implied_capture_kwargs(capsys):
     edit to adopt streaming -- that is what makes the §4.1 seam a one-method
     change."""
     result = shellout.run_streamed(
-        _sh("echo implied"), capture_output=True, text=True, check=False
+        _sh("echo implied"), capture_output=True, text=True, check=False, stream=False
     )
 
     assert result.stdout == "implied\n"
-    capsys.readouterr()
+    assert capsys.readouterr().err == ""
 
 
 def test_run_streamed_forwards_cwd_and_env(tmp_path, capsys):
@@ -1097,27 +1243,30 @@ def test_run_streamed_forwards_cwd_and_env(tmp_path, capsys):
     result = shellout.run_streamed(
         _sh('ls marker.txt; echo "VAR=$MY_VAR"'),
         cwd=str(tmp_path),
+        stream=False,
         env={"MY_VAR": "forwarded", "PATH": os.environ["PATH"]},
     )
 
     assert "marker.txt" in result.stdout
     assert "VAR=forwarded" in result.stdout
-    capsys.readouterr()
+    assert capsys.readouterr().err == ""
 
 
 def test_run_streamed_delivers_input_to_the_child(capsys):
     """`input` is written from its own thread for the same reason both pipes
     are read from theirs: a child that talks before it listens would otherwise
     deadlock a parent that insisted on writing first."""
-    result = shellout.run_streamed(_sh("cat"), input="fed-on-stdin\n")
+    result = shellout.run_streamed(_sh("cat"), input="fed-on-stdin\n", stream=False)
 
     assert result.stdout == "fed-on-stdin\n"
-    capsys.readouterr()
+    assert capsys.readouterr().err == ""
 
 
 def test_run_streamed_times_out_and_keeps_what_it_saw(capsys):
     """`TimeoutExpired` carries the output collected so far, so a wedged
     command is diagnosable rather than merely reported as slow."""
+    sink = _RecordingSink()
+
     with pytest.raises(subprocess.TimeoutExpired) as excinfo:
         shellout.run_streamed(
             _py(
@@ -1125,11 +1274,13 @@ def test_run_streamed_times_out_and_keeps_what_it_saw(capsys):
                 "sys.stdout.write('started\\n'); sys.stdout.flush()\n"
                 "time.sleep(30)\n"
             ),
+            renderer=sink,
             timeout=1.0,
         )
 
     assert "started" in (excinfo.value.output or "")
-    capsys.readouterr()
+    assert sink.lines == ["started"]
+    assert capsys.readouterr().err == ""
 
 
 def test_run_streamed_propagates_a_missing_executable(capsys):
@@ -1138,7 +1289,7 @@ def test_run_streamed_propagates_a_missing_executable(capsys):
     with pytest.raises(FileNotFoundError):
         shellout.run_streamed(["/nonexistent/binary-that-is-not-there"])
 
-    capsys.readouterr()
+    assert capsys.readouterr().err == ""
 
 
 def test_run_streamed_labels_transcript_lines_with_the_command_name(tmp_path, capsys):
@@ -1147,7 +1298,7 @@ def test_run_streamed_labels_transcript_lines_with_the_command_name(tmp_path, ca
     shellout.run_streamed(_sh("echo labelled"), label="custom-label")
 
     assert "[info ] [custom-label] labelled" in run_file.read_text()
-    capsys.readouterr()
+    assert "[custom-label] labelled" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -1171,15 +1322,17 @@ def test_bundled_script_streams_through_the_tee_runner(tmp_path, monkeypatch, ca
     assert sorted(sink.lines) == ["staged-err", "staged-out"]
     assert result.stdout == "staged-out\n"
     assert result.stderr == "staged-err\n"
-    capsys.readouterr()
+    # The renderer is the writer; only shellout's own bookkeeping is printed.
+    terminal = capsys.readouterr().err
+    assert "staged-out" not in terminal
+    assert "chatty.sh exited 0" in terminal
 
 
 def test_bundled_script_keeps_its_unredacted_buffer_while_streaming(
     tmp_path, monkeypatch, capsys
 ):
     """Its documented contract survives the move onto the shared runner: the
-    caller parses the fragment's real output, the terminal and transcript do
-    not see it."""
+    caller parses the fragment's real output, the terminal does not see it."""
     fixture = _fixture_script(
         tmp_path, "leak.sh", '#!/bin/sh\necho "NGC_API_KEY=$NGC_API_KEY"\n'
     )
@@ -1193,19 +1346,21 @@ def test_bundled_script_keeps_its_unredacted_buffer_while_streaming(
 
     assert "staged-secret" in result.stdout
     assert "staged-secret" not in "\n".join(sink.lines)
+    assert "staged-secret" not in capsys.readouterr().err
     assert "staged-secret" not in run_file.read_text()
-    capsys.readouterr()
 
 
-def test_bundled_script_streams_nothing_by_default(tmp_path, monkeypatch, capsys):
-    """No `Context`, no progress handle: a fragment is quiet unless a caller
-    asks for it, which keeps every existing call site behaving as it did."""
-    fixture = _fixture_script(tmp_path, "quiet.sh", "#!/bin/sh\necho unseen\n")
+def test_bundled_script_logs_its_output_when_no_renderer_is_given(
+    tmp_path, monkeypatch, capsys
+):
+    """The default path is unchanged from before streaming existed: `logs`
+    writes the fragment's output to stderr and the transcript, once."""
+    fixture = _fixture_script(tmp_path, "quiet.sh", "#!/bin/sh\necho seen\n")
     monkeypatch.setattr(shellout, "asset_path", lambda *parts: fixture)
-    out = io.StringIO()
+    run_file = _transcript(tmp_path)
 
     result = shellout.run_bundled_script("scripts", "quiet.sh")
 
-    assert out.getvalue() == ""
-    assert result.stdout == "unseen\n"
-    capsys.readouterr()
+    assert result.stdout == "seen\n"
+    assert capsys.readouterr().err.count("[quiet.sh] seen") == 1
+    assert "[info ] [quiet.sh] seen" in run_file.read_text()

@@ -170,6 +170,16 @@ def run_root(self, *args: str, stream: bool | None = None, **kwargs: Any)
 the caller asked for captured output. `stream=False` restores today's
 behaviour for a probe whose output would be noise.
 
+> **Unsettled, owned by [U11](#12-unit-and-wave-decomposition):** this
+> tty-gating and §7's table disagree. §7 says a non-tty run still gets
+> per-line output, plain; auto as written streams nothing off a tty, so
+> `mv3dt-installer | tee install.log` shows the operator nothing while it
+> runs. The transcript still receives everything, so no record is lost, but
+> "piped to a file" is a normal way to run an installer and silence there
+> repeats the failure §2 documents. Settle it in U11, which owns `app.py`
+> next: either auto streams plain lines off a tty, or §7's table is narrowed
+> to mean the transcript only. Do not resolve it by editing a step.
+
 This is the decision that makes the change tractable. Rewriting 72 call
 sites would be seven PRs of mechanical edits across every step module;
 changing one method is one reviewable unit, and every existing test that
@@ -184,7 +194,15 @@ When streaming, `run_root`:
 3. Writes each line to the terminal, indented and dimmed, under the current
    phase banner.
 4. Appends each line to the in-memory buffer that becomes
-   `CompletedProcess.stdout` / `.stderr`.
+   `CompletedProcess.stdout` / `.stderr`. **This buffer is deliberately not
+   scrubbed**, and that is not an oversight in the list above: §4.1 requires
+   it to be byte-identical to what `subprocess.run` would have returned, and
+   72 call sites parse it. Scrubbing is substring replacement against
+   environment values, so a child printing `version abc123 build` with
+   `NGC_API_KEY=abc` set would come back as `version <redacted>123 build` and
+   silently break every one of those parsers. The buffer is in-memory and
+   reaches no durable artifact on its own; the destinations that persist —
+   the terminal and the transcript — are always scrubbed.
 5. Appends each line to the transcript, honouring the existing redaction
    rules in [`shellout.py`](../mv3dt_installer/shellout.py).
 
@@ -300,6 +318,48 @@ No ANSI escape ever reaches the transcript. This is the existing rule in
 `logs.py` already enforces it for log lines; §4.2's writer honours it for
 streamed output.
 
+### 7.1 Live rendering must never cost the transcript (REQUIRED)
+
+`logs._emit` writes to stderr **and** appends to the transcript from a single
+call: there is no transcript-only sink. Any code that suppresses a log line
+to protect the live region therefore deletes it from the auditable record as
+well.
+
+That trade is not acceptable, and it bites hardest in the one case this doc
+exists for. A long download on an interactive tty draws a bar, so a periodic
+plain summary would be redundant on screen and is naturally suppressed — but
+suppressing it leaves the transcript with the task name, then nothing for the
+duration of a multi-hundred-megabyte transfer, then the phase-done line.
+Interactive runs are exactly the ones an operator performs by hand and later
+asks about.
+
+**REQUIRED:** `logs.py` grows a transcript-only write, and anything that
+suppresses a line for rendering reasons uses it instead of dropping the line.
+The screen may show less than the transcript. The transcript may never show
+less than the screen.
+
+> **U12 is a release blocker, and it lands before U4.** The gap opens the
+> moment `run_root` streams, not at release, so U12 is resequenced ahead of
+> U4 rather than left to wave 5: the loss then never exists on `main`, even
+> transiently.
+>
+> **Why it is a blocker at all.** The tee runner
+> (§4.2) must route each line to exactly one writer, or a line renders twice
+> and the raw copy tears through the live region's cursor arithmetic. With
+> no transcript-only sink, "exactly one writer" means a streamed line
+> reaches the renderer *instead of* the transcript. That is invisible while
+> nothing streams, and becomes a real loss the moment `run_root` starts
+> streaming — the transcript would then hold the phase sequence and the
+> reporting strings, but none of the command output an operator actually
+> needs to diagnose a failed install. **No release may ship streaming
+> without U12.** The two `record` call sites in the runner are where the
+> sink gets used.
+
+A related consistency rule: where a value is clamped for display (§5.1's
+overshoot case renders 100 percent of the declared total), the transcript
+must not mix the clamped and unclamped forms in the same run. Record the true
+number, and say it is the true number.
+
 ---
 
 ## 8. Verbosity
@@ -408,6 +468,7 @@ Open decision for the human:
 | U9 Phases and task naming, Steps 4-7 | `feat/installer-progress-steps-4-7` | `mv3dt_installer/steps/step4_calib_output_wiring.py`, `step5_per_project_exes.py`, `step6_remote_supervision.py`, `step7_webapp_integration.py`, their tests | U5, U7 | 6 |
 | U10 Failure context block and inferred-refusal evidence | `feat/installer-progress-failure-context` | `mv3dt_installer/report.py`, `tests/test_report.py` | U5 | 5 |
 | U11 Verbosity flag and doc 00 section 8 update | `feat/installer-progress-verbosity` | `mv3dt_installer/app.py`, `installer/plan/00-FRAMEWORK-AND-BOOTSTRAP.md`, `tests/test_app.py` | U5 | 5 |
+| U12 Transcript-only sink, so live rendering never costs the record | `feat/installer-progress-transcript-sink` | `mv3dt_installer/logs.py`, `tests/test_logs.py`, `mv3dt_installer/shellout.py`, `tests/test_shellout.py`, `mv3dt_installer/progress.py`, `tests/test_progress.py` | U3 | 4 |
 
 ### 12.1 Serialization points
 
@@ -425,7 +486,11 @@ Three files force ordering, and the waves above encode it:
   wires `run_root` to it. Putting the streaming implementation in U4
   alongside the `Context` change would have been one unreviewable PR
   touching the subprocess path and the progress path at once.
-- **`progress.py`** appears in U1, U6 and U7 (waves 1, 3, 4). The adapters
+- **`logs.py`** is touched only by U12, but every unit that suppresses a line
+  depends on the sink it adds. U12 is therefore the last progress unit to
+  land, and until it does, suppressing a line for rendering reasons is a
+  known gap in the record rather than a solved problem (§7.1).
+- **`progress.py`** appears in U1, U6, U7 and U12 (waves 1, 3, 4, 5). The adapters
   extend the renderer's public surface, so they must land after it exists
   and after each other: U7's apt bar reuses the byte-bar primitive U6
   introduces.
