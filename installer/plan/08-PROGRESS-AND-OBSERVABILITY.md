@@ -462,7 +462,7 @@ Open decision for the human:
 | U3 Tee runner: stream, capture and redact in one pass | `feat/installer-progress-streaming` | `mv3dt_installer/shellout.py`, `tests/test_shellout.py` | U1 | 2 |
 | U4 `Context.progress` handle and streaming `run_root` | `feat/installer-progress-context` | `mv3dt_installer/app.py`, `tests/test_app.py` | U1, U2, U3 | 3 |
 | U5a Step and phase banner in the dispatch loop | `feat/installer-progress-banner` | `mv3dt_installer/app.py`, `tests/test_app.py` | U4, U12 | 5 |
-| U5b The two defects in [§12.2](#122-known-defects-u5-carries) | `feat/installer-progress-defects` | `mv3dt_installer/progress.py`, `mv3dt_installer/logs.py`, their tests | U12 | 6 |
+| U5b The four defects in [§12.2](#122-known-defects-u5-carries) | `feat/installer-progress-defects` | `mv3dt_installer/progress.py`, `mv3dt_installer/logs.py`, their tests | U12, U5a | 6 |
 | U6 Download byte-progress adapter | `feat/installer-progress-downloads` | `mv3dt_installer/progress.py`, `tests/test_progress.py` | U1, U3 | 3 |
 | U7 apt `Status-Fd` percentage adapter | `feat/installer-progress-apt` | `mv3dt_installer/progress.py`, `tests/test_progress.py` | U6 | 5 |
 | U8 Phases and task naming, Steps 1-3 | `feat/installer-progress-steps-1-3` | `mv3dt_installer/steps/step1_prerequisites.py`, `step2_deepstream_sdk.py`, `step3_amc_launcher.py`, their tests | U5a, U7 | 7 |
@@ -473,8 +473,10 @@ Open decision for the human:
 
 ### 12.2 Known defects U5 carries
 
-Both were found in review of a unit that could not fix them, so they are
-recorded here rather than left in a PR comment.
+Each was found in review of a unit that could not fix them, so they are
+recorded here rather than left in a PR comment. Defects 3 and 4 make U5b a
+release blocker alongside U12: U5a's banner is what makes defect 3
+reachable, so U5a must not reach `main` ahead of the fix.
 
 1. **The step banner prints twice on a tty.** `Progress.begin_step` calls
    `log.info(banner)` and then writes the same banner to its own output
@@ -495,6 +497,36 @@ recorded here rather than left in a PR comment.
    alongside the escape pattern closes it. The comment above it currently
    claims a guarantee the regex does not deliver, which is the part that
    most needs fixing: a wrong comment outlives a narrow regex.
+3. **A foreign write invalidates the erase arithmetic.** The renderer
+   erases its region by counting the rows it drew and moving the cursor up
+   that many. Any write to stderr that does not go through the renderer
+   moves the cursor without it knowing, so the count is short by exactly
+   that many rows and the clear-below eats real output. The seven step
+   modules alone hold 121 direct `log.info` / `log.warn` / `log.error`
+   calls (7 in step 1, 45 in step 5), so on a tty install step 5 loses the
+   last rows of its own output under a stale region. Found in review of
+   U5a, which makes it reachable: on `main` no step is ever begun, `_drawn`
+   never leaves 0, and `_erase` is inert.
+
+   **Do not fix this by opening the region only once a step declares a
+   phase.** That was the first fix proposed and it is measurably wrong:
+   with no region open, `Progress.line()` appends to the window, `_draw()`
+   finds `_phase_started is None`, `_frame_lines()` returns empty, and the
+   terminal receives zero bytes. No step declares a phase until U8 and U9,
+   so it would make every streamed line invisible on a tty across all seven
+   steps, which is the failure in §2 this document exists to remove.
+   Measured on the real renderer, not inferred. The fix is the other one:
+   route the bypassing writes through the renderer using the `_erase` /
+   write / `_draw` sandwich `Progress.line()` already uses in verbose mode.
+4. **`--non-interactive` does not suppress colour.** `logs._colour_enabled()`
+   is `sys.stderr.isatty()` alone and never learns about the flag, so an
+   operator running `--non-interactive` on a real terminal still gets
+   `\033[32m[info ]` on every line. §7 is REQUIRED and asks for no escape
+   sequence at all, so this is a live violation of it. Found while
+   tightening U5a's degradation test, which had been asserting no-escape
+   against a stream that was never in live mode to begin with; that
+   assertion is currently split around this gap and tightens to a bare
+   no-escape check once it is closed.
 
 ---
 
