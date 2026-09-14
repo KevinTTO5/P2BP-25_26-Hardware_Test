@@ -469,6 +469,7 @@ Open decision for the human:
 | U9 Phases and task naming, Steps 4-7 | `feat/installer-progress-steps-4-7` | `mv3dt_installer/steps/step4_calib_output_wiring.py`, `step5_per_project_exes.py`, `step6_remote_supervision.py`, `step7_webapp_integration.py`, their tests | U5a, U7 | 7 |
 | U10 Failure context block and inferred-refusal evidence | `feat/installer-progress-failure-context` | `mv3dt_installer/report.py`, `tests/test_report.py` | U5a | 6 |
 | U11 Verbosity flag and doc 00 section 8 update | `feat/installer-progress-verbosity` | `mv3dt_installer/app.py`, `installer/plan/00-FRAMEWORK-AND-BOOTSTRAP.md`, `tests/test_app.py` | U5a | 6 |
+| U13 Plumb the parsed `--non-interactive` through to `logs.set_colour` | `feat/installer-progress-colour-plumbing` | `mv3dt_installer/app.py`, `tests/test_app.py`, `tests/test_logs.py` | U5b, U11 | 8 |
 | U12 Transcript-only sink, so live rendering never costs the record | `feat/installer-progress-transcript-sink` | `mv3dt_installer/logs.py`, `tests/test_logs.py`, `mv3dt_installer/shellout.py`, `tests/test_shellout.py`, `mv3dt_installer/progress.py`, `tests/test_progress.py` | U3 | 4 |
 
 ### 12.2 Known defects U5 carries
@@ -527,6 +528,20 @@ reachable, so U5a must not reach `main` ahead of the fix.
    against a stream that was never in live mode to begin with; that
    assertion is currently split around this gap and tightens to a bare
    no-escape check once it is closed.
+
+   **U5b's argv sniff is a pre-parse default, not the answer (U13).**
+   `logs` cannot import `app`, and the colour decision is needed before
+   `argparse` has run, so reading `sys.argv` is the only thing available at
+   that point and it is deliberately conservative. It is not authoritative:
+   it duplicates parsing `argparse` owns, it has to hand-implement
+   argparse's unambiguous-prefix rule (`--non`, `--non-int`), and it is
+   wrong for any caller that does not pass the installer's own argv. The
+   authoritative value is `logs.set_colour(enabled)`, called once from
+   `app.py` with the *parsed* flag. That call cannot be written until both
+   U5b (which adds `set_colour`) and U11 (which owns `app.py`) are on
+   `main`, so it is split out as **U13** rather than left as a comment
+   nobody owns. Until U13 lands, an exotic spelling of the flag still
+   colours its output, which costs a cosmetic escape and nothing else.
 
 ---
 
