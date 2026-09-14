@@ -61,7 +61,7 @@ import pathlib
 import re
 from typing import TYPE_CHECKING, Sequence
 
-from mv3dt_installer import shellout, waitui
+from mv3dt_installer import progress_exec, shellout, waitui
 from mv3dt_installer.steps import StepResult, StepStatus, UserAction, register
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -563,19 +563,25 @@ def _download_driver_run(ctx: "Context", dest: pathlib.Path) -> str | None:
     # says nothing about wget, which a minimal or server image need not ship.
     # -f so an HTTP error is a non-zero exit rather than an error page saved
     # under the runfile's name, -L to follow the mirror's redirect.
-    result = ctx.run_root(
-        "curl",
-        "-fL",
-        "--retry",
-        "3",
-        "--connect-timeout",
-        "30",
-        "-o",
-        str(partial),
+    result = progress_exec.download(
+        ctx,
+        partial,
         DRIVER_DOWNLOAD_URL,
-        check=False,
-        capture_output=True,
-        text=True,
+        lambda: ctx.run_root(
+            "curl",
+            "-fL",
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "30",
+            "-o",
+            str(partial),
+            DRIVER_DOWNLOAD_URL,
+            check=False,
+            capture_output=True,
+            text=True,
+        ),
+        task=f"NVIDIA driver {DRIVER_VERSION}",
     )
     if result.returncode != 0 or not partial.is_file():
         partial.unlink(missing_ok=True)
@@ -625,8 +631,8 @@ def _apt_install_reported(
     before/after `dpkg-query` presence probe (STEP-1 section 2.2 / 7.2)."""
     before = {pkg: _dpkg_version(ctx, pkg) for pkg in query_packages}
     argv = list(apt_args) if apt_args is not None else list(query_packages)
-    ctx.run_root(
-        "apt-get",
+    progress_exec.apt(
+        ctx,
         "install",
         "-y",
         "--no-install-recommends",
@@ -664,9 +670,11 @@ def _install_cuda_toolkit(ctx: "Context") -> None:
         capture_output=True,
         text=True,
     )
-    ctx.run_root("apt-get", "update", check=False, capture_output=True, text=True)
-    ctx.run_root(
-        "apt-get",
+    progress_exec.apt(
+        ctx, "update", check=False, capture_output=True, text=True
+    )
+    progress_exec.apt(
+        ctx,
         "install",
         "-y",
         "--no-install-recommends",
@@ -739,11 +747,11 @@ def _purge_distro_nvidia_packages(ctx: "Context") -> bool:
             packages.append(package)
     if not packages:
         return False
-    ctx.run_root(
-        "apt-get", "purge", "-y", *packages, check=False, capture_output=True, text=True
+    progress_exec.apt(
+        ctx, "purge", "-y", *packages, check=False, capture_output=True, text=True
     )
-    ctx.run_root(
-        "apt-get", "autoremove", "-y", check=False, capture_output=True, text=True
+    progress_exec.apt(
+        ctx, "autoremove", "-y", check=False, capture_output=True, text=True
     )
     return True
 
@@ -1085,8 +1093,8 @@ class Step1Prerequisites:
 
         ctx.progress.task(f"cuDNN {CUDNN_VERSION}")
         cudnn_before = _dpkg_version(ctx, CUDNN_QUERY_PACKAGE)
-        ctx.run_root(
-            "apt-get",
+        progress_exec.apt(
+            ctx,
             "install",
             "-y",
             "--no-install-recommends",
