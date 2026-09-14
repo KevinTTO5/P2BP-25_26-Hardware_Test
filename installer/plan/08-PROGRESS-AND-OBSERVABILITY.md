@@ -461,13 +461,14 @@ Open decision for the human:
 | U2 Phase declaration API on the step interface | `feat/installer-progress-phase-api` | `mv3dt_installer/steps/__init__.py`, `tests/test_steps_protocol.py` | — | 1 |
 | U3 Tee runner: stream, capture and redact in one pass | `feat/installer-progress-streaming` | `mv3dt_installer/shellout.py`, `tests/test_shellout.py` | U1 | 2 |
 | U4 `Context.progress` handle and streaming `run_root` | `feat/installer-progress-context` | `mv3dt_installer/app.py`, `tests/test_app.py` | U1, U2, U3 | 3 |
-| U5 Step and phase banner in the dispatch loop, and two defects below | `feat/installer-progress-banner` | `mv3dt_installer/app.py`, `tests/test_app.py`, `mv3dt_installer/progress.py`, `mv3dt_installer/logs.py`, their tests | U4, U12 | 5 |
+| U5a Step and phase banner in the dispatch loop | `feat/installer-progress-banner` | `mv3dt_installer/app.py`, `tests/test_app.py` | U4, U12 | 5 |
+| U5b The two defects in [§12.2](#122-known-defects-u5-carries) | `feat/installer-progress-defects` | `mv3dt_installer/progress.py`, `mv3dt_installer/logs.py`, their tests | U12 | 6 |
 | U6 Download byte-progress adapter | `feat/installer-progress-downloads` | `mv3dt_installer/progress.py`, `tests/test_progress.py` | U1, U3 | 3 |
-| U7 apt `Status-Fd` percentage adapter | `feat/installer-progress-apt` | `mv3dt_installer/progress.py`, `tests/test_progress.py` | U6 | 4 |
-| U8 Phases and task naming, Steps 1-3 | `feat/installer-progress-steps-1-3` | `mv3dt_installer/steps/step1_prerequisites.py`, `step2_deepstream_sdk.py`, `step3_amc_launcher.py`, their tests | U5, U7 | 6 |
-| U9 Phases and task naming, Steps 4-7 | `feat/installer-progress-steps-4-7` | `mv3dt_installer/steps/step4_calib_output_wiring.py`, `step5_per_project_exes.py`, `step6_remote_supervision.py`, `step7_webapp_integration.py`, their tests | U5, U7 | 6 |
-| U10 Failure context block and inferred-refusal evidence | `feat/installer-progress-failure-context` | `mv3dt_installer/report.py`, `tests/test_report.py` | U5 | 5 |
-| U11 Verbosity flag and doc 00 section 8 update | `feat/installer-progress-verbosity` | `mv3dt_installer/app.py`, `installer/plan/00-FRAMEWORK-AND-BOOTSTRAP.md`, `tests/test_app.py` | U5 | 5 |
+| U7 apt `Status-Fd` percentage adapter | `feat/installer-progress-apt` | `mv3dt_installer/progress.py`, `tests/test_progress.py` | U6 | 5 |
+| U8 Phases and task naming, Steps 1-3 | `feat/installer-progress-steps-1-3` | `mv3dt_installer/steps/step1_prerequisites.py`, `step2_deepstream_sdk.py`, `step3_amc_launcher.py`, their tests | U5a, U7 | 7 |
+| U9 Phases and task naming, Steps 4-7 | `feat/installer-progress-steps-4-7` | `mv3dt_installer/steps/step4_calib_output_wiring.py`, `step5_per_project_exes.py`, `step6_remote_supervision.py`, `step7_webapp_integration.py`, their tests | U5a, U7 | 7 |
+| U10 Failure context block and inferred-refusal evidence | `feat/installer-progress-failure-context` | `mv3dt_installer/report.py`, `tests/test_report.py` | U5a | 6 |
+| U11 Verbosity flag and doc 00 section 8 update | `feat/installer-progress-verbosity` | `mv3dt_installer/app.py`, `installer/plan/00-FRAMEWORK-AND-BOOTSTRAP.md`, `tests/test_app.py` | U5a | 6 |
 | U12 Transcript-only sink, so live rendering never costs the record | `feat/installer-progress-transcript-sink` | `mv3dt_installer/logs.py`, `tests/test_logs.py`, `mv3dt_installer/shellout.py`, `tests/test_shellout.py`, `mv3dt_installer/progress.py`, `tests/test_progress.py` | U3 | 4 |
 
 ### 12.2 Known defects U5 carries
