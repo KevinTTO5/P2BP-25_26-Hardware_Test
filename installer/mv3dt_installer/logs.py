@@ -16,12 +16,12 @@ Public API:
     transcript(level, msg) -- append one line to the transcript *only*,
         printing nothing (doc 08 §7.1).
     die(msg)             -- log.error(msg) then sys.exit(1); never returns.
-    set_colour(enabled)  -- force the colour decision, or None to go back
-        to auto-detection (doc 08 §7).
+    set_colour(enabled)  -- the authoritative colour decision, or None to
+        go back to the pre-parse default (doc 08 §7).
     set_live_writer(stream, writer) / clear_live_writer(writer) -- hand the
         printed copy of a log line to a live renderer that owns the cursor
         on `stream`, so a log call cannot corrupt its redraw arithmetic
-        (doc 08 §12.2 defect 3).
+        (doc 08 §12.2 defect 3). `writer(level, line)`.
     open_transcript(log_dir=None) -- open/create the per-run transcript file
         and wire subsequent log.*() calls to also append to it. Returns the
         path to the per-run file.
@@ -86,11 +86,21 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 # The flag doc 00 §3.3 defines and doc 08 §7 makes REQUIRED here: a
 # non-interactive run writes no escape sequence at all, on a real terminal
-# as much as down a pipe. It is read off argv rather than plumbed in from a
-# parsed `Namespace` because argv is where the flag is from the first
-# instruction of the process, so the rule holds for every log line a run
-# emits, including any written before or during argument parsing.
-# `set_colour` is the explicit override for a caller that knows better.
+# as much as down a pipe.
+#
+# Reading it off argv is the *pre-parse default* and nothing more. A log
+# line can be emitted before `parse_args` has run and something has to
+# decide for it, so this decides, and it is deliberately conservative: it
+# would rather drop colour from a run that wanted it than write an escape
+# into a run that forbids it. It is not authoritative, because argv is not
+# where the answer lives once the arguments are parsed -- `set_colour` is,
+# and the unit that owns `app.py` calls it with the parsed value.
+#
+# Conservative means every spelling argparse accepts. `build_parser()`
+# takes argparse's defaults, so `allow_abbrev` is on and any unambiguous
+# prefix parses: `--non` and `--non-int` are the flag today. `store_true`
+# rejects `--non-interactive=x`, so that form is unreachable, but the split
+# below costs nothing and keeps this from depending on that.
 _NON_INTERACTIVE_FLAG = "--non-interactive"
 
 # Guards access to _transcript_path, the transcript file append below, and
@@ -100,28 +110,33 @@ _NON_INTERACTIVE_FLAG = "--non-interactive"
 _lock = threading.Lock()
 _transcript_path: pathlib.Path | None = None
 
-# None means "decide from the terminal and argv"; True/False force it.
+# None means "use the pre-parse default"; True/False are the parsed answer.
 _colour_override: bool | None = None
 
 # The renderer that owns the cursor, and the stream it owns it on. See
 # set_live_writer().
 _live_stream: object | None = None
-_live_writer: Callable[[str], None] | None = None
+_live_writer: Callable[[str, str], None] | None = None
 
 
 def set_colour(enabled: bool | None) -> None:
-    """Force colour on or off; None restores auto-detection.
+    """Settle the colour question; None goes back to the pre-parse default.
 
-    Auto-detection is `stderr is a tty and the run is not
-    --non-interactive`, which is what doc 08 §7 requires of every context
-    in its table. This override exists for a caller holding a parsed
-    `--non-interactive` value it trusts more than argv, and for tests.
+    This is the authoritative answer, and the caller holding it is whoever
+    has just parsed `--non-interactive`: `set_colour(not
+    args.non_interactive)` immediately after `parse_args` makes the parsed
+    value govern every line from that point on, which is what doc 08 §7
+    requires of every context in its table. Until then the argv default
+    below decides, conservatively.
     """
     global _colour_override
-    _colour_override = None if enabled is None else bool(enabled)
+    with _lock:
+        _colour_override = None if enabled is None else bool(enabled)
 
 
-def set_live_writer(stream: object, writer: Callable[[str], None]) -> None:
+def set_live_writer(
+    stream: object, writer: Callable[[str, str], None]
+) -> None:
     """Route the *printed* copy of a log line through `writer`.
 
     A live renderer erases its region by counting the rows it drew and
@@ -131,9 +146,12 @@ def set_live_writer(stream: object, writer: Callable[[str], None]) -> None:
     output (doc 08 §12.2 defect 3). The seven step modules hold 121 direct
     log calls, so this is not a corner case.
 
-    `writer` receives the fully composed screen line, without its newline,
-    and is expected to write it around the region rather than into it. The
-    transcript copy is unaffected and still written here.
+    `writer` receives the level and the fully composed screen line without
+    its newline, and is expected to write it around the region rather than
+    into it. The level is passed because it decides what the region does
+    afterwards: an "error" is the last thing an operator should see, so it
+    is written and the region is left down rather than redrawn beneath it.
+    The transcript copy is unaffected and still written here.
 
     `stream` is what the renderer draws to, and the routing applies only
     while that stream *is* `sys.stderr` at the moment of the call: a
@@ -146,21 +164,30 @@ def set_live_writer(stream: object, writer: Callable[[str], None]) -> None:
         _live_writer = writer
 
 
-def clear_live_writer(writer: Callable[[str], None] | None = None) -> None:
+def clear_live_writer(
+    writer: Callable[[str, str], None] | None = None
+) -> None:
     """Stop routing through the live writer.
 
     Passing the writer clears only that registration, so a renderer that
     has already been superseded cannot unhook the current one. Passing
     nothing clears whatever is registered.
+
+    The comparison is `==` rather than `is` because what a renderer
+    registers is a bound method, and Python builds a new bound-method
+    object on every attribute access: `p.method is p.method` is already
+    False, which would make this whole path unreachable. Two bound methods
+    compare equal when they share an instance and a function, which is the
+    question actually being asked.
     """
     global _live_stream, _live_writer
     with _lock:
-        if writer is None or writer is _live_writer:
+        if writer is None or writer == _live_writer:
             _live_stream = None
             _live_writer = None
 
 
-def _screen_writer() -> Callable[[str], None] | None:
+def _screen_writer() -> Callable[[str, str], None] | None:
     with _lock:
         stream, writer = _live_stream, _live_writer
     if writer is None or stream is not sys.stderr:
@@ -168,11 +195,25 @@ def _screen_writer() -> Callable[[str], None] | None:
     return writer
 
 
+def _non_interactive_in_argv() -> bool:
+    """The pre-parse default's half of the question. See above."""
+    for token in sys.argv[1:]:
+        if token == "--":
+            # argparse stops reading options here, and so does this.
+            break
+        name = token.split("=", 1)[0]
+        if len(name) > 2 and _NON_INTERACTIVE_FLAG.startswith(name):
+            return True
+    return False
+
+
 def _colour_enabled() -> bool:
-    if _colour_override is not None:
-        return _colour_override
+    with _lock:
+        override = _colour_override
+    if override is not None:
+        return override
     # Bash checks `[[ -t 2 ]]`; sys.stderr.isatty() is the Python equivalent.
-    return sys.stderr.isatty() and _NON_INTERACTIVE_FLAG not in sys.argv[1:]
+    return sys.stderr.isatty() and not _non_interactive_in_argv()
 
 
 def _timestamp() -> str:
@@ -227,7 +268,7 @@ def _emit(level: str, msg: str) -> None:
     else:
         # A renderer owns the cursor on this stream; it writes the line
         # around its region instead of through it (see set_live_writer).
-        writer(line)
+        writer(level, line)
 
     # The transcript never carries ANSI escapes, regardless of whether stderr
     # itself is coloured.

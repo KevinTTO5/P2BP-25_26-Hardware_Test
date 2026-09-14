@@ -315,6 +315,72 @@ def test_colour_survives_an_interactive_run_with_other_flags(
     assert "\033[32m" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "spelling",
+    ["--non-interactive", "--non-interacti", "--non-int", "--non", "--no"],
+)
+def test_every_abbreviation_argparse_accepts_suppresses_colour(
+    capsys, monkeypatch, spelling
+):
+    """`build_parser()` takes argparse's defaults, so `allow_abbrev` is on
+    and any unambiguous prefix is a real spelling of the flag. The
+    pre-parse default has to recognise all of them, because emitting an
+    escape into a run that forbids one is the failure section 7 names."""
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr(sys, "argv", ["mv3dt-installer", spelling, "install"])
+
+    logs.log.info("plain please")
+
+    assert "\033" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "spelling", ["--nothing-like-it", "--verbose", "--install-dir", "-n"]
+)
+def test_a_flag_that_is_not_the_one_leaves_colour_alone(
+    capsys, monkeypatch, spelling
+):
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr(sys, "argv", ["mv3dt-installer", spelling, "install"])
+
+    logs.log.info("coloured")
+
+    assert "\033[32m" in capsys.readouterr().err
+
+
+def test_the_default_stops_reading_options_at_a_bare_double_dash(
+    capsys, monkeypatch
+):
+    """argparse stops treating tokens as options after `--`, so a positional
+    that happens to look like the flag is not the flag."""
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr(
+        sys, "argv", ["mv3dt-installer", "run", "--", "--non-interactive"]
+    )
+
+    logs.log.info("coloured")
+
+    assert "\033[32m" in capsys.readouterr().err
+
+
+def test_the_parsed_value_overrides_the_pre_parse_default(capsys, monkeypatch):
+    """argv is the default until the arguments are parsed, and no longer.
+
+    The unit that owns `app.py` calls `set_colour(not
+    args.non_interactive)` straight after `parse_args`, and from then on
+    that answer governs, whatever argv looked like.
+    """
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr(
+        sys, "argv", ["mv3dt-installer", "--non", "install"]
+    )
+    logs.set_colour(True)
+
+    logs.log.info("the parsed value said colour")
+
+    assert "\033[32m" in capsys.readouterr().err
+
+
 def test_set_colour_forces_the_decision_both_ways(capsys, monkeypatch):
     """The override for a caller holding a parsed flag it trusts more than
     argv, and the way a test states its intent outright."""
@@ -405,14 +471,45 @@ def test_a_coloured_screen_line_is_still_recorded_plain(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+class Recorder:
+    """A writer with the shape a renderer registers: a bound method.
+
+    Deliberately not `list.append`. A bound method is rebuilt on every
+    attribute access, which is the whole reason `clear_live_writer`
+    compares with `==`, so the tests below have to register the kind of
+    callable that actually exhibits it.
+    """
+
+    def __init__(self) -> None:
+        self.taken: list[tuple[str, str]] = []
+
+    def write(self, level: str, line: str) -> None:
+        self.taken.append((level, line))
+
+
 def test_a_registered_writer_takes_the_printed_copy(capsys, monkeypatch):
     monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
-    taken: list[str] = []
-    logs.set_live_writer(sys.stderr, taken.append)
+    recorder = Recorder()
+    logs.set_live_writer(sys.stderr, recorder.write)
 
     logs.log.info("through the renderer")
 
-    assert taken == ["\033[32m[info ]\033[0m through the renderer"]
+    assert recorder.taken == [
+        ("info", "\033[32m[info ]\033[0m through the renderer")
+    ]
+    assert capsys.readouterr().err == ""
+
+
+def test_a_registered_writer_is_told_the_level(capsys):
+    """The level decides what the region does after the line (blocker 2)."""
+    recorder = Recorder()
+    logs.set_live_writer(sys.stderr, recorder.write)
+
+    logs.log.info("i")
+    logs.log.warn("w")
+    logs.log.error("e")
+
+    assert [level for level, _ in recorder.taken] == ["info", "warn", "error"]
     assert capsys.readouterr().err == ""
 
 
@@ -421,7 +518,7 @@ def test_a_registered_writer_does_not_take_the_recorded_copy(
 ):
     """Section 7.1: routing the screen copy must never cost the record."""
     run_file = logs.open_transcript(log_dir=tmp_path / "logs")
-    logs.set_live_writer(sys.stderr, lambda line: None)
+    logs.set_live_writer(sys.stderr, Recorder().write)
 
     logs.log.info("drawn, and recorded")
 
@@ -431,48 +528,73 @@ def test_a_registered_writer_does_not_take_the_recorded_copy(
 def test_a_writer_registered_for_another_stream_is_not_used(capsys):
     """A renderer drawing somewhere else shares no cursor with this module,
     so there is nothing for it to protect."""
-    taken: list[str] = []
-    logs.set_live_writer(io.StringIO(), taken.append)
+    recorder = Recorder()
+    logs.set_live_writer(io.StringIO(), recorder.write)
 
     logs.log.info("straight to stderr")
 
-    assert taken == []
+    assert recorder.taken == []
     assert "straight to stderr" in capsys.readouterr().err
 
 
 def test_clear_live_writer_gives_the_stream_back(capsys):
-    taken: list[str] = []
-    logs.set_live_writer(sys.stderr, taken.append)
+    recorder = Recorder()
+    logs.set_live_writer(sys.stderr, recorder.write)
     logs.clear_live_writer()
 
     logs.log.info("printed again")
 
-    assert taken == []
+    assert recorder.taken == []
+    assert "printed again" in capsys.readouterr().err
+
+
+def test_clearing_the_current_writer_gives_the_stream_back(capsys):
+    """The named form of the un-claim, with the callable production uses.
+
+    `recorder.write` is a different object every time it is read, so an
+    identity comparison inside `clear_live_writer` would leave the claim
+    standing here and this test would fail on the line below.
+    """
+    recorder = Recorder()
+    logs.set_live_writer(sys.stderr, recorder.write)
+
+    logs.clear_live_writer(recorder.write)
+    logs.log.info("printed again")
+
+    assert recorder.taken == []
     assert "printed again" in capsys.readouterr().err
 
 
 def test_clearing_a_superseded_writer_leaves_the_current_one_alone(capsys):
     """A renderer that has already been replaced must not be able to unhook
-    the one that replaced it."""
-    stale: list[str] = []
-    current: list[str] = []
-    logs.set_live_writer(sys.stderr, stale.append)
-    logs.set_live_writer(sys.stderr, current.append)
+    the one that replaced it -- and the current one must still be able to."""
+    stale, current = Recorder(), Recorder()
+    logs.set_live_writer(sys.stderr, stale.write)
+    logs.set_live_writer(sys.stderr, current.write)
 
-    logs.clear_live_writer(stale.append)
+    logs.clear_live_writer(stale.write)
     logs.log.info("still routed")
 
-    assert current == ["[info ] still routed"]
+    assert current.taken == [("info", "[info ] still routed")]
+    assert stale.taken == []
     assert capsys.readouterr().err == ""
 
+    # The same call, with the writer that is actually registered, does
+    # clear it. Without this the test passes whether or not clearing works.
+    logs.clear_live_writer(current.write)
+    logs.log.info("printed again")
 
-def test_die_reaches_the_screen_through_a_registered_writer(monkeypatch):
+    assert len(current.taken) == 1
+    assert "printed again" in capsys.readouterr().err
+
+
+def test_die_reaches_the_screen_through_a_registered_writer():
     """`die` is the last thing an operator sees; it may not be the one line
     the region eats."""
-    taken: list[str] = []
-    logs.set_live_writer(sys.stderr, taken.append)
+    recorder = Recorder()
+    logs.set_live_writer(sys.stderr, recorder.write)
 
     with pytest.raises(SystemExit):
         logs.die("fatal problem")
 
-    assert taken == ["[error] fatal problem"]
+    assert recorder.taken == [("error", "[error] fatal problem")]

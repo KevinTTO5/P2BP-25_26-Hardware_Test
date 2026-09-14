@@ -485,6 +485,12 @@ class Progress:
         self._last_line: str | None = None
         self._frame = 0
         self._drawn = 0
+        # Bound once, because a bound method is rebuilt on every attribute
+        # access: registering `self._write_around_region` twice registers
+        # two unequal-by-identity objects, and nothing could ever un-claim
+        # the stream again.
+        self._writer = self._write_around_region
+        self._writing_foreign = False
 
         self._claim_stream()
 
@@ -743,18 +749,37 @@ class Progress:
         cursor arithmetic to protect and `logs` keeps printing for itself.
         """
         if self._live:
-            set_live_writer(self._out, self._write_around_region)
+            set_live_writer(self._out, self._writer)
 
-    def _write_around_region(self, text: str) -> None:
+    def _write_around_region(self, level: str, text: str) -> None:
         """Write one line that did not come from here, above the region.
 
         The `line()` verbose path's sandwich, reused: erase the region,
         let the line scroll into place as permanent output, redraw. Both
         halves are no-ops off a tty, so this degrades to a plain write.
+
+        An error is the exception, and it is the whole point of taking the
+        level. `die()` logs and exits, and the dispatch loop logs a FAILED
+        step and moves on, so redrawing underneath either one leaves a
+        spinner frozen below the fatal line as the last thing the operator
+        sees. The region comes down instead and stays down until something
+        draws again, so the error is the bottom of the screen.
         """
-        self._erase()
-        _write(self._out, text + "\n")
-        self._draw()
+        if self._writing_foreign:
+            # Nothing on the `_draw` path logs today, so this cannot
+            # happen; if a future helper ever logs, it degrades to a plain
+            # write rather than recursing until the stack runs out.
+            _write(self._out, text + "\n")
+            return
+
+        self._writing_foreign = True
+        try:
+            self._erase()
+            _write(self._out, text + "\n")
+            if level != "error":
+                self._draw()
+        finally:
+            self._writing_foreign = False
 
     def _position(self) -> str:
         where = f"phase {self._phase_number}/{len(self._phases)}"

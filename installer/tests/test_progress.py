@@ -660,6 +660,110 @@ def test_a_foreign_log_line_still_reaches_the_transcript(tmp_path, monkeypatch):
     )
 
 
+def _visible(screen: FakeTty) -> list[str]:
+    """The rows still on screen, stripped of colour and trailing blanks."""
+    rows = [_ANSI.sub("", row).rstrip() for row in _screen(screen.getvalue())]
+    while rows and not rows[-1]:
+        rows.pop()
+    return rows
+
+
+def test_a_fatal_error_is_the_last_thing_on_the_screen(monkeypatch):
+    """An error takes the region down with it.
+
+    `die` logs and exits, so anything drawn after the error line is the
+    last thing the operator ever sees: a bar and a spinner frozen at
+    whatever frame they happened to be on, under the message explaining
+    that the install is over. The region comes down instead.
+    """
+    screen, clock = FakeTty(), FakeClock()
+    bar = _stderr_progress(monkeypatch, screen, clock)
+    bar.begin_step(2, "DeepStream SDK", _PHASES)
+    bar.phase(1)
+    bar.task("apt-get install deepstream-7.1")
+
+    with pytest.raises(SystemExit):
+        logs.die("apt-get returned 100")
+
+    rows = _visible(screen)
+    assert rows[-1] == "[error] apt-get returned 100"
+    assert not any(
+        frame in row for row in rows[-3:] for frame in progress.SPINNER_FRAMES
+    )
+
+
+def test_a_failed_step_does_not_leave_a_frozen_region_below_it(monkeypatch):
+    """The dispatch loop's FAILED branch has the same shape as `die`.
+
+    It logs the failure and returns without an `end_step()`, so the same
+    rule has to hold for a plain `log.error` and not only for `die`.
+    """
+    screen, clock = FakeTty(), FakeClock()
+    bar = _stderr_progress(monkeypatch, screen, clock)
+    bar.begin_step(2, "DeepStream SDK", _PHASES)
+    bar.phase(1)
+
+    logs.log.error("step 2 failed: NGC login rejected the API key")
+
+    rows = _visible(screen)
+    assert rows[-1] == "[error] step 2 failed: NGC login rejected the API key"
+
+
+def test_a_warning_still_leaves_the_region_drawing_below_it(monkeypatch):
+    """Only an error ends the run, so only an error ends the region."""
+    screen, clock = FakeTty(), FakeClock()
+    bar = _stderr_progress(monkeypatch, screen, clock)
+    bar.begin_step(2, "DeepStream SDK", _PHASES)
+    bar.phase(1)
+
+    logs.log.warn("no NGC key configured, skipping the login check")
+
+    rows = _visible(screen)
+    assert rows[-1] != "[warn ] no NGC key configured, skipping the login check"
+    assert any(row.startswith("  ▸ ") for row in rows)
+
+
+def test_the_region_comes_back_when_the_run_carries_on_after_an_error(
+    monkeypatch
+):
+    """Down is not gone: a step that logs an error and keeps working gets
+    its region back on the next redraw."""
+    screen, clock = FakeTty(), FakeClock()
+    bar = _stderr_progress(monkeypatch, screen, clock)
+    bar.begin_step(2, "DeepStream SDK", _PHASES)
+    bar.phase(1)
+
+    logs.log.error("retrying the download")
+    bar.tick()
+
+    rows = _visible(screen)
+    error_at = rows.index("[error] retrying the download")
+    assert any(row.startswith("  ▸ ") for row in rows[error_at:])
+
+
+def test_the_stream_can_be_given_back_by_naming_the_renderer_s_writer(
+    monkeypatch
+):
+    """The un-claim path, with the callable a renderer actually registers.
+
+    `Progress` binds its writer once, because a bound method read twice is
+    two objects: registering the attribute directly would leave nothing
+    able to name the registration afterwards.
+    """
+    screen, clock = FakeTty(), FakeClock()
+    bar = _stderr_progress(monkeypatch, screen, clock)
+    bar.begin_step(2, "DeepStream SDK", _PHASES)
+
+    logs.clear_live_writer(bar._writer)
+    screen.truncate(0)
+    screen.seek(0)
+    logs.log.info("straight to the stream now")
+
+    assert _ANSI.sub("", screen.getvalue()) == (
+        "[info ] straight to the stream now\n"
+    )
+
+
 def test_a_renderer_off_a_tty_leaves_logs_printing_for_itself(monkeypatch):
     """Nothing is drawn, so there is no cursor arithmetic to protect."""
     screen, clock = FakeTty(), FakeClock()
