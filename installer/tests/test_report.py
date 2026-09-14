@@ -681,3 +681,45 @@ def test_result_constructors_do_not_share_a_mutable_user_actions_default():
     second = report.refusal("b")
     first.user_actions.append(UserAction(text="x"))
     assert second.user_actions == []
+
+
+def test_output_lines_keeps_crlf_terminated_lines_whole():
+    # The switch away from str.splitlines() (so that sanitise can still see
+    # a redraw sequence) leaves a CRLF line ending as a trailing "\r", and
+    # sanitise keeps only what follows the last carriage return. Without
+    # stripping that one terminator, every CRLF line loses its content
+    # rather than its line ending, and a block of real apt errors renders
+    # as "(none captured)".
+    assert report._output_lines("a\r\nb\r\n") == ["a", "b"]
+    assert report._output_lines("E: one\r\nE: two\r\n") == ["E: one", "E: two"]
+
+    # Only the terminator, and only one: a genuine redraw separates its
+    # frames with carriage returns *inside* the line, which must still
+    # collapse to the last frame.
+    assert report._output_lines("  0%\r 50%\r100% [####]\n") == ["100% [####]"]
+    assert report._output_lines("a\rb\rc") == ["c"]
+
+    assert report._output_lines("a\nb\n") == ["a", "b"]
+    assert report._output_lines("") == []
+
+
+def test_failure_block_renders_crlf_errors_rather_than_none_captured():
+    block = report.render_failure_context(
+        report.FailureContext(
+            step="Prerequisites",
+            command=["apt-get", "install", "tensorrt"],
+            exit_code=100,
+            output="E: Sub-process returned an error code\r\nE: Unmet dependencies\r\n",
+        )
+    )
+    assert "(none captured)" not in block
+    assert "E: Sub-process returned an error code" in block
+    assert "E: Unmet dependencies" in block
+
+
+def test_render_command_reports_an_argv_that_cleans_away_as_not_recorded():
+    # Quoting an argv whose every element sanitises to nothing yields a row
+    # of '' that reads as though the command really was an empty string.
+    assert report._render_command(["\x1b[0m"]) == "(not recorded)"
+    # A genuine empty argument beside a real one still renders.
+    assert report._render_command(["echo", ""]) == "echo ''"

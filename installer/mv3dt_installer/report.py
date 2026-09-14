@@ -345,13 +345,25 @@ def _output_lines(output: Any) -> list[str]:
     block was printed for. Splitting on newlines only leaves each frame
     sequence intact inside its line, and sanitise keeps the last frame.
 
+    One `\r` per line is a terminator and not a redraw, though, so it is
+    stripped before cleaning. Splitting `"a\r\nb\r\n"` on newlines leaves
+    `"a\r"`, and sanitise keeps only what follows the last carriage return,
+    so the line would lose its whole content rather than its line ending.
+    Real output hits this constantly: 25 apt `E: ...\r\n` errors would
+    render as `(none captured)`. Stripping exactly one trailing `\r` per
+    element keeps a CRLF line intact and leaves a genuine redraw sequence,
+    whose frames are separated by CRs *inside* the line, untouched.
+
     A command's output almost always ends in a newline, which would
     otherwise spend one of the 20 tail lines on nothing.
     """
     if output is None:
         return []
     if isinstance(output, (str, bytes, bytearray)):
-        raw = _decode(output).split("\n")
+        raw = [
+            line[:-1] if line.endswith("\r") else line
+            for line in _decode(output).split("\n")
+        ]
     else:
         raw = [_decode(item) for item in output]
     secrets = _secrets()
@@ -388,7 +400,12 @@ def _render_command(command: Any) -> str:
     if isinstance(command, (str, bytes, bytearray)):
         return _clean(_decode(command), secrets) or _NOT_RECORDED
     parts = [progress.sanitise(_decode(part)) for part in command]
-    if not parts:
+    # `any` and not `parts`: an argv whose every element cleans away to
+    # nothing recorded no command, and quoting it yields a row of `''` that
+    # reads like the command really was an empty string. A genuine empty
+    # argument alongside a real one still renders, since `any` sees the
+    # real one.
+    if not any(parts):
         return _NOT_RECORDED
     return shellout._command_dump(parts, secrets) or _NOT_RECORDED
 
