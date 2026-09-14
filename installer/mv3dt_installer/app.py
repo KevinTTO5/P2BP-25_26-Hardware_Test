@@ -168,6 +168,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip 'press Enter' confirmations.",
     )
     parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show every line of command output instead of the rolling "
+        "8-line window (doc 00 §8.5, doc 08 §8). This is what to re-run "
+        "with when reporting a problem. There is no --quiet: the "
+        "transcript already holds everything either way.",
+    )
+    parser.add_argument(
         "--log-dir",
         metavar="PATH",
         default=None,
@@ -405,42 +413,41 @@ class ProgressHandle:
         self.renderer.bytes(done, total)
 
 
-def _stderr_is_tty() -> bool:
-    """Whether live output has anywhere to go (doc 08 §7).
-
-    Deliberately tolerant: under pytest, and behind PyInstaller's console
-    handling, `sys.stderr` may be a substitute object without `isatty`, or
-    one whose `isatty` raises on a closed stream. Either way the answer is
-    "not a terminal", which is the safe direction -- it suppresses live
-    rendering rather than writing escapes into a pipe.
-    """
-    isatty = getattr(sys.stderr, "isatty", None)
-    if isatty is None:
-        return False
-    try:
-        return bool(isatty())
-    except Exception:
-        return False
-
-
 def _should_stream(stream: Optional[bool], kwargs: dict) -> bool:
     """Resolve `run_root`'s `stream=` into a yes/no (doc 08 §4.1).
 
-    `stream=None` is AUTO: stream when stderr is a terminal *and* the caller
-    asked for captured text output. Both halves matter. Without capture the
-    child already inherits the terminal and its output is live anyway, and
-    routing it through the tee would turn a `None` `.stdout` into a string.
-    Without text mode the caller wants `bytes` back, and the tee is
-    line-oriented and text-only.
+    **AUTO resolves on one question only: can the tee serve this call?**
+    `stream=None` streams whenever the caller asked for captured *text*
+    output, and the terminal it would be streamed to plays no part in the
+    decision. Both halves of the capture test matter. Without
+    `capture_output` the child already inherits the terminal and its output
+    is live anyway, and routing it through the tee would turn a `None`
+    `.stdout` into a string. Without text mode the caller wants `bytes`
+    back, and the tee is line-oriented and text-only.
 
-    `stream=False` is the escape hatch doc 08 §4.1 names: today's behaviour
-    for a probe whose output would be noise.
+    **Why AUTO is not tty-gated** (doc 00 §8.5 records the resolution; doc
+    08 §4.1 left it open and handed it to this unit). §4.1's prose said
+    "stream when stderr is a tty", which would mean
+    `mv3dt-installer | tee install.log` shows the operator nothing at all
+    while it runs -- the exact silence doc 08 §2 exists to remove, in a
+    normal way to run an installer. §7 is REQUIRED and says a non-tty run
+    still gets per-line output, plain. So the runner streams, and *how* a
+    streamed line reaches the operator is left where it belongs: to
+    `progress.Progress`, which draws a live region on a tty and writes
+    plain lines everywhere else. Nothing here reads `sys.stderr.isatty()`,
+    and neither `--verbose` nor `--non-interactive` changes this answer --
+    they change the rendering, not whether the tee runs.
 
-    `stream=True` forces streaming even off a tty (plain lines, per §7), but
-    only for a call the tee can serve without changing the shape of the
-    returned `CompletedProcess`. Asking to stream a binary or uncaptured
-    call is an authoring mistake, and a loud one here beats a caller
-    receiving a `str` where it indexed `bytes`.
+    `stream=False` is the escape hatch doc 08 §4.1 names, and it is
+    absolute: today's behaviour for a probe whose output would be noise,
+    not overridable by `--verbose`. The line still reaches the transcript
+    (doc 08 §7.1), so nothing is lost from the record by suppressing it.
+
+    `stream=True` forces streaming, but only for a call the tee can serve
+    without changing the shape of the returned `CompletedProcess`. Asking
+    to stream a binary or uncaptured call is an authoring mistake, and a
+    loud one here beats a caller receiving a `str` where it indexed
+    `bytes`.
     """
     if stream is False:
         return False
@@ -450,7 +457,7 @@ def _should_stream(stream: Optional[bool], kwargs: dict) -> bool:
     streamable = captured and text
 
     if stream is None:
-        return streamable and _stderr_is_tty()
+        return streamable
 
     if not streamable:
         raise ValueError(
@@ -532,10 +539,15 @@ class Context:
         not; that equivalence is the whole reason the seam is here rather
         than at the call sites.
 
-        `stream=None` is auto (see `_should_stream`): stream when there is a
-        terminal to stream to and the caller captured text. `stream=False`
-        restores the plain `subprocess.run` path for a probe whose output
-        would be noise.
+        `stream=None` is auto (see `_should_stream`): stream whenever the
+        caller captured text, tty or not. Whether those lines are drawn
+        into a live region or written out plain is the renderer's decision,
+        not this one, and so is whether `--verbose` widens the rolling
+        window to the full stream -- `shellout._resolve_sink` defers to a
+        supplied renderer, and `run_root` always supplies one, so the
+        `verbose` the operator passed reaches the tee through
+        `Progress(verbose=...)` alone. `stream=False` restores the plain
+        `subprocess.run` path for a probe whose output would be noise.
 
         A missing executable is treated the same as a `check=False` step
         already treats a nonzero exit -- see `_missing_executable_result`.
@@ -564,7 +576,10 @@ class Context:
 
 
 def build_context(
-    cfg: config_mod.Config, user: InvokingUser, non_interactive: bool
+    cfg: config_mod.Config,
+    user: InvokingUser,
+    non_interactive: bool,
+    verbose: bool = False,
 ) -> Context:
     """Assemble the `Context` a dispatched step's lifecycle methods receive
     (doc 00 §12.3), bound to the resolved `Config` and invoking user.
@@ -574,6 +589,12 @@ def build_context(
     can branch on it directly instead of guessing from `sys.argv` or
     `sys.stdin.isatty()` -- both workarounds Step 1 and Step 2 used before
     this field existed.
+
+    `verbose` mirrors `--verbose` (doc 00 §8.5) onto the one renderer this
+    run owns. It is deliberately not a `Context` field: doc 08 §9 says a
+    step never writes to the terminal itself, so a step has nothing to
+    branch on verbosity for, and the flag's whole effect is the rolling
+    window the renderer either keeps or drops.
     """
     return Context(
         install_dir=cfg.install_dir,
@@ -599,6 +620,7 @@ def build_context(
             renderer=progress_mod.Progress(
                 total_steps=len(STEP_IDS),
                 out=sys.stderr,
+                verbose=verbose,
                 non_interactive=non_interactive,
             )
         ),
@@ -812,9 +834,9 @@ def _bootstrap_subcommand_context(
     A small, permissive parser (`parse_known_args`, so it never errors on a
     subcommand's own flags) plucks exactly the framework-owned flags this
     bootstrap itself needs -- `--install-dir`, `--non-interactive`,
-    `--log-dir` -- out of `argv` without consuming or otherwise altering
-    it: the unmodified `argv` is still exactly what the subcommand handler
-    receives. This is what lets a systemd `ExecStart=` line for a later
+    `--verbose`, `--log-dir` -- out of `argv` without consuming it or
+    otherwise altering it: the unmodified `argv` is still exactly what the
+    subcommand handler receives. This is what lets a systemd `ExecStart=` line for a later
     step's unit (e.g. an `ingest` invocation baked with `--non-interactive
     --install-dir <install_dir>`, doc 00's `render_ingest_units` example)
     resolve the right `install_dir` for its `Context` while the handler
@@ -823,6 +845,7 @@ def _bootstrap_subcommand_context(
     peek = argparse.ArgumentParser(add_help=False)
     peek.add_argument("--install-dir", default=None)
     peek.add_argument("--non-interactive", action="store_true")
+    peek.add_argument("--verbose", action="store_true")
     peek.add_argument("--log-dir", default=None)
     known, _unused = peek.parse_known_args(argv)
 
@@ -842,7 +865,7 @@ def _bootstrap_subcommand_context(
     else:
         cfg = _read_only_subcommand_config(known, sm)
 
-    return build_context(cfg, user, known.non_interactive)
+    return build_context(cfg, user, known.non_interactive, known.verbose)
 
 
 # ---------------------------------------------------------------------------
@@ -1279,5 +1302,5 @@ def main(
         privilege.show_reboot_required(title)
         return 0
 
-    ctx = build_context(cfg, user, args.non_interactive)
+    ctx = build_context(cfg, user, args.non_interactive, args.verbose)
     return _dispatch(sm, ctx, cfg)

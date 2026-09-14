@@ -171,6 +171,8 @@ Steps may add their own, but the framework owns these:
 - `--non-interactive` — never prompt; use defaults/config; fail if a required
   value is missing (mirrors `00_bootstrap.sh --non-interactive`).
 - `--no-pause` — skip "press Enter" confirmations.
+- `--verbose` — show every line of command output instead of the rolling
+  8-line window (section 8.5). There is deliberately no `--quiet`.
 - `--log-dir PATH` — override the transcript directory (§8).
 - `--remote-supervision {off,local,remote}` — set the Step 6 gate (§3.4).
 - `--webapp-integration {off,on}` — set the Step 7 gate (§3.4). Both gate
@@ -622,6 +624,86 @@ Every step MUST use `verify_pinned` in its `verify()` and one of the two §8.3
 reporters after every dependency it touches, so the transcript is uniform and
 greppable. Steps use **equality pins** (DS 9.1 refuses older/newer minors of
 the driver and `libnvinfer*`; see [References](#references)).
+
+### 8.5 Verbosity and live command output (REQUIRED)
+
+The transcript contract above is about the **record**. This subsection is
+about the **screen**, and it owns exactly two framework-level facts: the
+`--verbose` flag ([section 3.3](#33-cli-flags-framework-level)), and what
+`Context.run_root`'s `stream=None` resolves to. The rendering itself —
+bars, spinners, the rolling window, the step and phase banner — is
+specified in
+[`08` section 4](08-PROGRESS-AND-OBSERVABILITY.md#4-streaming-command-output)
+and
+[`08` section 8](08-PROGRESS-AND-OBSERVABILITY.md#8-verbosity),
+and is not restated here.
+
+`--verbose` replaces the rolling window with the full stream. The window's
+size and its fixed-height rule are
+[`08` section 8](08-PROGRESS-AND-OBSERVABILITY.md#8-verbosity)'s and are
+deliberately not repeated here, so there is one place to change them.
+`--verbose` is what an operator is told to re-run with when reporting a
+problem, in place of being asked to find and tail the transcript by hand.
+
+**There is no `--quiet` (RESOLVED).** It has no consumer. The systemd units
+in [`STEP-6`](STEP-6-REMOTE-SUPERVISION.md) pass no `--non-interactive`;
+what covers them is `StandardError=journal`, which is not a tty, so they
+already take the last row of the table below. And the transcript holds every
+line whatever the screen shows
+([`08` section 7.1](08-PROGRESS-AND-OBSERVABILITY.md#71-live-rendering-must-never-cost-the-transcript-required)).
+Adding a flag that can only make a silent installer more silent would
+reintroduce the failure mode doc `08` exists to remove.
+
+#### AUTO mode, resolved
+
+[`08` section 4.1](08-PROGRESS-AND-OBSERVABILITY.md#41-the-one-seam-locked)
+described `stream=None` as "stream when stderr is a tty and the caller asked
+for captured output", and
+[`08` section 7](08-PROGRESS-AND-OBSERVABILITY.md#7-behaviour-off-a-tty-required)
+requires that a non-tty run still get per-line output, plain. Read together,
+a tty-gated AUTO sends nothing at all to an operator whose **stderr** is not
+a terminal: `mv3dt-installer 2>&1 | tee install.log`, any run redirected to
+a file, CI, and the journald-backed STEP-6 units. That is exactly the
+silence that caused two interrupted installs. Section 7 is REQUIRED and
+section 4.1's tty clause was prose inside it, so the narrower statement
+gives way.
+
+> A plain `mv3dt-installer | tee install.log` is **not** one of these cases,
+> and it is worth stating because it is the example that first motivated
+> this resolution and it is wrong: a pipe redirects stdout, leaving stderr
+> on the terminal, so the old gate would have streamed there normally. The
+> resolution is unchanged — the cases above are real — but the reasoning
+> should not rest on a case that does not exist.
+
+**RESOLVED: AUTO asks one question, and a terminal is not part of it.**
+`stream=None` streams whenever the call is one the tee runner can serve —
+`capture_output=True` **and** text mode — because only then can it return a
+`CompletedProcess` shaped exactly as `subprocess.run` would have. Nothing in
+the resolution reads `isatty`. Whether a streamed line is drawn into a live
+region or written out plain is the renderer's decision, made once per run
+from the same two inputs section 7 already names.
+
+| Context | `--verbose` | AUTO streams | On screen | Bars / spinners | Transcript |
+|---------|-------------|--------------|-----------|-----------------|------------|
+| Interactive tty | off | Yes | Last 8 lines, rolling | Yes | Every line |
+| Interactive tty | on | Yes | Every line, scrolling above the live region | Yes | Every line |
+| Interactive tty, `--non-interactive` | off or on | Yes | Every line, plain | No | Every line |
+| Not a tty (pipe, CI, `tee`) | off or on | Yes | Every line, plain | No | Every line |
+
+Three consequences, stated so they need not be re-derived:
+
+1. **`--verbose` is observable only on an interactive tty.** Everywhere else
+   the full stream is already what reaches the screen, because there is no
+   cursor to redraw a window with. The flag is accepted and changes nothing
+   there, which is the correct behavior rather than an omission.
+2. **`--non-interactive` suppresses drawing, never streaming.** It is a
+   separate question from verbosity and answers only "may anything be drawn
+   in place", matching section 7's third row.
+3. **`stream=False` is absolute.** A step author's explicit "this probe's
+   output is noise" is not overridden by `--verbose`; the line still reaches
+   the transcript, so the record loses nothing. `stream=True` is the mirror
+   escape hatch, and it raises rather than streaming if the call is not one
+   the tee can return unchanged.
 
 ---
 
@@ -1324,6 +1406,9 @@ Repo files referenced:
   control plane (§3.4 gate, §12.4 map).
 - [`STEP-7-WEBAPP-INTEGRATION.md`](STEP-7-WEBAPP-INTEGRATION.md) — the opt-in
   data plane; sole consumer of the §14 credential contract.
+- [`08-PROGRESS-AND-OBSERVABILITY.md`](08-PROGRESS-AND-OBSERVABILITY.md) —
+  the progress and streaming foundation section 8.5 configures; its sections
+  4.1 and 7 are the two the AUTO-mode resolution reconciles.
 - [`DELETION-REVIEW.md`](DELETION-REVIEW.md) — records which Jetson-tree files
   the §14 contract was harvested from, and why they are being removed.
 
