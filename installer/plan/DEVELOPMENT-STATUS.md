@@ -9,14 +9,14 @@ the tree. Every contract it mentions is **defined elsewhere** — in
 spec wins and this doc is stale.
 
 This document exists because the repo has reached a state that is easy to
-misread: **all seven steps are implemented and the progress subsystem is
-merged, but the progress bars are not yet connected to the commands they
-measure.** A reader who greps for `progress.py` finds a complete, tested
-renderer with byte and percentage adapters and reasonably concludes the work
-is done. It is not. [Section 5](#5-what-remains) is the honest list.
+misread: **all seven steps and the progress subsystem are implemented, and
+the apt and download adapters are wired, but failure evidence is not yet
+connected across the step modules.** A reader who finds `report.py` can
+reasonably conclude the diagnostic work is done. It is not.
+[Section 5](#5-what-remains) is the honest list.
 
-Current release: **v0.3.0**. Current version string:
-`installer/mv3dt_installer/__init__.py` `__version__ = "0.3.0"`.
+Current release: **v0.3.1**. Current version string:
+`installer/mv3dt_installer/__init__.py` `__version__ = "0.3.1"`.
 
 ---
 
@@ -49,8 +49,8 @@ the binary and attaches it plus a `.sha256` to the release. The version in
 | Progress renderer, bars, spinner, window | Implemented | `mv3dt_installer/progress.py` |
 | Streaming command output through `run_root` | Implemented and wired | `app.py`, `shellout.py` |
 | Step and phase banner | Implemented and wired | `app.py`, all seven steps |
-| Download byte adapter (`follow_download`) | Implemented, **not wired** | `progress.py` |
-| apt percentage adapter (`follow_apt`) | Implemented, **not wired** | `progress.py` |
+| Download byte adapter (`follow_download`) | Implemented and wired | `progress.py`, `progress_exec.py`, Steps 1-2 |
+| apt percentage adapter (`follow_apt`) | Implemented and wired | `progress.py`, `progress_exec.py`, Steps 1-2 |
 | Failure context block, refusal evidence | Implemented, **call sites not retrofitted** | `report.py` |
 | Docker pull progress | Not started, open decision | — |
 
@@ -69,13 +69,13 @@ python3 -m pytest tests/ -q
 Current result on an **arm64 macOS** development machine:
 
 ```
-5 failed, 1244 passed, 6 skipped
+5 failed, 1252 passed, 6 skipped
 ```
 
 **The 5 failures are environmental, not regressions (REQUIRED to know before
 you start).** They are architecture assertions that cannot pass off x86_64.
 The same suite passes fully in CI on x86_64 — the `installer-tests` workflow
-run for the v0.3.0 tag is green. The five are:
+run for the v0.3.1 tag is green. The five are:
 
 | Test | Why it fails off x86_64 |
 |---|---|
@@ -165,6 +165,11 @@ It was built as 13 units across 8 dependency-ordered waves. All are merged:
 | U12 | Transcript-only sink | `60da882` |
 | U13 | Parsed `--non-interactive` settles the colour question | `a3ba33a` |
 
+The post-v0.3.0 integration commit `5b94392` connects the apt and download
+adapters through the shared `progress_exec.py` orchestration seam. It keeps
+the renderer single-writer, retains captured output and the transcript, and
+preserves Step 2's invoking-user download contract.
+
 ### 3.4 Design decisions worth not re-litigating
 
 Each of these was contested during review and settled with a measurement.
@@ -237,46 +242,7 @@ that is not obvious.
 
 ## 5. What remains
 
-### 5.1 Wire the adapters to the commands (the immediate next task)
-
-**This is the gap between "implemented" and "an operator sees a bar."** The
-adapters are built, reviewed and tested — `test_progress.py` alone holds 149
-tests — but they have **zero call sites outside `progress.py`**. Verify with:
-
-```bash
-grep -rn "follow_apt\|follow_download\|progress.bytes\|progress.percent" \
-  installer/mv3dt_installer --include='*.py' | grep -v progress.py
-```
-
-That currently returns nothing. What v0.3.0 therefore does and does not do:
-
-| Works today | Missing |
-|---|---|
-| `[ 1/7 ]` step banner with absolute position | Percentage bars |
-| Phase lines collapsing to `✓ label  3m41s` | `412 MB / 606 MB  14.2 MB/s  0:14` |
-| Task names per operation | apt's own unpack and configure percent |
-| Live command output in the rolling 8-line window | |
-| `--verbose`, failure blocks, full transcript | |
-
-Two pieces of work, neither of which needs new mechanism:
-
-1. **apt percentage.** Pass `-o APT::Status-Fd=<fd>` at the `apt-get` call
-   sites — there are **7**, in `step1_prerequisites.py` and
-   `step2_deepstream_sdk.py` — and feed the resulting lines to
-   `progress.follow_apt`. `progress.apt_status_fd_args(fd)` already builds
-   the argument. The parser handles the `dlstatus`/`pmstatus` double sweep
-   monotonically and falls back to a spinner when no denominator exists. The
-   highest-value single call site is Step 1's TensorRT transaction: that is
-   event 3 in [`08` §2](08-PROGRESS-AND-OBSERVABILITY.md#2-observed-failures-this-doc-exists-to-fix),
-   the one an operator interrupted believing it had hung.
-2. **Download bytes.** Call `progress.follow_download` against the `.part`
-   file already used by `_download_driver_run` in `step1_prerequisites.py`
-   (the roughly 400 MB NVIDIA runfile, event 2 in `08` §2), and at the
-   artifact fetches in `step2_deepstream_sdk.py`. `content_length` and
-   `part_size` are the two probes; the poll is a `stat()` on a file the
-   installer is already writing, so it works for any fetch tool.
-
-### 5.2 Retrofit the failure-context call sites
+### 5.1 Retrofit the failure-context call sites
 
 U10 built `report.FailureContext`, `report.failure()`, `report.refusal()`
 and `report.with_evidence()`, but **no step calls them yet**. Today a step
@@ -290,7 +256,7 @@ precedent is Step 1's `_session_hazard`, which returns an evidence string
 rather than a bare verdict, and `report.with_evidence` accepts that exact
 shape unchanged.
 
-### 5.3 Open decision for the human
+### 5.2 Open decision for the human
 
 **Docker pull progress** ([`08` §11](08-PROGRESS-AND-OBSERVABILITY.md#11-out-of-scope--open-decisions),
 item 3). Step 2 resolves its install method to `deb`, `tar` or `docker` at
@@ -298,7 +264,7 @@ run time. The doc deliberately leaves this open: wire a bar only for
 whichever path Step 2 actually takes in practice. This needs a decision
 before it needs code.
 
-### 5.4 Known residuals
+### 5.3 Known residuals
 
 - **`report._secrets` reads `os.environ`**, not the child process's
   environment, so a secret passed only to a child is not redacted in a
@@ -322,10 +288,10 @@ before it needs code.
 
 For the current state to be what this document claims:
 
-- [ ] `python3 -m pytest tests/ -q` from `installer/` gives 1244 passed and
+- [ ] `python3 -m pytest tests/ -q` from `installer/` gives 1252 passed and
       exactly the 5 failures in [section 2.1](#21-test-suite).
-- [ ] `grep` for the adapters ([section 5.1](#51-wire-the-adapters-to-the-commands-the-immediate-next-task))
-      returns no call sites outside `progress.py`.
+- [ ] `grep` for `follow_apt` and `follow_download` finds the Step 1 and
+      Step 2 call sites routed through `progress_exec.py`.
 - [ ] Every step declares `phases` and calls exactly `phase(1)` through
       `phase(len(phases))` — pinned by
       `tests/test_steps_protocol.py::test_every_step_declares_phases_that_match_the_indices_it_uses`.
@@ -354,18 +320,19 @@ Settled exclusions, carried from [`08` §11](08-PROGRESS-AND-OBSERVABILITY.md#11
 
 ## References
 
-Facts in this document are drawn from the repository at commit `4f7033e`
-(tag `v0.3.0`) and from the workstation install runs of `mv3dt-installer`
+Facts in this document are drawn from the repository through release
+`v0.3.1` and from the workstation install runs of `mv3dt-installer`
 0.1.2 through 0.1.9, which are the source of the observed-failure inventory
 in [`08` §2](08-PROGRESS-AND-OBSERVABILITY.md#2-observed-failures-this-doc-exists-to-fix).
 Test counts and the arm64 failure list were produced by running the suite,
 not estimated.
 
 - [apt `APT::Status-Fd`](https://manpages.debian.org/bookworm/apt/apt.conf.5.en.html)
-  — **backs [section 5.1](#51-wire-the-adapters-to-the-commands-the-immediate-next-task)**:
-  the `pmstatus:` percentage the unwired apt adapter parses.
-- [`curl` `--write-out`](https://curl.se/docs/manpage.html) — **backs
-  section 5.1**: the byte count used to confirm a completed transfer.
+  — **backs the apt integration described in [section 3.3](#33-the-progress-and-observability-subsystem)**:
+  the `pmstatus:` percentage the wired apt adapter parses.
+- [`curl` `--write-out`](https://curl.se/docs/manpage.html) — **backs the
+  download integration described in section 3.3**: the byte count used to
+  confirm a completed transfer.
 - [NVIDIA driver runfile index](https://download.nvidia.com/XFree86/Linux-x86_64/)
   — **backs [section 3.2](#32-step-1s-two-launch-structure-required-to-understand)**:
   the pinned runfile Step 1 downloads and version-verifies.
@@ -382,8 +349,10 @@ Repo files referenced:
   structure and the equality pins.
 - [`DELETION-REVIEW.md`](DELETION-REVIEW.md) — what was removed from this
   fork, why, and where each pattern landed.
-- `installer/mv3dt_installer/progress.py` — the renderer and the two unwired
+- `installer/mv3dt_installer/progress.py` — the renderer and apt/download
   adapters.
+- `installer/mv3dt_installer/progress_exec.py` — shared adapter/process
+  orchestration used by Steps 1 and 2.
 - `installer/mv3dt_installer/report.py` — the unretrofitted failure-context
   and evidence surface.
 - `installer/tests/conftest.py` — the global-state reset that keeps `logs`
