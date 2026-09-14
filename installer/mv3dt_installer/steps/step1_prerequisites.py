@@ -16,11 +16,12 @@ reporting a driver version -- rather than writing `state.json` itself
 
 * **Launch A** (driver not yet loaded): base deps, the DS 9.1 section 4.1
   apt prerequisites, the CUDA repo + toolkit, nouveau/distro-driver
-  cleanup, the Secure Boot gate, stopping the desktop session, and running
-  the driver `.run`. Ends in `USER_ACTION_REQUIRED` (reboot instructions)
-  once the `.run` succeeds, or earlier for the nouveau/distro-driver
-  cleanup, Secure Boot gate, staging gap, or a `gdm`/`lightdm` stop
-  failure; `FAILED` only if the `.run` itself exits non-zero.
+  cleanup, the Secure Boot gate, and the driver `.run`. A desktop launch
+  hands display teardown, the runfile, and the success reboot to a persistent
+  systemd worker before this process exits; TTY/SSH launches retain the
+  synchronous path. Ends in `USER_ACTION_REQUIRED` for the handoff/reboot,
+  nouveau/distro-driver cleanup, Secure Boot gate, or staging gap; `FAILED`
+  only if scheduling or the synchronous `.run` exits non-zero.
 * **Launch B** (driver loaded): TensorRT + cuDNN via apt, a GStreamer pin
   confirmation, and the Mosquitto broker via the bundled
   `10_setup_mosquitto.sh` (section 3.2). Ends in `COMPLETE`, letting the
@@ -47,8 +48,9 @@ through to whatever comes next.
 All subprocess work goes through `ctx.run_root` (never a bare
 `subprocess.run`), which is the seam tests inject a fake `Context` through.
 System paths this module writes directly (`/etc/profile.d/cuda.sh`,
-`/etc/modprobe.d/blacklist-nouveau.conf`, `/etc/mosquitto/conf.d/mv3dt.conf`)
-are named by module-level constants, following the same pattern
+`/etc/modprobe.d/blacklist-nouveau.conf`, the driver-handoff state, and
+`/etc/mosquitto/conf.d/mv3dt.conf`) are named by module-level constants,
+following the same pattern
 `systemd.py`'s `UNIT_DIR` uses, so tests can monkeypatch them to a `tmp_path`
 without ever touching the real filesystem.
 """
@@ -59,9 +61,10 @@ import hashlib
 import os
 import pathlib
 import re
+import shutil
 from typing import TYPE_CHECKING, Sequence
 
-from mv3dt_installer import progress_exec, shellout, waitui
+from mv3dt_installer import progress_exec, shellout, systemd as systemd_mod, waitui
 from mv3dt_installer.steps import StepResult, StepStatus, UserAction, register
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -194,6 +197,19 @@ CUDA_PROFILE_PATH = pathlib.Path("/etc/profile.d/cuda.sh")
 # STEP-1 section 4, caveat 4 -- nouveau must be out of the way before the
 # .run installer runs.
 NOUVEAU_BLACKLIST_PATH = pathlib.Path("/etc/modprobe.d/blacklist-nouveau.conf")
+
+# STEP-1 section 5.1a -- a desktop terminal cannot survive GDM stopping, so
+# the runfile is handed to a root-owned oneshot service. Every artifact the
+# service needs is copied out of PyInstaller's temporary extraction directory
+# before it starts.
+DRIVER_HANDOFF_ROOT = pathlib.Path("/var/lib/mv3dt-installer/driver-handoff")
+DRIVER_HANDOFF_WORKER_PATH = DRIVER_HANDOFF_ROOT / "install-driver.sh"
+DRIVER_HANDOFF_RUNFILE_PATH = DRIVER_HANDOFF_ROOT / DRIVER_RUN_FILENAME
+DRIVER_HANDOFF_STATUS_PATH = DRIVER_HANDOFF_ROOT / "status"
+DRIVER_HANDOFF_LOG_PATH = DRIVER_HANDOFF_ROOT / "driver-install.log"
+DRIVER_HANDOFF_UNIT_NAME = "mv3dt-driver-handoff.service"
+DRIVER_HANDOFF_UNIT_DIR = pathlib.Path("/etc/systemd/system")
+DRIVER_HANDOFF_BOOT_ID_PATH = pathlib.Path("/proc/sys/kernel/random/boot_id")
 
 # STEP-1 section 3.2 -- the Mosquitto broker drop-in this step's Python
 # wraps the bundled script's install with change detection for.
@@ -502,6 +518,154 @@ def _nouveau_loaded(ctx: "Context") -> bool:
 
 def _driver_run_path(ctx: "Context") -> pathlib.Path:
     return pathlib.Path(ctx.install_dir) / "downloads" / "nvidia" / DRIVER_RUN_FILENAME
+
+
+def _driver_handoff_state() -> str | None:
+    """Return the persistent worker state, or None before the first handoff."""
+    try:
+        return DRIVER_HANDOFF_STATUS_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _current_boot_id() -> str | None:
+    try:
+        return DRIVER_HANDOFF_BOOT_ID_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _driver_handoff_result() -> StepResult | None:
+    """Block duplicate work while a prior desktop handoff is actionable."""
+    state = _driver_handoff_state()
+    if state in {"scheduled", "running"}:
+        return StepResult(
+            status=StepStatus.USER_ACTION_REQUIRED,
+            message="the NVIDIA driver handoff is still running",
+            user_actions=[
+                UserAction(
+                    text=(
+                        "Do not start another installer. The desktop will close while "
+                        "the driver installs, and the workstation will reboot "
+                        "automatically when it succeeds."
+                    ),
+                    command=f"sudo journalctl -fu {DRIVER_HANDOFF_UNIT_NAME}",
+                    path=str(DRIVER_HANDOFF_LOG_PATH),
+                )
+            ],
+        )
+    if state is not None and state.startswith("succeeded"):
+        _, _, handoff_boot_id = state.partition(":")
+        current_boot_id = _current_boot_id()
+        if handoff_boot_id and current_boot_id and handoff_boot_id != current_boot_id:
+            return StepResult(
+                status=StepStatus.USER_ACTION_REQUIRED,
+                message=(
+                    "the NVIDIA driver handoff succeeded, but the driver did not "
+                    "load after reboot"
+                ),
+                user_actions=[
+                    UserAction(
+                        text=(
+                            "Check Secure Boot or MOK enrollment and inspect the "
+                            "persistent driver log. Remove the handoff marker only "
+                            "after correcting the cause, then run the installer again."
+                        ),
+                        command=f"sudo rm -f {DRIVER_HANDOFF_STATUS_PATH}",
+                        path=str(DRIVER_HANDOFF_LOG_PATH),
+                    )
+                ],
+            )
+        return StepResult(
+            status=StepStatus.USER_ACTION_REQUIRED,
+            message="the NVIDIA driver handoff succeeded and is waiting for reboot",
+            user_actions=_driver_reboot_actions(),
+        )
+    if state is not None and state.startswith("failed:"):
+        return StepResult(
+            status=StepStatus.USER_ACTION_REQUIRED,
+            message=f"the NVIDIA driver background install {state}",
+            user_actions=[
+                UserAction(
+                    text=(
+                        "The desktop was restored. Inspect the driver log, remove the "
+                        "failure marker after correcting the cause, then run the "
+                        "installer again."
+                    ),
+                    command=f"sudo rm -f {DRIVER_HANDOFF_STATUS_PATH}",
+                    path=str(DRIVER_HANDOFF_LOG_PATH),
+                )
+            ],
+        )
+    return None
+
+
+def _schedule_driver_handoff(ctx: "Context", run_path: pathlib.Path) -> str | None:
+    """Stage and start the desktop-safe systemd worker.
+
+    Returns None after systemd accepts the asynchronous job, otherwise a short
+    operator-facing reason. The service owns display teardown, the runfile,
+    failure recovery, and the success reboot after this process exits.
+    """
+    DRIVER_HANDOFF_ROOT.mkdir(parents=True, exist_ok=True)
+    DRIVER_HANDOFF_ROOT.chmod(0o700)
+
+    source = ctx.asset_path("systemd", "mv3dt-driver-handoff.sh")
+    shutil.copyfile(source, DRIVER_HANDOFF_WORKER_PATH)
+    DRIVER_HANDOFF_WORKER_PATH.chmod(0o700)
+    shutil.copyfile(run_path, DRIVER_HANDOFF_RUNFILE_PATH)
+    DRIVER_HANDOFF_RUNFILE_PATH.chmod(0o700)
+
+    staged_reason = _verify_driver_run(DRIVER_HANDOFF_RUNFILE_PATH)
+    if staged_reason is not None:
+        DRIVER_HANDOFF_RUNFILE_PATH.unlink(missing_ok=True)
+        return f"could not stage the NVIDIA driver handoff: {staged_reason}"
+
+    rendered = systemd_mod.render_unit(
+        ("systemd", "mv3dt-driver-handoff.service.in"),
+        {
+            "WORKER": str(DRIVER_HANDOFF_WORKER_PATH),
+            "RUNFILE": str(DRIVER_HANDOFF_RUNFILE_PATH),
+            "STATUS_FILE": str(DRIVER_HANDOFF_STATUS_PATH),
+            "LOG_FILE": str(DRIVER_HANDOFF_LOG_PATH),
+            "DRIVER_VERSION": DRIVER_VERSION,
+            "BOOT_ID_FILE": str(DRIVER_HANDOFF_BOOT_ID_PATH),
+        },
+    )
+    changed = systemd_mod.install_unit(
+        DRIVER_HANDOFF_UNIT_NAME,
+        rendered,
+        unit_dir=DRIVER_HANDOFF_UNIT_DIR,
+    )
+    runner = lambda argv, **kwargs: ctx.run_root(*argv, **kwargs)
+    if changed:
+        systemd_mod.daemon_reload(runner=runner)
+
+    DRIVER_HANDOFF_STATUS_PATH.write_text("scheduled\n", encoding="utf-8")
+    DRIVER_HANDOFF_STATUS_PATH.chmod(0o600)
+    ctx.run_root(
+        "systemctl",
+        "reset-failed",
+        DRIVER_HANDOFF_UNIT_NAME,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    result = ctx.run_root(
+        "systemctl",
+        "start",
+        "--no-block",
+        DRIVER_HANDOFF_UNIT_NAME,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        DRIVER_HANDOFF_STATUS_PATH.write_text(
+            f"failed:systemd-start:{result.returncode}\n", encoding="utf-8"
+        )
+        return f"systemd could not start the driver handoff (exit {result.returncode})"
+    return None
 
 
 def _driver_run_embedded_version(path: pathlib.Path) -> str | None:
@@ -904,6 +1068,10 @@ class Step1Prerequisites:
         return self._run_launch_b(ctx)
 
     def _run_launch_a(self, ctx: "Context") -> StepResult:
+        handoff_result = _driver_handoff_result()
+        if handoff_result is not None:
+            return handoff_result
+
         kernel = _kernel_release(ctx)
         base_kernel_packages = [
             *BASE_KERNEL_PACKAGES,
@@ -1002,28 +1170,31 @@ class Step1Prerequisites:
                 ],
             )
 
-        # Refuse before touching the display manager, not after: once gdm
-        # is stopped from inside the desktop session there is no process
-        # left to report anything (section 4, caveat 6a).
+        # A desktop terminal cannot survive GDM stopping. Hand the disruptive
+        # work to systemd before touching the display manager; TTY and SSH
+        # sessions retain the synchronous path and its live output.
         hazard = _session_hazard(ctx)
         if hazard is not None:
+            reason = _schedule_driver_handoff(ctx, run_path)
+            if reason is not None:
+                return StepResult(status=StepStatus.FAILED, message=reason)
             return StepResult(
                 status=StepStatus.USER_ACTION_REQUIRED,
                 message=(
-                    "the driver installer must stop the desktop session, which "
-                    f"would kill this installer along with it ({hazard})"
+                    "the NVIDIA driver installation was handed to systemd; the "
+                    "desktop will close shortly and the workstation will reboot "
+                    f"automatically when installation succeeds ({hazard})"
                 ),
                 user_actions=[
                     UserAction(
                         text=(
-                            "Switch to a virtual console with Ctrl+Alt+F3, log in "
-                            "there, and re-run this command. The desktop session "
-                            "cannot take the installer down with it from a console. "
-                            "An SSH session works too. If you are already on a "
-                            "console and see this anyway, override the check with "
-                            f"{ALLOW_DISPLAY_STOP_ENV}=1."
+                            "Save any other open work now. Do not power off after the "
+                            "desktop closes. After the automatic reboot, log in and "
+                            "run mv3dt-installer again to continue with TensorRT and "
+                            "cuDNN."
                         ),
-                        command=f"sudo {ALLOW_DISPLAY_STOP_ENV}=1 ./mv3dt-installer",
+                        command=f"sudo journalctl -fu {DRIVER_HANDOFF_UNIT_NAME}",
+                        path=str(DRIVER_HANDOFF_LOG_PATH),
                     ),
                 ],
             )

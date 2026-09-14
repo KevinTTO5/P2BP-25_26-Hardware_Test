@@ -55,6 +55,16 @@ def _safe_system_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(s1, "CUDA_PROFILE_PATH", tmp_path / "etc-profile.d" / "cuda.sh")
     monkeypatch.setattr(s1, "NOUVEAU_BLACKLIST_PATH", tmp_path / "etc-modprobe.d" / "blacklist-nouveau.conf")
     monkeypatch.setattr(s1, "MOSQUITTO_CONF_DIR", tmp_path / "etc-mosquitto" / "conf.d")
+    handoff_root = tmp_path / "var-lib" / "driver-handoff"
+    monkeypatch.setattr(s1, "DRIVER_HANDOFF_ROOT", handoff_root)
+    monkeypatch.setattr(s1, "DRIVER_HANDOFF_WORKER_PATH", handoff_root / "install-driver.sh")
+    monkeypatch.setattr(s1, "DRIVER_HANDOFF_RUNFILE_PATH", handoff_root / s1.DRIVER_RUN_FILENAME)
+    monkeypatch.setattr(s1, "DRIVER_HANDOFF_STATUS_PATH", handoff_root / "status")
+    monkeypatch.setattr(s1, "DRIVER_HANDOFF_LOG_PATH", handoff_root / "driver-install.log")
+    monkeypatch.setattr(s1, "DRIVER_HANDOFF_UNIT_DIR", tmp_path / "systemd")
+    boot_id_path = tmp_path / "boot-id"
+    boot_id_path.write_text("boot-a\n")
+    monkeypatch.setattr(s1, "DRIVER_HANDOFF_BOOT_ID_PATH", boot_id_path)
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +103,7 @@ class FakeRunner:
         gstreamer_version: str = "",
         mosquitto_active: bool = True,
         display_manager_active: bool = True,
+        handoff_start_ok: bool = True,
         cudnn_install_result: Optional[str] = s1.CUDNN_VERSION,
         kernel_release: str = "6.8.0-generic",
     ) -> None:
@@ -113,6 +124,7 @@ class FakeRunner:
         self.gstreamer_version = gstreamer_version
         self.mosquitto_active = mosquitto_active
         self.display_manager_active = display_manager_active
+        self.handoff_start_ok = handoff_start_ok
         self.cudnn_install_result = cudnn_install_result
         self.kernel_release = kernel_release
 
@@ -152,6 +164,8 @@ class FakeRunner:
             return _rc(args, 0 if self.gdm_stops else 1)
         if cmd == "systemctl" and args[1] == "stop":
             return _rc(args, 0 if self.gdm_stops else 1)
+        if cmd == "systemctl" and args[1] == "start" and "--no-block" in args:
+            return _rc(args, 0 if self.handoff_start_ok else 1)
         if cmd == "pkill":
             return _rc(args, 0)
         if cmd == "dpkg-query":
@@ -1096,10 +1110,8 @@ def test_guard_blocks_a_desktop_terminal_emulator(tmp_path, monkeypatch):
     assert s1._session_hazard(ctx) is not None
 
 
-def test_launch_a_refuses_before_touching_the_display_manager(tmp_path, monkeypatch):
-    """The regression: launched from a desktop terminal, Step 1 used to stop
-    gdm, die on SIGHUP before the .run started, and leave a black screen with
-    no log and no explanation."""
+def test_launch_a_hands_desktop_install_to_systemd(tmp_path, monkeypatch):
+    """A desktop terminal exits before systemd owns the disruptive work."""
     monkeypatch.setattr(s1, "_controlling_tty", lambda: "/dev/pts/1")
     monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: False)
     ctx, runner = _make_ctx(tmp_path, display_manager_active=True)
@@ -1108,12 +1120,87 @@ def test_launch_a_refuses_before_touching_the_display_manager(tmp_path, monkeypa
     result = s1.Step1Prerequisites()._run_launch_a(ctx)
 
     assert result.status is StepStatus.USER_ACTION_REQUIRED
-    assert "kill this installer" in result.message
-    assert "Ctrl+Alt+F3" in result.user_actions[0].text
-    # Nothing was torn down, and the .run never started.
-    assert not [c for c in runner.calls if c[0] == "service"]
+    assert "handed to systemd" in result.message
+    assert "automatically" in result.message
+    assert s1.DRIVER_HANDOFF_STATUS_PATH.read_text().strip() == "scheduled"
+    assert s1.DRIVER_HANDOFF_WORKER_PATH.is_file()
+    assert s1._verify_driver_run(s1.DRIVER_HANDOFF_RUNFILE_PATH) is None
+    assert (s1.DRIVER_HANDOFF_UNIT_DIR / s1.DRIVER_HANDOFF_UNIT_NAME).is_file()
+    assert any(
+        c[:3] == ("systemctl", "start", "--no-block") for c in runner.calls
+    )
+    # The foreground process never tears down the desktop or runs the file.
     assert not [c for c in runner.calls if c[0] == "pkill"]
     assert not [c for c in runner.calls if str(c[0]).endswith(".run")]
+
+
+def test_launch_a_reports_a_systemd_schedule_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(s1, "_controlling_tty", lambda: "/dev/pts/1")
+    monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: False)
+    ctx, _ = _make_ctx(
+        tmp_path, display_manager_active=True, handoff_start_ok=False
+    )
+    _stage_driver_run(ctx)
+
+    result = s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    assert result.status is StepStatus.FAILED
+    assert "systemd could not start" in result.message
+    assert s1.DRIVER_HANDOFF_STATUS_PATH.read_text().startswith(
+        "failed:systemd-start:"
+    )
+
+
+@pytest.mark.parametrize("state", ["scheduled", "running"])
+def test_launch_a_does_not_duplicate_an_active_handoff(tmp_path, state):
+    ctx, runner = _make_ctx(tmp_path)
+    s1.DRIVER_HANDOFF_STATUS_PATH.parent.mkdir(parents=True)
+    s1.DRIVER_HANDOFF_STATUS_PATH.write_text(f"{state}\n")
+
+    result = s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert "still running" in result.message
+    assert not runner.calls
+
+
+def test_launch_a_surfaces_a_failed_handoff_without_retrying(tmp_path):
+    ctx, runner = _make_ctx(tmp_path)
+    s1.DRIVER_HANDOFF_STATUS_PATH.parent.mkdir(parents=True)
+    s1.DRIVER_HANDOFF_STATUS_PATH.write_text("failed:runfile:1\n")
+
+    result = s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert "failed:runfile:1" in result.message
+    assert result.user_actions[0].path == str(s1.DRIVER_HANDOFF_LOG_PATH)
+    assert not runner.calls
+
+
+def test_launch_a_keeps_a_successful_handoff_at_the_reboot_gate(tmp_path):
+    ctx, runner = _make_ctx(tmp_path)
+    s1.DRIVER_HANDOFF_STATUS_PATH.parent.mkdir(parents=True)
+    s1.DRIVER_HANDOFF_STATUS_PATH.write_text("succeeded:boot-a\n")
+
+    result = s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert "waiting for reboot" in result.message
+    assert result.user_actions[-1].command == "sudo reboot"
+    assert not runner.calls
+
+
+def test_launch_a_reports_driver_not_loaded_after_handoff_reboot(tmp_path):
+    ctx, runner = _make_ctx(tmp_path)
+    s1.DRIVER_HANDOFF_STATUS_PATH.parent.mkdir(parents=True)
+    s1.DRIVER_HANDOFF_STATUS_PATH.write_text("succeeded:boot-before\n")
+
+    result = s1.Step1Prerequisites()._run_launch_a(ctx)
+
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert "did not load after reboot" in result.message
+    assert "Secure Boot" in result.user_actions[0].text
+    assert not runner.calls
 
 
 def test_sshd_ancestor_walk_handles_a_comm_containing_parens(monkeypatch, tmp_path):
@@ -1183,8 +1270,7 @@ def test_stopping_fails_only_when_an_active_manager_will_not_stop(tmp_path):
     assert s1._stop_display_manager(ctx) is False
 
 
-def test_refusal_names_what_it_detected(tmp_path, monkeypatch):
-    """A refusal the operator cannot check is a refusal they cannot fix."""
+def test_handoff_message_names_what_it_detected(tmp_path, monkeypatch):
     monkeypatch.setattr(s1, "_controlling_tty", lambda: "/dev/pts/1")
     monkeypatch.setattr(s1, "_has_sshd_ancestor", lambda: False)
     ctx, _ = _make_ctx(tmp_path, display_manager_active=True)
@@ -1194,7 +1280,7 @@ def test_refusal_names_what_it_detected(tmp_path, monkeypatch):
 
     assert "/dev/pts/1" in result.message
     assert "gdm3" in result.message
-    assert s1.ALLOW_DISPLAY_STOP_ENV in result.user_actions[0].text
+    assert result.user_actions[0].path == str(s1.DRIVER_HANDOFF_LOG_PATH)
 
 
 def test_refusal_says_so_when_no_terminal_was_detected(tmp_path, monkeypatch):

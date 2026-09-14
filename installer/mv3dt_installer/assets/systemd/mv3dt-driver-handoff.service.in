@@ -1,0 +1,11 @@
+[Unit]
+Description=MV3DT NVIDIA driver @DRIVER_VERSION@ desktop handoff
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 10
+ExecStart="@WORKER@" "@RUNFILE@" "@STATUS_FILE@" "@LOG_FILE@" "@BOOT_ID_FILE@"
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=infinity

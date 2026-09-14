@@ -321,7 +321,7 @@ and Phases 1–2 of
 | 3 | Distro `nvidia-*` / `libnvidia-*` conflict with `.run` | `apt purge 'nvidia-*' 'libnvidia-*'` + `apt autoremove` | may set `REBOOT_REQUIRED` (§5) |
 | 4 | `nouveau` will abort the `.run` installer | write `/etc/modprobe.d/blacklist-nouveau.conf` (`blacklist nouveau` + `options nouveau modeset=0`), `update-initramfs -u` | `REBOOT_REQUIRED` if nouveau was loaded (§5) |
 | 5 | Secure Boot → unsigned `nvidia.ko` | probe `mokutil --sb-state`; if enabled, surface `USER_ACTION_REQUIRED` (disable Secure Boot in BIOS **or** complete MOK enrollment on next boot) | operator action; MOK/BIOS is out of scope ([`00` §13](00-FRAMEWORK-AND-BOOTSTRAP.md#13-out-of-scope--defer-to-human)) |
-| 6 | GDM/Xorg holding the GPU during `.run` | `service gdm stop` (fallback `lightdm`), `pkill -9 Xorg` before running `.run`; if it still fails under a desktop, surface a `USER_ACTION_REQUIRED` telling the operator to switch to a TTY (`Ctrl+Alt+F3`) and re-run | precondition for §5 step 4 |
+| 6 | GDM/Xorg holding the GPU during `.run` | From a desktop session, stage and asynchronously start `mv3dt-driver-handoff.service`; its root-owned worker stops the active display manager and Xorg after the foreground installer exits. TTY/SSH sessions retain the synchronous path. | desktop-safe precondition for §5 step 7 |
 | 7 | CUDA 13.2 not on `PATH` / `LD_LIBRARY_PATH` | write `/etc/profile.d/cuda.sh` exporting `/usr/local/cuda-13.2/bin` and `/usr/local/cuda-13.2/lib64` | enables `nvcc` in `verify()` |
 
 Notes:
@@ -362,10 +362,15 @@ the framework's reboot gate
    (before touching the `.run`), because the `.run` cannot build against a
    live nouveau.
 6. **Secure Boot check** (caveat 5). If enabled → `USER_ACTION_REQUIRED`.
-7. **Stop GDM/Xorg** (caveat 6), then **run the driver `.run`**
-   (`NVIDIA-Linux-x86_64-595.58.03.run --no-cc-version-check`).
-8. **Return `REBOOT_REQUIRED`** — the driver kernel module needs a reboot to
-   load (§6).
+7. **Install the driver** (caveat 6): a desktop launch copies the verified
+   runfile and bundled worker into the root-owned handoff directory, starts
+   `mv3dt-driver-handoff.service` with `--no-block`, and returns
+   `USER_ACTION_REQUIRED` before the service stops GDM/Xorg. A TTY or SSH
+   launch stops GDM/Xorg and runs the same `.run` synchronously.
+8. **Reboot after success**: the handoff worker records `succeeded` and
+   automatically reboots. The synchronous path returns reboot instructions.
+   On handoff failure it records the runfile exit code, restores the display
+   manager, and does not reboot.
 
 **Launch B — after the confirmed reboot (§6):**
 
@@ -433,10 +438,10 @@ Two corrections, both REQUIRED:
 
 ---
 
-### 5.1a Documented drift: `--silent` and the session guard (RESOLVED)
+### 5.1a Desktop-safe systemd handoff (RESOLVED)
 
-Two departures from the verbatim DS 9.1 command, both found on real
-hardware rather than in review:
+Two operational departures from the verbatim DS 9.1 command are **LOCKED**,
+both found on real hardware rather than in review:
 
 1. **`--silent` is added** to the `.run` invocation. The runfile is
    interactive by default and can stop on ncurses questions (DKMS
@@ -446,21 +451,33 @@ hardware rather than in review:
    outside is indistinguishable from a slow kernel-module build. `--silent`
    implies `--no-questions` and accepts the licence, making that class of
    hang impossible.
-2. **Step 1 refuses to stop the display manager when doing so would kill the
-   installer itself** (caveat 6a). `service gdm stop` tears down the X
-   session and every terminal emulator in it — including the one the
-   operator launched from, if they launched from the desktop. The installer
-   then dies on `SIGHUP`, usually *before* the `.run` starts, leaving a black
-   screen, no `/var/log/nvidia-installer.log`, and no indication anything
-   went wrong. The check runs **before** the display manager is touched,
-   since afterwards no process survives to report anything.
+2. **A desktop launch hands the disruptive work to systemd before GDM is
+   touched.** `service gdm stop` tears down the X session and every terminal
+   emulator in it, including the foreground installer. Step 1 therefore
+   stages the bundled worker, a freshly verified copy of the runfile, a
+   status marker, and the persistent log under
+   `/var/lib/mv3dt-installer/driver-handoff/`. It installs
+   `mv3dt-driver-handoff.service`, starts it asynchronously, and exits. The
+   unit waits ten seconds before the worker stops the display manager, runs
+   the exact [§5.1](#51-driver-install-method-run-runfile-locked-verified-against-nvidia-docs)
+   command, records `succeeded:<boot-id>`, and automatically reboots only
+   after exit zero. A failure writes `failed:runfile:<code>`, restarts the
+   display manager, and leaves the log
+   at `/var/lib/mv3dt-installer/driver-handoff/driver-install.log`.
 
-The session check treats a virtual console (`/dev/ttyN`) and an SSH session
-as safe, and a desktop terminal emulator with a display manager running as
-unsafe. SSH is detected by walking `/proc` for an `sshd` ancestor rather
-than by reading `SSH_CONNECTION`/`SSH_TTY`, because `sudo`'s default
-`env_reset` strips those before a step ever sees them — an SSH operator
-would otherwise be refused for a hazard that cannot reach them.
+The session check still treats a virtual console (`/dev/ttyN`) and an SSH
+session as safe synchronous paths. SSH is detected by walking `/proc` for an
+`sshd` ancestor rather than reading `SSH_CONNECTION`/`SSH_TTY`, because
+`sudo`'s default `env_reset` strips those variables. A desktop terminal with
+an active display manager selects the handoff path instead of being refused.
+
+| Handoff status | Next launch behavior |
+| --- | --- |
+| absent | Stage and schedule the worker when the desktop hazard is detected |
+| `scheduled` / `running` | Refuse a duplicate handoff and show the journal/log locations |
+| `succeeded:<current-boot-id>` | Show the reboot action as a fallback |
+| `succeeded:<prior-boot-id>` but driver absent | Report that the module did not load and show Secure Boot/MOK remediation |
+| `failed:<reason>` | Keep Step 1 pending; show the persistent log and marker-reset command |
 
 ---
 
@@ -762,8 +779,11 @@ something this spec change performs by itself.
   Secure Boot in BIOS, **or** complete MOK Manager enrollment on the next
   boot, then re-run. (BIOS/MOK are out of scope for the installer,
   [`00` §13](00-FRAMEWORK-AND-BOOTSTRAP.md#13-out-of-scope--defer-to-human).)
-- If Step 1 returned `USER_ACTION_REQUIRED` for **GDM/desktop**: switch to a
-  TTY (`Ctrl+Alt+F3`), log in, re-run the installer from there.
+- If Step 1 returned `USER_ACTION_REQUIRED` for the **desktop handoff**: save
+  other open work and wait. The desktop closes after the ten-second grace
+  period and the workstation reboots automatically after a successful driver
+  install. Log in and run the installer again to continue. On failure, the
+  desktop is restored and the displayed persistent log explains the cause.
 - New login shells pick up CUDA 13.2 automatically from
   `/etc/profile.d/cuda.sh`; a shell open from before the reboot must
   `source /etc/profile.d/cuda.sh` or re-login for `nvcc` to be on `PATH`.
