@@ -834,9 +834,9 @@ def _bootstrap_subcommand_context(
     A small, permissive parser (`parse_known_args`, so it never errors on a
     subcommand's own flags) plucks exactly the framework-owned flags this
     bootstrap itself needs -- `--install-dir`, `--non-interactive`,
-    `--verbose`, `--log-dir` -- out of `argv` without consuming or otherwise altering
-    it: the unmodified `argv` is still exactly what the subcommand handler
-    receives. This is what lets a systemd `ExecStart=` line for a later
+    `--verbose`, `--log-dir` -- out of `argv` without consuming it or
+    otherwise altering it: the unmodified `argv` is still exactly what the
+    subcommand handler receives. This is what lets a systemd `ExecStart=` line for a later
     step's unit (e.g. an `ingest` invocation baked with `--non-interactive
     --install-dir <install_dir>`, doc 00's `render_ingest_units` example)
     resolve the right `install_dir` for its `Context` while the handler

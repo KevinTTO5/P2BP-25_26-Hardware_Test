@@ -638,19 +638,17 @@ and
 [`08` section 8](08-PROGRESS-AND-OBSERVABILITY.md#8-verbosity),
 and is not restated here.
 
-| Flag | Command output on screen | Bars | Use |
-|------|--------------------------|------|-----|
-| *(default)* | Last 8 lines, rolling | Yes | Normal install |
-| `--verbose` | Every line, verbatim | Yes | Debugging a failure |
+`--verbose` replaces the rolling window with the full stream. The window's
+size and its fixed-height rule are
+[`08` section 8](08-PROGRESS-AND-OBSERVABILITY.md#8-verbosity)'s and are
+deliberately not repeated here, so there is one place to change them.
+`--verbose` is what an operator is told to re-run with when reporting a
+problem, in place of being asked to find and tail the transcript by hand.
 
-The window is a fixed 8 lines in every phase, so the layout does not shift
-underneath the operator as the install moves between phases. `--verbose` is
-what an operator is told to re-run with when reporting a problem, in place
-of being asked to find and tail the transcript by hand.
-
-**There is no `--quiet` (RESOLVED).** It has no consumer: the systemd units
-in [`STEP-6`](STEP-6-REMOTE-SUPERVISION.md) run non-interactively and are
-already covered by the non-tty rows below, and the transcript holds every
+**There is no `--quiet` (RESOLVED).** It has no consumer. The systemd units
+in [`STEP-6`](STEP-6-REMOTE-SUPERVISION.md) pass no `--non-interactive`;
+what covers them is `StandardError=journal`, which is not a tty, so they
+already take the last row of the table below. And the transcript holds every
 line whatever the screen shows
 ([`08` section 7.1](08-PROGRESS-AND-OBSERVABILITY.md#71-live-rendering-must-never-cost-the-transcript-required)).
 Adding a flag that can only make a silent installer more silent would
@@ -663,11 +661,19 @@ described `stream=None` as "stream when stderr is a tty and the caller asked
 for captured output", and
 [`08` section 7](08-PROGRESS-AND-OBSERVABILITY.md#7-behaviour-off-a-tty-required)
 requires that a non-tty run still get per-line output, plain. Read together,
-a tty-gated AUTO would send nothing at all to an operator running
-`mv3dt-installer | tee install.log` — a normal way to run an installer, and
-exactly the silence that caused two interrupted installs. Section 7 is
-REQUIRED and section 4.1's tty clause was prose inside it, so the narrower
-statement gives way.
+a tty-gated AUTO sends nothing at all to an operator whose **stderr** is not
+a terminal: `mv3dt-installer 2>&1 | tee install.log`, any run redirected to
+a file, CI, and the journald-backed STEP-6 units. That is exactly the
+silence that caused two interrupted installs. Section 7 is REQUIRED and
+section 4.1's tty clause was prose inside it, so the narrower statement
+gives way.
+
+> A plain `mv3dt-installer | tee install.log` is **not** one of these cases,
+> and it is worth stating because it is the example that first motivated
+> this resolution and it is wrong: a pipe redirects stdout, leaving stderr
+> on the terminal, so the old gate would have streamed there normally. The
+> resolution is unchanged — the cases above are real — but the reasoning
+> should not rest on a case that does not exist.
 
 **RESOLVED: AUTO asks one question, and a terminal is not part of it.**
 `stream=None` streams whenever the call is one the tee runner can serve —
