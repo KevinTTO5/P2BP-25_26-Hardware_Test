@@ -51,6 +51,7 @@ the binary and attaches it plus a `.sha256` to the release. The version in
 | Step and phase banner | Implemented and wired | `app.py`, all seven steps |
 | Download byte adapter (`follow_download`) | Implemented and wired | `progress.py`, `progress_exec.py`, Steps 1-2 |
 | apt percentage adapter (`follow_apt`) | Implemented and wired | `progress.py`, `progress_exec.py`, Steps 1-2 |
+| Desktop-safe NVIDIA driver handoff | Implemented and wired | Step 1, `assets/systemd/mv3dt-driver-handoff.*` |
 | Failure context block, refusal evidence | Implemented, **call sites not retrofitted** | `report.py` |
 | Docker pull progress | Not started, open decision | — |
 
@@ -69,7 +70,7 @@ python3 -m pytest tests/ -q
 Current result on an **arm64 macOS** development machine:
 
 ```
-5 failed, 1252 passed, 6 skipped
+5 failed, 1262 passed, 7 skipped
 ```
 
 **The 5 failures are environmental, not regressions (REQUIRED to know before
@@ -120,7 +121,12 @@ to be edited next, so its shape is worth stating.
 `nvidia-smi --query-gpu=driver_version`:
 
 1. **Launch A** (driver not loaded) — base packages, CUDA repo and toolkit,
-   nouveau and distro-driver cleanup, then the NVIDIA driver `.run`.
+   nouveau and distro-driver cleanup, then the NVIDIA driver `.run`. A
+   desktop launch hands the disruptive work to a persistent root-owned
+   systemd worker, which records whether desktop recovery succeeds after a
+   failure or reboots automatically after driver success. TTY and SSH
+   launches remain synchronous and also recover the display manager when the
+   runfile fails.
 2. **Launch B** (driver loaded) — TensorRT, cuDNN, Mosquitto.
 
 Both reboot points return `USER_ACTION_REQUIRED`, **never**

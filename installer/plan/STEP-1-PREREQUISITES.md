@@ -27,8 +27,7 @@ Per the step-module interface in
 - `order = 1` — the first step the dispatch loop runs.
 - Consumes: `Context` (`install_dir`, `run_root`, `run_as_user`, `log`,
   `report_installed`, `report_already_installed`, `verify_pinned`,
-  `asset_path`, `reboot.request`), the reboot gate
-  ([`00` §7](00-FRAMEWORK-AND-BOOTSTRAP.md#7-reboot-detection--continuation-contract)),
+  `asset_path`), Step 1's private continuation evidence ([§6](#6-reboot-gating-step-1-owned-continuation)),
   and the exact reporting strings
   ([`00` §8.3–8.4](00-FRAMEWORK-AND-BOOTSTRAP.md#83-reporting-format-for-dependencies-required-exact-strings)).
 - Produces no NGC/download artifacts (Step 1 needs no NGC key). It writes only
@@ -318,10 +317,10 @@ and Phases 1–2 of
 |---|--------------|---------------------|---------|
 | 1 | Kernel headers for `.run` to build `nvidia.ko` | `apt install build-essential dkms linux-headers-$(uname -r)` | reported via §8.3 |
 | 2 | `add-apt-repository` / `apt-key` present on minimal 24.04 | `apt install software-properties-common ca-certificates gnupg curl` | reported via §8.3 |
-| 3 | Distro `nvidia-*` / `libnvidia-*` conflict with `.run` | `apt purge 'nvidia-*' 'libnvidia-*'` + `apt autoremove` | may set `REBOOT_REQUIRED` (§5) |
-| 4 | `nouveau` will abort the `.run` installer | write `/etc/modprobe.d/blacklist-nouveau.conf` (`blacklist nouveau` + `options nouveau modeset=0`), `update-initramfs -u` | `REBOOT_REQUIRED` if nouveau was loaded (§5) |
+| 3 | Distro `nvidia-*` / `libnvidia-*` conflict with `.run` | `apt purge 'nvidia-*' 'libnvidia-*'` + `apt autoremove` | may return `USER_ACTION_REQUIRED` for reboot (§5) |
+| 4 | `nouveau` will abort the `.run` installer | write `/etc/modprobe.d/blacklist-nouveau.conf` (`blacklist nouveau` + `options nouveau modeset=0`), `update-initramfs -u` | `USER_ACTION_REQUIRED` for reboot if nouveau was loaded (§5) |
 | 5 | Secure Boot → unsigned `nvidia.ko` | probe `mokutil --sb-state`; if enabled, surface `USER_ACTION_REQUIRED` (disable Secure Boot in BIOS **or** complete MOK enrollment on next boot) | operator action; MOK/BIOS is out of scope ([`00` §13](00-FRAMEWORK-AND-BOOTSTRAP.md#13-out-of-scope--defer-to-human)) |
-| 6 | GDM/Xorg holding the GPU during `.run` | `service gdm stop` (fallback `lightdm`), `pkill -9 Xorg` before running `.run`; if it still fails under a desktop, surface a `USER_ACTION_REQUIRED` telling the operator to switch to a TTY (`Ctrl+Alt+F3`) and re-run | precondition for §5 step 4 |
+| 6 | GDM/Xorg holding the GPU during `.run` | From a desktop session, stage and asynchronously start `mv3dt-driver-handoff.service`; its root-owned worker stops the active display manager and Xorg after the foreground installer exits. TTY/SSH sessions retain the synchronous path. | desktop-safe precondition for §5 step 7 |
 | 7 | CUDA 13.2 not on `PATH` / `LD_LIBRARY_PATH` | write `/etc/profile.d/cuda.sh` exporting `/usr/local/cuda-13.2/bin` and `/usr/local/cuda-13.2/lib64` | enables `nvcc` in `verify()` |
 
 Notes:
@@ -344,8 +343,9 @@ Notes:
 Step 1 mirrors the DS 9.1 Installation page ordering (apt prereqs → CUDA repo
 → driver → reboot → TensorRT/cuDNN → verify). Because the driver `.run`
 requires a reboot mid-step, the work is split across **two launches** using
-the framework's reboot gate
-([`00` §7](00-FRAMEWORK-AND-BOOTSTRAP.md#7-reboot-detection--continuation-contract)).
+Step 1's idempotent driver probe and private handoff marker. It deliberately
+does not use the framework auto-complete reboot gate, as [§6](#6-reboot-gating-step-1-owned-continuation)
+defines.
 
 **Launch A — up to and including the driver install:**
 
@@ -358,14 +358,20 @@ the framework's reboot gate
 4. **CUDA repo + keyring** and `apt-get install cuda-toolkit-13-2`
    (DS 9.1 §4.2). Write `/etc/profile.d/cuda.sh` (caveat 7).
 5. **Nouveau + old-NVIDIA cleanup** (caveats 3–4). If nouveau was loaded or a
-   distro `nvidia-*` package was purged → **return `REBOOT_REQUIRED`** now
+   distro `nvidia-*` package was purged → **return `USER_ACTION_REQUIRED`**
+   with reboot instructions now
    (before touching the `.run`), because the `.run` cannot build against a
    live nouveau.
 6. **Secure Boot check** (caveat 5). If enabled → `USER_ACTION_REQUIRED`.
-7. **Stop GDM/Xorg** (caveat 6), then **run the driver `.run`**
-   (`NVIDIA-Linux-x86_64-595.58.03.run --no-cc-version-check`).
-8. **Return `REBOOT_REQUIRED`** — the driver kernel module needs a reboot to
-   load (§6).
+7. **Install the driver** (caveat 6): a desktop launch copies the verified
+   runfile and bundled worker into the root-owned handoff directory, starts
+   `mv3dt-driver-handoff.service` with `--no-block`, and returns
+   `USER_ACTION_REQUIRED` before the service stops GDM/Xorg. A TTY or SSH
+   launch stops GDM/Xorg and runs the same `.run` synchronously.
+8. **Reboot after success**: the handoff worker records `succeeded` and
+   automatically reboots. The synchronous path returns reboot instructions.
+   On handoff failure it records the runfile exit code, restores the display
+   manager, and does not reboot.
 
 **Launch B — after the confirmed reboot (§6):**
 
@@ -388,7 +394,7 @@ the framework's reboot gate
 > nouveau/purge reboot (step 5) only fires on machines that shipped with
 > nouveau loaded or a distro driver preinstalled; on a clean image it is a
 > no-op and Launch A proceeds straight to the driver `.run`. Both use the same
-> reboot gate, so a machine may legitimately require **two** reboots before
+> continuation flow, so a machine may legitimately require **two** reboots before
 > Step 1 completes; the framework resumes at the first incomplete step each
 > time.
 
@@ -433,10 +439,10 @@ Two corrections, both REQUIRED:
 
 ---
 
-### 5.1a Documented drift: `--silent` and the session guard (RESOLVED)
+### 5.1a Desktop-safe systemd handoff (RESOLVED)
 
-Two departures from the verbatim DS 9.1 command, both found on real
-hardware rather than in review:
+Two operational departures from the verbatim DS 9.1 command are **LOCKED**,
+both found on real hardware rather than in review:
 
 1. **`--silent` is added** to the `.run` invocation. The runfile is
    interactive by default and can stop on ncurses questions (DKMS
@@ -446,21 +452,34 @@ hardware rather than in review:
    outside is indistinguishable from a slow kernel-module build. `--silent`
    implies `--no-questions` and accepts the licence, making that class of
    hang impossible.
-2. **Step 1 refuses to stop the display manager when doing so would kill the
-   installer itself** (caveat 6a). `service gdm stop` tears down the X
-   session and every terminal emulator in it — including the one the
-   operator launched from, if they launched from the desktop. The installer
-   then dies on `SIGHUP`, usually *before* the `.run` starts, leaving a black
-   screen, no `/var/log/nvidia-installer.log`, and no indication anything
-   went wrong. The check runs **before** the display manager is touched,
-   since afterwards no process survives to report anything.
+2. **A desktop launch hands the disruptive work to systemd before GDM is
+   touched.** `service gdm stop` tears down the X session and every terminal
+   emulator in it, including the foreground installer. Step 1 therefore
+   stages the bundled worker, a freshly verified copy of the runfile, a
+   status marker, and the persistent log under
+   `/var/lib/mv3dt-installer/driver-handoff/`. It installs
+   `mv3dt-driver-handoff.service`, starts it asynchronously, and exits. The
+   unit waits ten seconds before the worker stops the display manager, runs
+   the exact [§5.1](#51-driver-install-method-run-runfile-locked-verified-against-nvidia-docs)
+   command, records `succeeded:<boot-id>`, and automatically reboots only
+   after exit zero. A failure writes `failed:runfile:<code>`, attempts to
+   restart the display manager, records a `:desktop-restore` suffix if that
+   recovery also fails, and leaves the log
+   at `/var/lib/mv3dt-installer/driver-handoff/driver-install.log`.
 
-The session check treats a virtual console (`/dev/ttyN`) and an SSH session
-as safe, and a desktop terminal emulator with a display manager running as
-unsafe. SSH is detected by walking `/proc` for an `sshd` ancestor rather
-than by reading `SSH_CONNECTION`/`SSH_TTY`, because `sudo`'s default
-`env_reset` strips those before a step ever sees them — an SSH operator
-would otherwise be refused for a hazard that cannot reach them.
+The session check still treats a virtual console (`/dev/ttyN`) and an SSH
+session as safe synchronous paths. SSH is detected by walking `/proc` for an
+`sshd` ancestor rather than reading `SSH_CONNECTION`/`SSH_TTY`, because
+`sudo`'s default `env_reset` strips those variables. A desktop terminal with
+an active display manager selects the handoff path instead of being refused.
+
+| Handoff status | Next launch behavior |
+| --- | --- |
+| absent | Stage and schedule the worker when the desktop hazard is detected |
+| `scheduled` / `running` | Refuse a duplicate handoff and show the journal/log locations |
+| `succeeded:<current-boot-id>` | Show the reboot action as a fallback |
+| `succeeded:<prior-boot-id>` but driver absent | Report that the module did not load and show Secure Boot/MOK remediation |
+| `failed:<reason>` | Keep Step 1 pending; show the persistent log and marker-reset command |
 
 ---
 
@@ -528,67 +547,57 @@ redirect.
 
 ---
 
-## 6. Reboot gating (Step 1's use of the §7 contract)
+## 6. Reboot gating (Step 1-owned continuation)
 
-Step 1 consumes the reboot contract in
-[`00` §7](00-FRAMEWORK-AND-BOOTSTRAP.md#7-reboot-detection--continuation-contract).
-It uses the **auto-complete-on-reboot** variant, not self-verification:
+Step 1 **does not use** the framework's auto-complete reboot variant
+([`00` §7](00-FRAMEWORK-AND-BOOTSTRAP.md#7-reboot-detection--continuation-contract)).
+That contract marks the requesting step `COMPLETE` when a new boot is
+detected. Step 1 still owns TensorRT, cuDNN, Mosquitto, and final verification
+after the driver reboot, so auto-completion would skip required work.
 
-### 6.1 When Step 1 returns `REBOOT_REQUIRED`
+### 6.1 Reboot outcomes
 
-- After the **driver `.run`** completes (§5 step 8) — always.
-- After a **nouveau blacklist that was applied while nouveau was loaded**, or
-  after **purging a preinstalled distro `nvidia-*`** (§5 step 5) — only when
-  that state actually changed.
+Both Step 1 reboot points keep the framework step state pending:
 
-`run()` returns `StepResult(status=REBOOT_REQUIRED, message=..., user_actions=[...])`
-via `ctx.reboot.request()`. The framework then stores
-`/proc/sys/kernel/random/boot_id`
-([`00` §7.1](00-FRAMEWORK-AND-BOOTSTRAP.md#71-signaling-reboot-required)),
-prints the reboot block, and exits 0.
+| Reboot point | Result | Continuation evidence |
+| --- | --- | --- |
+| Nouveau loaded or distro driver purged | `USER_ACTION_REQUIRED` with `sudo reboot` | Idempotent cleanup probes are clear on the next launch |
+| Synchronous driver install succeeds | `USER_ACTION_REQUIRED` with `sudo reboot` | `nvidia-smi` reports exactly `595.58.03` on the next launch |
+| Desktop handoff succeeds | Worker writes `succeeded:<boot-id>` and requests reboot | New boot ID plus `nvidia-smi` reporting exactly `595.58.03` |
 
-### 6.2 User-action text displayed on `REBOOT_REQUIRED`
+The framework alone owns `state.json`
+([`00` §12.2](00-FRAMEWORK-AND-BOOTSTRAP.md#122-stepresult-and-status-recorded-by-the-state-machine)).
+The desktop worker's marker is operational handoff state under
+`/var/lib/mv3dt-installer/driver-handoff/status`, not step-completion state.
 
-Rendered inside the framework's reboot frame
-([`00` §9.4](00-FRAMEWORK-AND-BOOTSTRAP.md#94-reboot-block)). The `UserAction`
-list Step 1 supplies:
+### 6.2 User actions
 
-1. text: "The NVIDIA driver 595.58.03 kernel module is installed but not yet
-   loaded. Reboot so `nvidia.ko` loads before TensorRT/cuDNN install."
-2. text: "CUDA 13.2 has been added to PATH/LD_LIBRARY_PATH for new login
-   shells." — path: `/etc/profile.d/cuda.sh` (written by Step 1; sourced
-   automatically on next login).
-3. command: `sudo reboot`
+The synchronous driver-success action list contains:
 
-The frame's closing line is always the framework's contract phrase
-**"Then run the installer again to continue."**
-([`00` §9.3](00-FRAMEWORK-AND-BOOTSTRAP.md#93-user-action-display-contract)).
+1. **Driver load**: reboot so `nvidia.ko` loads before TensorRT/cuDNN.
+2. **CUDA shell path**: `/etc/profile.d/cuda.sh` applies to new login shells.
+3. **Reboot command**: `sudo reboot`.
 
-### 6.3 Confirming the reboot happened before Step 2
+The desktop path instead tells the operator to save other work and wait. The
+worker closes the desktop after its ten-second grace period and reboots
+automatically after success. The operator logs in and runs the installer
+again after either reboot path.
 
-On the next launch, `reboot.reconcile()`
-([`00` §7.2](00-FRAMEWORK-AND-BOOTSTRAP.md#72-detecting-the-reboot-actually-happened))
-compares the stored boot-id to the current one:
+### 6.3 Next-launch routing
 
-- **Different boot-id** → real reboot confirmed. The framework auto-marks
-  Step 1's requesting stage complete and dispatch continues.
-- **Same boot-id** → operator re-ran without rebooting → the reboot block is
-  re-printed and the loop refuses to advance.
+`run()` always starts from idempotent evidence:
 
-Because Step 1 uses auto-complete, its **post-reboot** work (TensorRT/cuDNN,
-final verify) lives in the same step module and runs on the launch after the
-confirmed reboot: the dispatch loop re-enters `step1` (still not `COMPLETE`
-in `state.json` — the driver reboot was one of two internal stages), and
-`preflight()` detects that the driver stage is done (driver `.run` applied +
-reboot confirmed) and proceeds to the TensorRT/cuDNN stage. Step 1 tracks its
-own internal A/B stage via an idempotent probe (driver present + `nvidia-smi`
-loads), **not** by writing `state.json` (which only the framework owns,
-[`00` §12.2](00-FRAMEWORK-AND-BOOTSTRAP.md#122-stepresult-and-status-recorded-by-the-state-machine)).
-
-> Guard: if after the confirmed reboot `nvidia-smi` still fails (driver did
-> not load — e.g. Secure Boot rejected the unsigned module), Step 1 returns
-> `USER_ACTION_REQUIRED` with the MOK/Secure-Boot remediation rather than
-> `COMPLETE`, blocking Step 2.
+- **Driver `595.58.03` loaded**: route directly to Launch B, regardless of a
+  retained handoff marker.
+- **Handoff status `scheduled` or `running`**: refuse a duplicate worker.
+- **Handoff success from the current boot**: retain the Step 1 reboot gate and show
+  `sudo reboot` as a fallback if the automatic request did not occur.
+- **Handoff success from a prior boot but driver absent**: report that the
+  module did not load and show Secure Boot/MOK remediation.
+- **Handoff failure**: keep Step 1 pending and show the persistent log and
+  marker-reset command. A `:desktop-restore` suffix states that graphical
+  recovery also failed; it is never described as successful.
+- **No handoff state**: continue Launch A normally.
 
 ---
 
@@ -619,9 +628,11 @@ Against the protocol in
   `report_already_installed` (§2.2, §3, §3.2). The "already installed" path is
   taken when a pre-check (`dpkg -s` / `nvidia-smi` / `nvcc` /
   `gst-inspect-1.0`) shows the component already at the pinned version.
-- May return `REBOOT_REQUIRED` (§6), `USER_ACTION_REQUIRED` (Secure Boot,
-  GDM-stop failure, driver failed to load), `FAILED` (apt/`.run` error), or
-  `COMPLETE`.
+- May return `USER_ACTION_REQUIRED` (reboot, active handoff, Secure Boot,
+  GDM-stop failure, or driver-load failure), `FAILED` (apt, synchronous
+  `.run`, or handoff scheduling error), or `COMPLETE`. It never returns
+  `REBOOT_REQUIRED`; [§6](#6-reboot-gating-step-1-owned-continuation) defines
+  why.
 
 ### 7.3 `verify(ctx)` — the pinned checklist
 
@@ -756,14 +767,17 @@ something this spec change performs by itself.
 
 - Nothing further **if** `verify()` returned `COMPLETE` — the dispatch loop
   advances straight to Step 2.
-- If Step 1 returned `REBOOT_REQUIRED`: `sudo reboot`, then **run the
-  installer again to continue** (framework prints this).
+- If Step 1 returned `USER_ACTION_REQUIRED` after cleanup or a synchronous
+  driver install: `sudo reboot`, then run the installer again to continue.
 - If Step 1 returned `USER_ACTION_REQUIRED` for **Secure Boot / MOK**: disable
   Secure Boot in BIOS, **or** complete MOK Manager enrollment on the next
   boot, then re-run. (BIOS/MOK are out of scope for the installer,
   [`00` §13](00-FRAMEWORK-AND-BOOTSTRAP.md#13-out-of-scope--defer-to-human).)
-- If Step 1 returned `USER_ACTION_REQUIRED` for **GDM/desktop**: switch to a
-  TTY (`Ctrl+Alt+F3`), log in, re-run the installer from there.
+- If Step 1 returned `USER_ACTION_REQUIRED` for the **desktop handoff**: save
+  other open work and wait. The desktop closes after the ten-second grace
+  period and the workstation reboots automatically after a successful driver
+  install. Log in and run the installer again to continue. On failure, the
+  desktop is restored and the displayed persistent log explains the cause.
 - New login shells pick up CUDA 13.2 automatically from
   `/etc/profile.d/cuda.sh`; a shell open from before the reboot must
   `source /etc/profile.d/cuda.sh` or re-login for `nvcc` to be on `PATH`.

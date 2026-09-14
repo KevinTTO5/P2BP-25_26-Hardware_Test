@@ -599,6 +599,14 @@ def test_templates_are_bundled_under_assets_systemd(name):
 #: filtered out below since it's a "not installed yet" fact, not a unit
 #: syntax/section problem.
 _TEMPLATE_CASES = {
+    "mv3dt-driver-handoff.service.in": {
+        "WORKER": "/var/lib/mv3dt-installer/driver-handoff/install-driver.sh",
+        "RUNFILE": "/opt/mv3dt/downloads/nvidia/NVIDIA.run",
+        "STATUS_FILE": "/var/lib/mv3dt-installer/driver-handoff/status",
+        "LOG_FILE": "/var/lib/mv3dt-installer/driver-handoff/driver-install.log",
+        "DRIVER_VERSION": "595.58.03",
+        "BOOT_ID_FILE": "/proc/sys/kernel/random/boot_id",
+    },
     "mv3dt-agent.service.in": {"USER": "mv3dt"},
     "mv3dt-pipeline@.service.in": {"USER": "mv3dt"},
     "mv3dt-reporter.service.in": {
