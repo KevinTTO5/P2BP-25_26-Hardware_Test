@@ -187,5 +187,6 @@ def test_step2_artifact_download_keeps_the_invoking_user_seam(
     assert (ok, source, early) == (True, "downloaded", None)
     assert calls[0][0][0] == "curl"
     assert calls[0][1]["cwd"] == str(artifact_dir)
+    assert calls[0][1]["stream"] is True
     assert observed[0][1] == artifact_dir / step2.DEB_ARTIFACT
     assert observed[0][3] == step2.DEB_ARTIFACT

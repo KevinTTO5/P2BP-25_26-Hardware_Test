@@ -596,10 +596,17 @@ def test_context_run_as_user_delegates_to_privilege(tmp_path, monkeypatch):
     monkeypatch.setattr(app.privilege, "run_as_user", fake_run_as_user)
     ctx, _cfg = _minimal_ctx(tmp_path)
 
-    result = ctx.run_as_user("echo", "hi", check=True)
+    result = ctx.run_as_user(
+        "echo", "hi", check=True, capture_output=True, text=True
+    )
 
     assert result == "sentinel"
-    assert calls == [(("echo", "hi"), {"check": True})]
+    assert calls == [
+        (
+            ("echo", "hi"),
+            {"check": True, "capture_output": True, "text": True},
+        )
+    ]
 
 
 def test_context_run_as_user_streams_captured_text_through_sudo(tmp_path, monkeypatch):
@@ -614,7 +621,11 @@ def test_context_run_as_user_streams_captured_text_through_sudo(tmp_path, monkey
     monkeypatch.setattr(app.shellout, "run_streamed", fake_run_streamed)
 
     result = ctx.run_as_user(
-        "curl", "https://example.invalid", capture_output=True, text=True
+        "curl",
+        "https://example.invalid",
+        capture_output=True,
+        text=True,
+        stream=True,
     )
 
     assert result is completed

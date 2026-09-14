@@ -429,7 +429,14 @@ def _ensure_artifact(
         artifact_path,
         url,
         lambda: _run_as_user(
-            ctx, "curl", "-fsSL", "-o", artifact_name, url, cwd=str(artifact_dir)
+            ctx,
+            "curl",
+            "-fsSL",
+            "-o",
+            artifact_name,
+            url,
+            cwd=str(artifact_dir),
+            stream=True,
         ),
         task=artifact_name,
     )

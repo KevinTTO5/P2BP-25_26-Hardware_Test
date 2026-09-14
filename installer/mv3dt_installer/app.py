@@ -547,12 +547,13 @@ class Context:
         CLI, `docker` without sudo, files under the user's home) MUST go
         through this rather than running unwrapped as root.
 
-        Captured text uses the same one-pass tee as ``run_root`` so an
+        ``stream=True`` uses the same one-pass tee as ``run_root`` so an
         observed invoking-user download retains all curl output in the
-        transcript.  Other call shapes keep delegating to the established
-        privilege helper unchanged.
+        transcript. Other calls keep delegating to the established privilege
+        helper unchanged.
         """
-        if _should_stream(stream, kwargs):
+        if stream is True:
+            _should_stream(stream, kwargs)
             command = ("sudo", "-u", self.user.name, "-H", *args)
             try:
                 return shellout.run_streamed(
