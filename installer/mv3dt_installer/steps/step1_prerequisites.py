@@ -79,6 +79,7 @@ __all__ = ["Step1Prerequisites"]
 DRIVER_VERSION = "595.58.03"
 CUDA_VERSION = "13.2"
 CUDNN_VERSION = "9.20.0.48"
+CUDNN_APT_VERSION = f"{CUDNN_VERSION}-1"
 TENSORRT_VERSION = "10.16.0.72-1+cuda13.2"
 GSTREAMER_VERSION = "1.24.2"
 CUDA_TOOLKIT_PACKAGE = "cuda-toolkit-13-2"
@@ -105,15 +106,15 @@ TENSORRT_PACKAGES: tuple[str, ...] = (
     "libnvinfer-win-builder-resource10",
 )
 
-# cuDNN's package set is not enumerated by the DS 9.1 page the way
-# TensorRT's is, so the family is still installed via a glob -- but (like
-# TensorRT) the meta package itself is version-pinned in the apt invocation
-# (`libcudnn9=9.20.0.48`, alongside the `libcudnn9*` glob for the rest of the
-# family), so a version mismatch fails fast at apt-install time instead of
-# only surfacing later at verify(). `libcudnn9` alone is used for
-# before/after presence + verify().
-CUDNN_APT_GLOB = "libcudnn9*"
-CUDNN_QUERY_PACKAGE = "libcudnn9"
+# CUDA 13 uses concrete, versioned cuDNN packages on Ubuntu 24.04. Pin both
+# meta-package layers so their >= dependency cannot resolve a newer cuDNN,
+# and pin/query the concrete runtime package used by DeepStream.
+CUDNN_PACKAGES: tuple[str, ...] = (
+    "cudnn9-cuda-13",
+    "cudnn9-cuda-13-2",
+    "libcudnn9-cuda-13",
+)
+CUDNN_QUERY_PACKAGE = "libcudnn9-cuda-13"
 
 # STEP-1 section 4, caveats 1-2: kernel headers + minimal-24.04 tooling,
 # installed before the DS 9.1 apt prerequisites and the CUDA repo.
@@ -192,6 +193,7 @@ _DRIVER_HEADER_VERSION_RE = re.compile(rb"Linux-x86_64[\s-]+(\d+\.\d+(?:\.\d+)?)
 
 # STEP-1 section 4, caveat 7 / section 6.2 -- CUDA on PATH for new shells.
 CUDA_HOME = f"/usr/local/cuda-{CUDA_VERSION}"
+CUDA_NVCC_PATH = f"{CUDA_HOME}/bin/nvcc"
 CUDA_PROFILE_PATH = pathlib.Path("/etc/profile.d/cuda.sh")
 
 # STEP-1 section 4, caveat 4 -- nouveau must be out of the way before the
@@ -242,7 +244,10 @@ def _dpkg_version(ctx: "Context", package: str) -> str | None:
 
 
 def _cudnn_installed_version(ctx: "Context") -> str | None:
-    return _dpkg_version(ctx, CUDNN_QUERY_PACKAGE)
+    raw = _dpkg_version(ctx, CUDNN_QUERY_PACKAGE)
+    if raw == CUDNN_APT_VERSION:
+        return CUDNN_VERSION
+    return raw
 
 
 def _driver_version(ctx: "Context") -> str:
@@ -265,7 +270,7 @@ def _driver_loaded(ctx: "Context") -> bool:
 
 def _nvcc_release(ctx: "Context") -> str:
     result = ctx.run_root(
-        "nvcc", "--version", capture_output=True, text=True, check=False
+        CUDA_NVCC_PATH, "--version", capture_output=True, text=True, check=False
     )
     if result.returncode != 0:
         return ""
@@ -302,7 +307,12 @@ def _kernel_release(ctx: "Context") -> str:
 
 def _gpu_present(ctx: "Context") -> bool:
     result = ctx.run_root(
-        "bash", "-c", "lspci | grep -qi nvidia", check=False, capture_output=True, text=True
+        "bash",
+        "-c",
+        "lspci | grep -qi nvidia",
+        check=False,
+        capture_output=True,
+        text=True,
     )
     return result.returncode == 0
 
@@ -737,7 +747,9 @@ def _download_driver_run(ctx: "Context", dest: pathlib.Path) -> str | None:
     partial = dest.with_suffix(dest.suffix + ".part")
     partial.unlink(missing_ok=True)
 
-    ctx.log.info(f"Downloading NVIDIA driver {DRIVER_VERSION} from {DRIVER_DOWNLOAD_URL}")
+    ctx.log.info(
+        f"Downloading NVIDIA driver {DRIVER_VERSION} from {DRIVER_DOWNLOAD_URL}"
+    )
     # curl, not wget: BASE_TOOLING_PACKAGES guarantees curl is installed and
     # says nothing about wget, which a minimal or server image need not ship.
     # -f so an HTTP error is a non-zero exit rather than an error page saved
@@ -803,14 +815,21 @@ def _apt_install_reported(
     query_packages: Sequence[str],
     *,
     apt_args: Sequence[str] | None = None,
-) -> None:
+    reported_version: str | None = None,
+) -> StepResult | None:
     """Install `query_packages` (or `apt_args`, if the apt invocation needs
     version-pinned `pkg=version` arguments) in one apt transaction, then
     report each with the doc 00 section 8.3 exact strings, based on a
     before/after `dpkg-query` presence probe (STEP-1 section 2.2 / 7.2)."""
     before = {pkg: _dpkg_version(ctx, pkg) for pkg in query_packages}
     argv = list(apt_args) if apt_args is not None else list(query_packages)
-    progress_exec.apt(
+    requested = {
+        package: version
+        for arg in argv
+        if "=" in arg
+        for package, version in [arg.split("=", 1)]
+    }
+    result = progress_exec.apt(
         ctx,
         "install",
         "-y",
@@ -820,22 +839,46 @@ def _apt_install_reported(
         capture_output=True,
         text=True,
     )
-    for pkg in query_packages:
-        after = _dpkg_version(ctx, pkg) or "unknown"
-        if before[pkg] is None:
-            ctx.report_installed(pkg, after)
+    if result.returncode != 0:
+        return StepResult(
+            status=StepStatus.FAILED,
+            message=(
+                f"apt install failed for {', '.join(query_packages)} "
+                f"(exit {result.returncode})"
+            ),
+        )
+    after = {pkg: _dpkg_version(ctx, pkg) for pkg in query_packages}
+    for pkg, version in after.items():
+        if version is None:
+            return StepResult(
+                status=StepStatus.FAILED,
+                message=f"apt reported success but {pkg} is not installed",
+            )
+        if pkg in requested and version != requested[pkg]:
+            return StepResult(
+                status=StepStatus.FAILED,
+                message=(
+                    f"apt installed {pkg} version {version}; "
+                    f"expected {requested[pkg]}"
+                ),
+            )
+    for pkg, version in after.items():
+        display_version = reported_version or version
+        if before[pkg] == version:
+            ctx.report_already_installed(pkg, display_version)
         else:
-            ctx.report_already_installed(pkg, after)
+            ctx.report_installed(pkg, display_version)
+    return None
 
 
-def _install_cuda_toolkit(ctx: "Context") -> None:
+def _install_cuda_toolkit(ctx: "Context") -> StepResult | None:
     """STEP-1 section 5 step 4: CUDA repo + keyring, then
     `cuda-toolkit-13-2`. The reported version is the CUDA_VERSION pin
     (`13.2`), not the package's raw apt version suffix -- matching the
     exact example string in STEP-1 section 2.2
     ("installed cuda-toolkit-13-2 version 13.2")."""
     before = _dpkg_version(ctx, CUDA_TOOLKIT_PACKAGE)
-    ctx.run_root(
+    keyring = ctx.run_root(
         "bash",
         "-c",
         # curl for the same reason as the driver download: curl is in
@@ -849,10 +892,20 @@ def _install_cuda_toolkit(ctx: "Context") -> None:
         capture_output=True,
         text=True,
     )
-    progress_exec.apt(
+    if keyring.returncode != 0:
+        return StepResult(
+            status=StepStatus.FAILED,
+            message=f"CUDA repository keyring install failed (exit {keyring.returncode})",
+        )
+    update = progress_exec.apt(
         ctx, "update", check=False, capture_output=True, text=True
     )
-    progress_exec.apt(
+    if update.returncode != 0:
+        return StepResult(
+            status=StepStatus.FAILED,
+            message=f"apt update failed after CUDA keyring install (exit {update.returncode})",
+        )
+    install = progress_exec.apt(
         ctx,
         "install",
         "-y",
@@ -862,10 +915,22 @@ def _install_cuda_toolkit(ctx: "Context") -> None:
         capture_output=True,
         text=True,
     )
-    if before is None:
-        ctx.report_installed(CUDA_TOOLKIT_PACKAGE, CUDA_VERSION)
-    else:
+    if install.returncode != 0:
+        return StepResult(
+            status=StepStatus.FAILED,
+            message=f"apt install failed for {CUDA_TOOLKIT_PACKAGE} (exit {install.returncode})",
+        )
+    after = _dpkg_version(ctx, CUDA_TOOLKIT_PACKAGE)
+    if after is None:
+        return StepResult(
+            status=StepStatus.FAILED,
+            message=f"apt reported success but {CUDA_TOOLKIT_PACKAGE} is not installed",
+        )
+    if before == after:
         ctx.report_already_installed(CUDA_TOOLKIT_PACKAGE, CUDA_VERSION)
+    else:
+        ctx.report_installed(CUDA_TOOLKIT_PACKAGE, CUDA_VERSION)
+    return None
 
 
 def _write_cuda_profile() -> None:
@@ -890,8 +955,8 @@ def _write_nouveau_blacklist() -> None:
     )
 
 
-def _purge_distro_nvidia_packages(ctx: "Context") -> bool:
-    """STEP-1 section 4, caveat 3. Returns whether anything was purged.
+def _purge_distro_nvidia_packages(ctx: "Context") -> tuple[bool, StepResult | None]:
+    """STEP-1 section 4, caveat 3. Returns purge state and any failure.
 
     Only packages dpkg reports as actually *present* are purged. `dpkg-query
     -W` lists every package name dpkg knows about, which on a stock Ubuntu
@@ -925,29 +990,46 @@ def _purge_distro_nvidia_packages(ctx: "Context") -> bool:
         if package and current not in ("", "not-installed"):
             packages.append(package)
     if not packages:
-        return False
-    progress_exec.apt(
+        return False, None
+    purge = progress_exec.apt(
         ctx, "purge", "-y", *packages, check=False, capture_output=True, text=True
     )
-    progress_exec.apt(
+    if purge.returncode != 0:
+        return False, StepResult(
+            status=StepStatus.FAILED,
+            message=f"apt purge failed for distro NVIDIA packages (exit {purge.returncode})",
+        )
+    autoremove = progress_exec.apt(
         ctx, "autoremove", "-y", check=False, capture_output=True, text=True
     )
-    return True
+    if autoremove.returncode != 0:
+        return False, StepResult(
+            status=StepStatus.FAILED,
+            message=f"apt autoremove failed after NVIDIA purge (exit {autoremove.returncode})",
+        )
+    return True, None
 
 
-def _clean_nouveau_and_distro_driver(ctx: "Context") -> bool:
+def _clean_nouveau_and_distro_driver(
+    ctx: "Context",
+) -> tuple[bool, StepResult | None]:
     """STEP-1 section 4, caveats 3-4 / section 5 step 5. Returns whether a
     reboot is now required (nouveau was loaded, or a distro package was
     purged)."""
     nouveau_loaded = _nouveau_loaded(ctx)
     _write_nouveau_blacklist()
     if nouveau_loaded:
-        ctx.run_root(
+        initramfs = ctx.run_root(
             "update-initramfs", "-u", check=False, capture_output=True, text=True
         )
+        if initramfs.returncode != 0:
+            return False, StepResult(
+                status=StepStatus.FAILED,
+                message=f"update-initramfs failed (exit {initramfs.returncode})",
+            )
 
-    purged = _purge_distro_nvidia_packages(ctx)
-    return nouveau_loaded or purged
+    purged, failure = _purge_distro_nvidia_packages(ctx)
+    return nouveau_loaded or purged, failure
 
 
 def _record_gpu_info(ctx: "Context") -> None:
@@ -1094,21 +1176,32 @@ class Step1Prerequisites:
         ]
         ctx.progress.phase(1)
         ctx.progress.task("kernel headers and build tools")
-        _apt_install_reported(ctx, base_kernel_packages)
+        failure = _apt_install_reported(ctx, base_kernel_packages)
+        if failure is not None:
+            return failure
         ctx.progress.task("base tooling")
-        _apt_install_reported(ctx, list(BASE_TOOLING_PACKAGES))
+        failure = _apt_install_reported(ctx, list(BASE_TOOLING_PACKAGES))
+        if failure is not None:
+            return failure
 
         ctx.progress.task("GStreamer and step prerequisites")
-        _apt_install_reported(ctx, list(APT_PREREQ_PACKAGES))
+        failure = _apt_install_reported(ctx, list(APT_PREREQ_PACKAGES))
+        if failure is not None:
+            return failure
 
         ctx.progress.phase(2)
         ctx.progress.task(f"CUDA {CUDA_VERSION} toolkit")
-        _install_cuda_toolkit(ctx)
+        failure = _install_cuda_toolkit(ctx)
+        if failure is not None:
+            return failure
         _write_cuda_profile()
 
         ctx.progress.phase(3)
         ctx.progress.task("nouveau and distro NVIDIA packages")
-        if _clean_nouveau_and_distro_driver(ctx):
+        reboot_required, failure = _clean_nouveau_and_distro_driver(ctx)
+        if failure is not None:
+            return failure
+        if reboot_required:
             # USER_ACTION_REQUIRED, not ctx.reboot.request() -- see the
             # "Reboot handling" note in this class's module docstring. The
             # merged reboot.reconcile() marks the *requesting* step COMPLETE
@@ -1159,7 +1252,9 @@ class Step1Prerequisites:
         if run_path.is_file():
             reason = _verify_driver_run(run_path)
             if reason is not None:
-                ctx.log.warn(f"Staged driver runfile rejected: {reason}; re-downloading")
+                ctx.log.warn(
+                    f"Staged driver runfile rejected: {reason}; re-downloading"
+                )
                 run_path.unlink(missing_ok=True)
                 reason = _download_driver_run(ctx, run_path)
         else:
@@ -1292,28 +1387,34 @@ class Step1Prerequisites:
 
     def _run_launch_b(self, ctx: "Context") -> StepResult:
         ctx.progress.phase(5)
+        ctx.progress.task(f"CUDA {CUDA_VERSION} toolkit")
+        if _nvcc_release(ctx) != CUDA_VERSION:
+            failure = _install_cuda_toolkit(ctx)
+            if failure is not None:
+                return failure
+        _write_cuda_profile()
+        if _nvcc_release(ctx) != CUDA_VERSION:
+            return StepResult(
+                status=StepStatus.FAILED,
+                message=f"CUDA {CUDA_VERSION} did not verify after toolkit install",
+            )
+
         ctx.progress.task(f"TensorRT {TENSORRT_VERSION}")
         apt_args = [f"{pkg}={TENSORRT_VERSION}" for pkg in TENSORRT_PACKAGES]
-        _apt_install_reported(ctx, TENSORRT_PACKAGES, apt_args=apt_args)
+        failure = _apt_install_reported(ctx, TENSORRT_PACKAGES, apt_args=apt_args)
+        if failure is not None:
+            return failure
 
         ctx.progress.task(f"cuDNN {CUDNN_VERSION}")
-        cudnn_before = _dpkg_version(ctx, CUDNN_QUERY_PACKAGE)
-        progress_exec.apt(
+        cudnn_args = [f"{package}={CUDNN_APT_VERSION}" for package in CUDNN_PACKAGES]
+        failure = _apt_install_reported(
             ctx,
-            "install",
-            "-y",
-            "--no-install-recommends",
-            f"{CUDNN_QUERY_PACKAGE}={CUDNN_VERSION}",
-            CUDNN_APT_GLOB,
-            check=False,
-            capture_output=True,
-            text=True,
+            CUDNN_PACKAGES,
+            apt_args=cudnn_args,
+            reported_version=CUDNN_VERSION,
         )
-        cudnn_after = _dpkg_version(ctx, CUDNN_QUERY_PACKAGE) or "unknown"
-        if cudnn_before is None:
-            ctx.report_installed(CUDNN_QUERY_PACKAGE, cudnn_after)
-        else:
-            ctx.report_already_installed(CUDNN_QUERY_PACKAGE, cudnn_after)
+        if failure is not None:
+            return failure
 
         # No separate GStreamer report here: `gstreamer1.0-tools` is already
         # reported (installed/already-installed) by Launch A's
@@ -1338,12 +1439,15 @@ class Step1Prerequisites:
         before_hash = _sha256_file(dst_path)
         bundled_hash = _sha256_file(ctx.asset_path("mosquitto", "mv3dt.conf"))
 
-        args = ["--non-interactive"] if ctx.non_interactive else []
         result = shellout.run_bundled_script(
             "scripts",
             "10_setup_mosquitto.sh",
-            args=args,
-            env={"MV3DT_INSTALLER_CONF": str(pathlib.Path(ctx.install_dir) / "installer.conf")},
+            args=["--non-interactive"],
+            env={
+                "MV3DT_INSTALLER_CONF": str(
+                    pathlib.Path(ctx.install_dir) / "installer.conf"
+                )
+            },
             tree=(),
         )
 
@@ -1375,7 +1479,7 @@ class Step1Prerequisites:
             ctx.verify_pinned("NVIDIA driver", _driver_version(ctx), DRIVER_VERSION),
             ctx.verify_pinned("CUDA (nvcc release)", _nvcc_release(ctx), CUDA_VERSION),
             ctx.verify_pinned(
-                "cuDNN (libcudnn9)",
+                f"cuDNN ({CUDNN_QUERY_PACKAGE})",
                 _cudnn_installed_version(ctx) or "",
                 CUDNN_VERSION,
             ),

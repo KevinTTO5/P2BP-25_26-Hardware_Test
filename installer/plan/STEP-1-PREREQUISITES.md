@@ -55,8 +55,8 @@ DeepStream SDK, ensure you have Ubuntu 24.04, GStreamer 1.24.2, NVIDIA driver
 | Component | Pinned version | Install source | Verify command | `verify_pinned` label / expected |
 |-----------|----------------|----------------|----------------|----------------------------------|
 | NVIDIA driver | `595.58.03` | `.run` installer (`NVIDIA-Linux-x86_64-595.58.03.run`) | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` | `verify_pinned("NVIDIA driver", <actual>, "595.58.03")` |
-| CUDA Toolkit | `13.2` (`cuda-toolkit-13-2`) | NVIDIA `ubuntu2404/x86_64` apt repo | `nvcc --version` → `release X.Y` | `verify_pinned("CUDA (nvcc release)", <actual>, "13.2")` |
-| cuDNN | `9.20.0.48` | apt (`libcudnn9*`) | `dpkg -l \| grep libcudnn9` | `verify_pinned("cuDNN (libcudnn9)", <actual>, "9.20.0.48")` |
+| CUDA Toolkit | `13.2` (`cuda-toolkit-13-2`) | NVIDIA `ubuntu2404/x86_64` apt repo | `/usr/local/cuda-13.2/bin/nvcc --version` → `release X.Y` | `verify_pinned("CUDA (nvcc release)", <actual>, "13.2")` |
+| cuDNN | `9.20.0.48` (apt `9.20.0.48-1`) | NVIDIA CUDA 13 apt packages | `dpkg-query -W -f='${Version}' libcudnn9-cuda-13` | `verify_pinned("cuDNN (libcudnn9-cuda-13)", <normalized>, "9.20.0.48")` |
 | TensorRT | `10.16.0.72-1+cuda13.2` | apt (all `libnvinfer*` pinned) | `dpkg -l \| grep libnvinfer10` | `verify_pinned("TensorRT (libnvinfer10)", <actual>, "10.16.0.72-1+cuda13.2")` |
 | GStreamer | `1.24.2` | apt (`gstreamer1.0-*`) | `gst-inspect-1.0 --version` | `verify_pinned("GStreamer", <actual>, "1.24.2")` |
 | OS | Ubuntu 24.04 / `x86_64` | (precondition) | `lsb_release -rs`, `uname -m` | preflight check, not `verify_pinned` |
@@ -79,6 +79,16 @@ libnvonnxparsers10                   tensorrt-dev
 libnvinfer-headers-python-plugin-dev libnvinfer-win-builder-resource10
 ```
 
+The cuDNN transaction pins `cudnn9-cuda-13`, `cudnn9-cuda-13-2`, and the
+concrete `libcudnn9-cuda-13` runtime package to apt version `9.20.0.48-1`.
+Pinning both meta-package layers prevents their greater-than-or-equal
+dependency from resolving a newer cuDNN release. The concrete runtime package
+is the presence and version probe; the virtual `libcudnn9` name and shell
+globs are not valid install or verification targets on Ubuntu 24.04. The
+probe normalizes only the exact apt value `9.20.0.48-1` to the DeepStream
+component pin `9.20.0.48`; a different Debian revision remains unnormalized
+and fails verification. Dependency reporting uses the component pin.
+
 ### 2.2 Reporting each pin
 
 For every component above, `run()` emits exactly one of the two required
@@ -91,7 +101,9 @@ strings from
   `already installed <dependency> version <version>`
 
 The "already installed" path is taken when a probe (see §7.2) finds the
-component present **at the exact pinned version**. Examples:
+component present **at the exact pinned version**. A transaction that upgrades
+or otherwise changes an existing package reports `installed`, not `already
+installed`. Examples:
 
 ```
 installed cuda-toolkit-13-2 version 13.2
@@ -195,11 +207,9 @@ script, staged as a **tree** so `source "$SCRIPT_DIR/lib/common.sh"` resolves
 ([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-and-staging-bundled-assets-at-runtime)):
 
 ```python
-args = ["--non-interactive"] if ctx.non_interactive else []
-
 shellout.run_bundled_script(
     "scripts", "10_setup_mosquitto.sh",
-    args=args, tree=(),
+    args=["--non-interactive"], tree=(),
 )
 ```
 
@@ -215,27 +225,16 @@ so the operator never types a script name and no repo checkout is involved.
 Its stdout and stderr land in the transcript through the shared logger
 ([`00` §8.2](00-FRAMEWORK-AND-BOOTSTRAP.md#82-transcript-log-file)).
 
-**REQUIRED — `--non-interactive` must be forwarded on an unattended run.**
+**REQUIRED — installer-owned execution is always non-interactive.**
 The script calls `pause_for_config_review` after installing the drop-in,
 which prints the installed config and then, unless the script's own
 `NONINTERACTIVE` variable is `1`, blocks on `read -r -p "Press Enter to
 continue..." </dev/tty`. `NONINTERACTIVE` starts at `0` and is set to `1`
-only by the script's `--non-interactive` CLI flag. The bundled copy also
-gates the same pause on an `MV3DT_NO_PAUSE` environment variable, echoing the
-name of the framework's own `--no-pause` flag
-([`00` §3.3](00-FRAMEWORK-AND-BOOTSTRAP.md#33-cli-flags-framework-level)) —
-but nothing on the Python side sets it yet; `run_bundled_script` does not
-export it, and `--no-pause` does not currently propagate to bundled scripts.
-Treat it as an operator escape hatch (`MV3DT_NO_PAUSE=1` in the environment
-before running), not something Step 1's `run()` can rely on. So Step 1 must
-pass the `--non-interactive` flag itself, exactly the
-way `--with-firewall` is described just below (passed only when the operator
-asked for it, otherwise omitted): when `ctx.non_interactive` is set (the
-installer's own `--non-interactive`, framework §3.3), Step 1 appends
-`--non-interactive` to `args`; otherwise `args` is empty and the operator sees
-the review block and presses Enter, same as running the script by hand. A
-call that omits the flag under an unattended run would hang forever on the
-`read`, since nothing will ever answer it.
+only by the script's `--non-interactive` CLI flag. The parent TUI owns
+installer interaction and streams the child output, so that child prompt is
+not a usable input surface. Step 1 therefore always passes the flag. Running
+the bundled script directly retains its config-review prompt and standalone
+interactive behavior.
 
 #### What the script actually does, in order
 
@@ -356,7 +355,9 @@ defines.
    `ca-certificates`, `gnupg`, `curl`.
 3. **DS 9.1 §4.1 apt prerequisites** (§3), single transaction.
 4. **CUDA repo + keyring** and `apt-get install cuda-toolkit-13-2`
-   (DS 9.1 §4.2). Write `/etc/profile.d/cuda.sh` (caveat 7).
+   (DS 9.1 §4.2). Write `/etc/profile.d/cuda.sh` (caveat 7). Any failed
+   keyring, apt update, or apt install transaction returns `FAILED` before
+   later work or dependency reporting.
 5. **Nouveau + old-NVIDIA cleanup** (caveats 3–4). If nouveau was loaded or a
    distro `nvidia-*` package was purged → **return `USER_ACTION_REQUIRED`**
    with reboot instructions now
@@ -375,20 +376,25 @@ defines.
 
 **Launch B — after the confirmed reboot (§6):**
 
-9. **TensorRT** (all `libnvinfer*` pinned to `10.16.0.72-1+cuda13.2`) and
-   **cuDNN** (`libcudnn9*` at `9.20.0.48`) via apt (DS 9.1 §4.4).
-10. **GStreamer** pin is satisfied by the §3 prereq set; confirm `1.24.2`.
-11. **Mosquitto broker** ([§3.2](#32-mosquitto-broker)): run the bundled
+9. **CUDA recovery**: probe `/usr/local/cuda-13.2/bin/nvcc`; when the toolkit
+   is missing after an interrupted Launch A, repeat the idempotent CUDA repo
+   and toolkit install, then write `/etc/profile.d/cuda.sh`.
+10. **TensorRT** (all `libnvinfer*` pinned to `10.16.0.72-1+cuda13.2`) and
+    **cuDNN** (the concrete CUDA 13 package set at apt `9.20.0.48-1`) via apt
+    (DS 9.1 §4.4). A failed transaction returns `FAILED` immediately and does
+    not report a dependency as installed.
+11. **GStreamer** pin is satisfied by the §3 prereq set; confirm `1.24.2`.
+12. **Mosquitto broker** ([§3.2](#32-mosquitto-broker)): run the bundled
     `10_setup_mosquitto.sh` to install the daemon, drop in `mv3dt.conf`, and
     enable + restart the service. Placed here because nothing in the NVIDIA
     stack depends on it and the broker survives the driver reboot untouched;
     it must nevertheless complete inside Step 1, since
     [`STEP-6` §E.1](STEP-6-REMOTE-SUPERVISION.md#e1-lifecycle) `preflight`
     fails without a reachable broker.
-12. **`verify()`** (§7.3): every pin via `verify_pinned`; confirm the driver
+13. **`verify()`** (§7.3): every pin via `verify_pinned`; confirm the driver
     now loads (`nvidia-smi` succeeds and reports `595.58.03`) and the broker
     is active.
-13. On all-match → `COMPLETE`; the dispatch loop advances to Step 2.
+14. On all-match → `COMPLETE`; the dispatch loop advances to Step 2.
 
 > The single reboot in this spec is the **driver `.run`** reboot (step 8). The
 > nouveau/purge reboot (step 5) only fires on machines that shipped with
@@ -643,10 +649,11 @@ verification command to `verify_pinned`
 ```
 nvidia-smi --query-gpu=driver_version --format=csv,noheader
         -> verify_pinned("NVIDIA driver", <out>, "595.58.03")
-nvcc --version   (parse "release X.Y")
+/usr/local/cuda-13.2/bin/nvcc --version   (parse "release X.Y")
         -> verify_pinned("CUDA (nvcc release)", <out>, "13.2")
-dpkg -l | grep libcudnn9   (extract version field)
-        -> verify_pinned("cuDNN (libcudnn9)", <out>, "9.20.0.48")
+dpkg-query -W -f='${Version}' libcudnn9-cuda-13
+        -> normalize exact "9.20.0.48-1" to "9.20.0.48"
+        -> verify_pinned("cuDNN (libcudnn9-cuda-13)", <normalized>, "9.20.0.48")
 dpkg -s libnvinfer10   (Version:)
         -> verify_pinned("TensorRT (libnvinfer10)", <out>, "10.16.0.72-1+cuda13.2")
 gst-inspect-1.0 --version   (parse "version X.Y.Z")
@@ -790,9 +797,11 @@ Step 1 is `COMPLETE` iff **all** of these pass:
 
 - [ ] `lsb_release -rs` = `24.04` and `uname -m` = `x86_64`.
 - [ ] `nvidia-smi` runs (driver loaded) and driver_version == `595.58.03`.
-- [ ] `nvcc --version` release == `13.2` (CUDA on PATH via
-      `/etc/profile.d/cuda.sh`).
-- [ ] `dpkg -l | grep libcudnn9` version contains `9.20.0.48`.
+- [ ] `/usr/local/cuda-13.2/bin/nvcc --version` release == `13.2`; new shells
+      also receive CUDA on `PATH` via `/etc/profile.d/cuda.sh`.
+- [ ] `dpkg-query -W -f='${Version}' libcudnn9-cuda-13` is exactly apt
+      `9.20.0.48-1`, normalized to the DeepStream pin `9.20.0.48` for the
+      verification and dependency report.
 - [ ] `dpkg -s libnvinfer10` Version == `10.16.0.72-1+cuda13.2` (and the full
       `libnvinfer*` set from §2.1 all at that version).
 - [ ] `gst-inspect-1.0 --version` == `1.24.2`.
