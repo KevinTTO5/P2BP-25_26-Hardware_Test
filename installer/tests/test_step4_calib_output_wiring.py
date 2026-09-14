@@ -22,6 +22,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 import zipfile
 
 import pytest
@@ -131,6 +132,17 @@ class FakeContext:
         self.report_already_installed = report.report_already_installed
         self.verify_pinned = report.verify_pinned
         self.non_interactive = non_interactive
+        # Doc 08 section 3.1: `run()` announces its phases through
+        # `ctx.progress`. Nothing here asserts on rendering, so the handle
+        # only has to exist and swallow the calls.
+        self.progress = SimpleNamespace(
+            begin_step=lambda step, index: None,
+            end_step=lambda: None,
+            phase=lambda number: None,
+            task=lambda name: None,
+            bytes=lambda done, total: None,
+            line=lambda text: None,
+        )
         self._asset_dir = asset_dir
         self.runner_root = runner_root if runner_root is not None else ScriptedRunner()
         self.runner_user = runner_user if runner_user is not None else ScriptedRunner()

@@ -1362,6 +1362,15 @@ class Step5PerProjectExes:
 
     id = "step5_per_project_exes"
     title = "Per-project executables"
+
+    # Doc 08 §3.1. This step holds 45 direct `log` calls, more than any
+    # other, which is what made it the worst case for the erase arithmetic
+    # in §12.2 defect 3; the phases give that output somewhere to belong.
+    phases = (
+        "project resolution",
+        "pipeline and record wrappers",
+        "project registry",
+    )
     order = 5
 
     # -- preflight (section 7.1) --------------------------------------------
@@ -1411,6 +1420,8 @@ class Step5PerProjectExes:
     # -- run (section 7.2) ---------------------------------------------------
 
     def run(self, ctx: "Context") -> StepResult:
+        ctx.progress.phase(1)
+        ctx.progress.task("resolving project and location")
         project_name = ctx.conf.get(CONF_PROJECT_NAME_KEY, "")
         location_id = ctx.conf.get(CONF_LOCATION_ID_KEY, "")
         rendered_config = resolve_rendered_config(ctx)
@@ -1423,6 +1434,8 @@ class Step5PerProjectExes:
         if err:
             return StepResult(status=StepStatus.FAILED, message=err)
 
+        ctx.progress.phase(2)
+        ctx.progress.task("writing per-project wrappers")
         installer_bin = step3_mod.ensure_installer_binary(ctx)
 
         pipeline_path, pipeline_changed = write_pipeline_wrapper(
@@ -1432,6 +1445,8 @@ class Step5PerProjectExes:
             ctx, installer_bin, project_name, location_id, slug
         )
 
+        ctx.progress.phase(3)
+        ctx.progress.task("updating the project registry")
         entry = upsert(
             ctx.install_dir,
             project_name=project_name,

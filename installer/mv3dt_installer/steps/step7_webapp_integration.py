@@ -1218,6 +1218,14 @@ def _gate_on(ctx: Any) -> bool:
 class Step7WebappIntegration:
     id = STEP_ID
     title = "Web-app integration"
+
+    # Doc 08 §3.1. Gated off (doc 00 §3.4), `run()` returns before the first
+    # `phase()` call, so a disabled step announces its banner and completes
+    # without ever drawing a phase row.
+    phases = (
+        "web-app directories",
+        "reporter and uploader units",
+    )
     order = 7
 
     def preflight(self, ctx: Any) -> StepResult:
@@ -1289,6 +1297,8 @@ class Step7WebappIntegration:
         if not _gate_on(ctx):
             return StepResult(status=StepStatus.COMPLETE)
 
+        ctx.progress.phase(1)
+        ctx.progress.task("creating web-app directories")
         webapp_dir = pathlib.Path(ctx.install_dir) / "webapp"
         run_dir = pathlib.Path(ctx.install_dir) / "run"
         for directory in (webapp_dir, run_dir):
@@ -1298,6 +1308,8 @@ class Step7WebappIntegration:
             except OSError:
                 pass  # best-effort, e.g. under a non-root test process
 
+        ctx.progress.phase(2)
+        ctx.progress.task("installing reporter and uploader units")
         reporter_changed, uploader_changed = _install_units(ctx)
 
         if reporter_changed:

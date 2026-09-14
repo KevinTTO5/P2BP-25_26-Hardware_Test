@@ -272,3 +272,51 @@ def test_validate_phases_names_the_offending_step() -> None:
     step = _DummyStep("step2_deepstream_sdk", "DeepStream SDK", 2, phases=("ok", ""))
     with pytest.raises(ValueError, match="step2_deepstream_sdk"):
         validate_phases(step)
+
+
+def test_every_step_declares_phases_that_match_the_indices_it_uses():
+    """Doc 08 section 3.1 and section 9.
+
+    `ctx.progress.phase(n)` raises on an out-of-range index, deliberately: a
+    wrong denominator on screen is worse than a traceback, because the
+    operator cannot tell a wrong one from a right one. That makes the
+    declaration and the call sites a pair that has to be kept in step, and
+    nothing else checks it. A step that grows a phase without declaring it
+    would otherwise fail for the first time on a real install.
+
+    Reads the modules directly rather than `STEP_REGISTRY`, which other
+    tests in the suite legitimately replace.
+    """
+    import importlib
+    import pathlib as _pathlib
+    import re as _re
+
+    from mv3dt_installer import steps as steps_mod
+
+    names = (
+        "step1_prerequisites",
+        "step2_deepstream_sdk",
+        "step3_amc_launcher",
+        "step4_calib_output_wiring",
+        "step5_per_project_exes",
+        "step6_remote_supervision",
+        "step7_webapp_integration",
+    )
+
+    for name in names:
+        module = importlib.import_module(f"mv3dt_installer.steps.{name}")
+        step = next(
+            obj
+            for obj in vars(module).values()
+            if isinstance(obj, type) and getattr(obj, "id", None) == name
+        )
+        labels = steps_mod.step_phases(step)
+        assert labels, f"{name} declares no phases"
+
+        source = _pathlib.Path(module.__file__).read_text(encoding="utf-8")
+        used = sorted(
+            {int(n) for n in _re.findall(r"ctx\.progress\.phase\((\d+)\)", source)}
+        )
+        assert used == list(range(1, len(labels) + 1)), (
+            f"{name} declares {len(labels)} phase(s) but calls phase{used}"
+        )

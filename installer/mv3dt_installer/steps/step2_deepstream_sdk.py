@@ -852,6 +852,16 @@ class _RunOutcome:
 class Step2DeepStreamSdk:
     id = "step2_deepstream_sdk"
     title = "DeepStream 9.1 SDK"
+
+    # Doc 08 §3.1. The SDK install itself is one phase whatever method
+    # resolves (deb, tar or docker), because the operator cares that the SDK
+    # is going in, not which of three paths it took; the method is already
+    # named in the line above it.
+    phases = (
+        "install method",
+        "DeepStream SDK",
+        "PeopleNet model",
+    )
     order = 2
 
     def __init__(self) -> None:
@@ -888,6 +898,7 @@ class Step2DeepStreamSdk:
     # -- run -------------------------------------------------------------
 
     def run(self, ctx: "Context") -> StepResult:
+        ctx.progress.phase(1)
         method, reason = _resolve_method(ctx)
         log.info(f"DS install method: {method.value} ({reason})")
 
@@ -898,6 +909,8 @@ class Step2DeepStreamSdk:
         self._post_install_actions = []
         self._smoke_passed = None
 
+        ctx.progress.phase(2)
+        ctx.progress.task(f"DeepStream 9.1 via {method.value}")
         if method is Method.DEB:
             result = self._run_deb(ctx)
         elif method is Method.TAR:
@@ -911,6 +924,8 @@ class Step2DeepStreamSdk:
         # doc STEP-4 section 6.3: Step 2 owns the PeopleNet model fetch,
         # independent of which DS SDK install method was chosen -- Step 5
         # execs deepstream-app against `<install_dir>/deepstream` regardless.
+        ctx.progress.phase(3)
+        ctx.progress.task("PeopleNet detector model")
         peoplenet_result = _ensure_peoplenet_model(ctx)
         if peoplenet_result is not None:
             return peoplenet_result

@@ -1012,6 +1012,15 @@ class Step6RemoteSupervision:
 
     id = "step6_remote_supervision"
     title = "Remote supervision"
+
+    # Doc 08 §3.1. The polkit rule is its own phase because it is written
+    # before the agent is ever started against it (section B.1.1), and an
+    # operator debugging a permission refusal needs to see that it ran.
+    phases = (
+        "systemd units",
+        "per-project pipeline units",
+        "polkit rule and agent",
+    )
     order = 6
 
     # -- preflight ------------------------------------------------------
@@ -1058,6 +1067,8 @@ class Step6RemoteSupervision:
     def run(self, ctx: "Context") -> StepResult:
         runner = _bind_run_root(ctx)
 
+        ctx.progress.phase(1)
+        ctx.progress.task("installing systemd units")
         pipeline_content = render_pipeline_unit(ctx.user.name)
         pipeline_changed = systemd_mod.install_unit(PIPELINE_UNIT_TEMPLATE, pipeline_content)
 
@@ -1071,6 +1082,8 @@ class Step6RemoteSupervision:
         else:
             ctx.report_already_installed(PIPELINE_UNIT_TEMPLATE, __version__)
 
+        ctx.progress.phase(2)
+        ctx.progress.task("enabling per-project pipeline units")
         for entry in step5_mod.list_projects(ctx.install_dir):
             unit = PIPELINE_UNIT_NAME(entry.slug)
             systemd_mod.enable_now(unit, runner=runner)
@@ -1083,6 +1096,8 @@ class Step6RemoteSupervision:
 
         # section B.1.1: the scoped polkit rule, written before the agent is
         # ever started against it.
+        ctx.progress.phase(3)
+        ctx.progress.task("writing the scoped polkit rule")
         rule_content = render_polkit_rule(ctx.user.name)
         rule_path = pathlib.Path("/etc/polkit-1/rules.d") / POLKIT_RULE_NAME
         rule_path.parent.mkdir(parents=True, exist_ok=True)

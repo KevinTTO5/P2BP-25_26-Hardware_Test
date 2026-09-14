@@ -854,6 +854,19 @@ class Step1Prerequisites:
     title = "Prerequisites (driver / CUDA / cuDNN / TensorRT / GStreamer)"
     order = 1
 
+    # Doc 08 §3.1. The numbering spans both launches deliberately: phases 1
+    # to 4 belong to launch A (pre-driver-reboot) and 5 to 6 to launch B, so
+    # an operator who reboots mid-step sees "phase 5/6" resume rather than
+    # a second step restarting at 1. Labels match doc 08 §3.2's mock-up.
+    phases = (
+        "base packages",
+        "CUDA repo and toolkit",
+        "nouveau and distro cleanup",
+        "NVIDIA driver runfile",
+        "TensorRT and cuDNN",
+        "Mosquitto broker",
+    )
+
     # -- preflight (section 7.1) -------------------------------------------
 
     def preflight(self, ctx: "Context") -> StepResult:
@@ -888,14 +901,22 @@ class Step1Prerequisites:
             *BASE_KERNEL_PACKAGES,
             f"linux-headers-{kernel}" if kernel else "linux-headers-generic",
         ]
+        ctx.progress.phase(1)
+        ctx.progress.task("kernel headers and build tools")
         _apt_install_reported(ctx, base_kernel_packages)
+        ctx.progress.task("base tooling")
         _apt_install_reported(ctx, list(BASE_TOOLING_PACKAGES))
 
+        ctx.progress.task("GStreamer and step prerequisites")
         _apt_install_reported(ctx, list(APT_PREREQ_PACKAGES))
 
+        ctx.progress.phase(2)
+        ctx.progress.task(f"CUDA {CUDA_VERSION} toolkit")
         _install_cuda_toolkit(ctx)
         _write_cuda_profile()
 
+        ctx.progress.phase(3)
+        ctx.progress.task("nouveau and distro NVIDIA packages")
         if _clean_nouveau_and_distro_driver(ctx):
             # USER_ACTION_REQUIRED, not ctx.reboot.request() -- see the
             # "Reboot handling" note in this class's module docstring. The
@@ -936,6 +957,8 @@ class Step1Prerequisites:
                 ],
             )
 
+        ctx.progress.phase(4)
+        ctx.progress.task(f"NVIDIA driver {DRIVER_VERSION}")
         run_path = _driver_run_path(ctx)
 
         # STEP-1 section 5.1: fetch the pinned runfile ourselves. An already
@@ -1055,9 +1078,12 @@ class Step1Prerequisites:
         )
 
     def _run_launch_b(self, ctx: "Context") -> StepResult:
+        ctx.progress.phase(5)
+        ctx.progress.task(f"TensorRT {TENSORRT_VERSION}")
         apt_args = [f"{pkg}={TENSORRT_VERSION}" for pkg in TENSORRT_PACKAGES]
         _apt_install_reported(ctx, TENSORRT_PACKAGES, apt_args=apt_args)
 
+        ctx.progress.task(f"cuDNN {CUDNN_VERSION}")
         cudnn_before = _dpkg_version(ctx, CUDNN_QUERY_PACKAGE)
         ctx.run_root(
             "apt-get",
@@ -1092,6 +1118,8 @@ class Step1Prerequisites:
         before/after diff-detection reporting the script itself does not
         do. Returns a `StepResult` only on failure; `None` means "continue".
         """
+        ctx.progress.phase(6)
+        ctx.progress.task("Mosquitto broker and mv3dt.conf")
         before_version = _dpkg_version(ctx, "mosquitto")
         dst_path = _mosquitto_dst_path()
         before_hash = _sha256_file(dst_path)

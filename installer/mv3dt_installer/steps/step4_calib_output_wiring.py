@@ -718,6 +718,15 @@ class Step4CalibOutputWiring:
 
     id = "step4_calib_output_wiring"
     title = "Calibration output wiring"
+
+    # Doc 08 §3.1. The ingest phase is the long one and the only one with a
+    # real denominator (a file copy), which is why it is its own phase
+    # rather than a task inside "calibration export".
+    phases = (
+        "project inputs",
+        "calibration export ingest",
+        "ownership and verification",
+    )
     order = 4
 
     # -- preflight (section 3) -----------------------------------------------
@@ -729,6 +738,8 @@ class Step4CalibOutputWiring:
                 message="AutoMagicCalib launcher (Step 3) is not complete; run Step 3 first",
             )
 
+        ctx.progress.phase(1)
+        ctx.progress.task("resolving project inputs")
         inputs, missing = resolve_project_inputs(ctx)
         if inputs is None:
             return _missing_conf_result(ctx, missing)  # type: ignore[arg-type]
@@ -807,6 +818,8 @@ class Step4CalibOutputWiring:
         was_populated = dest.is_dir() and any(dest.iterdir())
         _ensure_dir(ctx, dest)
 
+        ctx.progress.phase(2)
+        ctx.progress.task(f"ingesting export for {inputs.project_name}")
         outcome = ingest_export(
             ctx, amc_root=inputs.amc_root, project_name=inputs.project_name, dest=dest
         )
@@ -816,6 +829,8 @@ class Step4CalibOutputWiring:
                 message="AMC export was empty at ingest time",
                 user_actions=_export_wait_hints(ctx),
             )
+        ctx.progress.phase(3)
+        ctx.progress.task("setting ownership on the calibration tree")
         _chown_tree(ctx, dest)
 
         label = f"{inputs.project_name}@{outcome.stamp}"

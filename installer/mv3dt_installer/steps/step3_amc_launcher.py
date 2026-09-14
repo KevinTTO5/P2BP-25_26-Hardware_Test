@@ -1160,6 +1160,15 @@ class Step3AmcLauncher:
 
     id = "step3_amc_launcher"
     title = "AutoMagicCalib launcher"
+
+    # Doc 08 §3.1. The launch phase is conditional (section 7.2's
+    # confirm-then-launch), so a run that declines it collapses phase 3 the
+    # moment the step completes rather than leaving it drawn.
+    phases = (
+        "configuration",
+        "launcher wrapper",
+        "AutoMagicCalib launch",
+    )
     order = 3
 
     # -- preflight (section 7.1) -------------------------------------------
@@ -1199,6 +1208,8 @@ class Step3AmcLauncher:
     # -- run (section 7.2) ---------------------------------------------------
 
     def run(self, ctx: "Context") -> StepResult:
+        ctx.progress.phase(1)
+        ctx.progress.task("resolving AutoMagicCalib configuration")
         cfg = resolve_config(ctx)
 
         guard = check_repo_isolation(cfg.amc_root)
@@ -1207,6 +1218,8 @@ class Step3AmcLauncher:
 
         persist_config(ctx, cfg)
 
+        ctx.progress.phase(2)
+        ctx.progress.task("installer binary and amc wrapper")
         installer_bin = ensure_installer_binary(ctx)
         wrapper_path, wrapper_changed = write_amc_wrapper(ctx, installer_bin)
         if wrapper_changed:
@@ -1217,6 +1230,8 @@ class Step3AmcLauncher:
         if not _confirm_launch_now(ctx):
             return StepResult(status=StepStatus.COMPLETE)
 
+        ctx.progress.phase(3)
+        ctx.progress.task("launching AutoMagicCalib")
         result = launch_amc(ctx, non_interactive=ctx.non_interactive)
         if result.status is not StepStatus.COMPLETE:
             return result
