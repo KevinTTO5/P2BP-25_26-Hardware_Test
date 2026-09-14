@@ -15,7 +15,9 @@ root" requirement (a dedicated test below does confirm that gate exists).
 
 from __future__ import annotations
 
+import io
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -1635,7 +1637,275 @@ def test_step_making_no_progress_calls_dispatches_unchanged(tmp_path, monkeypatc
 
     assert rc == 0
     assert step.report_calls == 1
-    assert (recorder.steps, recorder.phases, recorder.lines) == ([], [], [])
+    # The banner is the framework's and appears without the step asking for
+    # it (doc 08 §3.2); the three step-author calls stay untouched.
+    assert recorder.steps == [(1, "Prerequisites", ())]
+    assert (recorder.phases, recorder.tasks, recorder.byte_calls, recorder.lines) == (
+        [],
+        [],
+        [],
+        [],
+    )
+
+
+def test_unnamed_phase_transition_reaches_the_transcript_not_the_screen(
+    tmp_path, capsys
+):
+    """Doc 08 §3.3 and §7.1 together.
+
+    A step that has declared no phases has exactly one, unnamed, and there
+    is no label to draw beside it -- so nothing is rendered. §3.3 still
+    wants every transition in the record and §7.1 forbids paying for a
+    rendering decision with a hole in it, so the line goes to the
+    transcript-only sink rather than being dropped.
+    """
+    from mv3dt_installer import logs
+
+    logs.open_transcript(tmp_path / "logs")
+    ctx, recorder = _recording_ctx(tmp_path)
+    step = _DummyStep("step4_calib_output_wiring", "Calibration wiring", 4)
+    ctx.progress.begin_step(step, 4)
+    capsys.readouterr()  # discard the banner
+
+    ctx.progress.phase(1)
+
+    assert recorder.phases == []
+    assert capsys.readouterr().err == ""
+    written = logs._transcript_path.read_text(encoding="utf-8")
+    assert "step4_calib_output_wiring phase 1/1: (unnamed)" in written
+
+
+# ---------------------------------------------------------------------------
+# doc 08 §3.2 -- the step banner in the dispatch loop
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_ctx(tmp_path: Path, steps, monkeypatch, **kwargs):
+    """A recording `Context`, a `StateMachine` and a registry of `steps`."""
+    ctx, cfg = _minimal_ctx(tmp_path, **kwargs)
+    recorder = _RecordingRenderer()
+    ctx.progress.renderer = recorder
+    monkeypatch.setattr(app, "STEP_REGISTRY", list(steps))
+    return ctx, cfg, StateMachine(path=tmp_path / "state.json"), recorder
+
+
+def test_dispatch_announces_every_step_it_runs_with_its_position(
+    tmp_path, monkeypatch
+):
+    """Doc 08 §3.2's `[ 3/7 ] <title>`, and event 4 in §2 it closes.
+
+    Position is the one thing a step cannot know about itself, which is why
+    the banner is the dispatch loop's and not a step's.
+    """
+    steps = [
+        _PhasedStep("step1_prerequisites", "Prerequisites", 1),
+        _DummyStep("step2_deepstream_sdk", "DeepStream SDK", 2),
+        _DummyStep("step7_webapp_integration", "Web-app Integration", 7),
+    ]
+    ctx, cfg, sm, recorder = _dispatch_ctx(
+        tmp_path, steps, monkeypatch, webapp_integration="on"
+    )
+
+    assert app._dispatch(sm, ctx, cfg) == 0
+    # The declared phases travel with the banner, so the renderer can pair
+    # a later `phase(n)` with a label (doc 08 §3.1).
+    assert recorder.steps == [
+        (1, "Prerequisites", ("first", "second")),
+        (2, "DeepStream SDK", ()),
+        (3, "Web-app Integration", ()),
+    ]
+    assert recorder.ended == 3
+
+
+def test_dispatch_never_announces_a_step_it_skips(tmp_path, monkeypatch):
+    """A gate-off skip and an already-complete skip never begin a step, so
+    neither opens a region -- but both still occupy their slot, so the one
+    step that does run is announced with its true, absolute position. Were
+    the counter advanced only for steps that actually ran, a resumed
+    install would renumber the remainder and contradict `--status`."""
+    steps = [
+        _DummyStep("step1_prerequisites", "Prerequisites", 1),
+        _DummyStep("step6_remote_supervision", "Remote Supervision", 6),
+        _DummyStep("step7_webapp_integration", "Web-app Integration", 7),
+    ]
+    ctx, cfg, sm, recorder = _dispatch_ctx(
+        tmp_path,
+        steps,
+        monkeypatch,
+        remote_supervision="off",
+        webapp_integration="on",
+    )
+    sm.mark_complete("step1_prerequisites")
+
+    assert app._dispatch(sm, ctx, cfg) == 0
+    assert recorder.steps == [(3, "Web-app Integration", ())]
+    assert recorder.ended == 1
+
+
+def test_dispatch_takes_the_region_down_before_report_writes(tmp_path, monkeypatch):
+    """On a tty the live region is erased by cursor arithmetic over the rows
+    it drew, so a `report()` line emitted while it was still up would be torn
+    through by the erase."""
+    events: list[str] = []
+
+    class _OrderedRenderer(_RecordingRenderer):
+        def end_step(self):
+            events.append("end_step")
+            super().end_step()
+
+    class _ReportingStep(_DummyStep):
+        def report(self, ctx):
+            events.append("report")
+            super().report(ctx)
+
+    step = _ReportingStep("step1_prerequisites", "Prerequisites", 1)
+    ctx, cfg = _minimal_ctx(tmp_path)
+    ctx.progress.renderer = _OrderedRenderer()
+    monkeypatch.setattr(app, "STEP_REGISTRY", [step])
+    sm = StateMachine(path=tmp_path / "state.json")
+
+    assert app._dispatch(sm, ctx, cfg) == 0
+    assert events == ["end_step", "report"]
+
+
+@pytest.mark.parametrize(
+    "outcome, printer",
+    [
+        (
+            StepResult(status=StepStatus.REBOOT_REQUIRED, message="reboot pls"),
+            "show_reboot_required",
+        ),
+        (
+            StepResult(status=StepStatus.USER_ACTION_REQUIRED, message="do a thing"),
+            "show_user_action_block",
+        ),
+        (StepResult(status=StepStatus.FAILED, message="boom"), None),
+    ],
+    ids=["reboot", "user-action", "failed"],
+)
+def test_dispatch_ends_the_step_before_every_halting_block(
+    tmp_path, monkeypatch, outcome, printer
+):
+    """Each halting branch prints its own block, so every one of them needs
+    the region down first, not just the `COMPLETE` path.
+
+    Asserted as an ordering and not as a call count. A count is satisfied
+    just as happily when `end_step` runs *after* the block, which is the one
+    thing this test exists to rule out: on a tty that ordering tears the
+    block through with the erase. The technique is the one
+    `test_dispatch_takes_the_region_down_before_report_writes` uses, applied
+    to the three halting printers instead of to `report()`.
+    """
+    events: list[str] = []
+
+    class _OrderedRenderer(_RecordingRenderer):
+        def end_step(self):
+            events.append("end_step")
+            super().end_step()
+
+    step = _DummyStep("step1_prerequisites", "Prerequisites", 1, verify=outcome)
+    ctx, cfg = _minimal_ctx(tmp_path)
+    recorder = _OrderedRenderer()
+    ctx.progress.renderer = recorder
+    monkeypatch.setattr(app, "STEP_REGISTRY", [step])
+    monkeypatch.setattr(app.reboot_mod, "current_boot_id", lambda: "boot-abc")
+    sm = StateMachine(path=tmp_path / "state.json")
+
+    if printer is None:
+        # The FAILED branch has no block printer of its own; its one
+        # `log.error` line is the block.
+        monkeypatch.setattr(
+            app.log, "error", lambda *a, **k: events.append("block")
+        )
+    else:
+        monkeypatch.setattr(
+            app.privilege, printer, lambda *a, **k: events.append("block")
+        )
+
+    app._dispatch(sm, ctx, cfg)
+
+    assert events == ["end_step", "block"]
+    assert recorder.steps == [(1, "Prerequisites", ())]
+    assert recorder.ended == 1
+
+
+def test_dispatch_ends_the_step_when_a_step_raises(tmp_path, monkeypatch):
+    """A step that raises must leave the terminal in the same clean state as
+    one that merely fails -- otherwise the traceback lands inside a region
+    that is still counting rows."""
+
+    class _ExplodingStep(_DummyStep):
+        def run(self, ctx):
+            raise RuntimeError("boom")
+
+    step = _ExplodingStep("step1_prerequisites", "Prerequisites", 1)
+    ctx, cfg, sm, recorder = _dispatch_ctx(tmp_path, [step], monkeypatch)
+
+    with pytest.raises(RuntimeError):
+        app._dispatch(sm, ctx, cfg)
+
+    assert recorder.steps == [(1, "Prerequisites", ())]
+    assert recorder.ended == 1
+
+
+class _TtyStream(io.StringIO):
+    """A stream that claims to be a terminal, so a test can put the renderer
+    in live mode deliberately instead of depending on the harness."""
+
+    def isatty(self):
+        return True
+
+
+def test_dispatch_banner_degrades_to_a_plain_line_when_non_interactive(
+    tmp_path, monkeypatch
+):
+    """Doc 08 §7: a pipe, a CI run and `--non-interactive` all get the phase
+    line plain, and not one escape sequence.
+
+    The stream reports a tty, so `live` is false because of the flag and not
+    because pytest replaced stderr. Without that, the assertion passes on a
+    renderer that is drawing at full tilt: `_colour_enabled()` is false under
+    `capsys` whatever the renderer does, and a first draw emits no escape
+    anyway, so both halves of the old assertion held with live rendering on.
+    """
+    stream = _TtyStream()
+    monkeypatch.setattr(sys, "stderr", stream)
+
+    # The control: the same stream with the flag off really does put the
+    # renderer in live mode, so `live is False` below is the flag's doing.
+    live_ctx, _ = _minimal_ctx(tmp_path, non_interactive=False)
+    assert live_ctx.progress.renderer.live is True
+
+    ctx, cfg = _minimal_ctx(tmp_path, non_interactive=True)
+    assert ctx.progress.renderer.live is False
+    step = _DummyStep("step1_prerequisites", "Prerequisites", 1)
+    monkeypatch.setattr(app, "STEP_REGISTRY", [step])
+    sm = StateMachine(path=tmp_path / "state.json")
+
+    stream.truncate(0)
+    stream.seek(0)
+    assert app._dispatch(sm, ctx, cfg) == 0
+
+    written = stream.getvalue()
+    banner = f"[ 1/{len(STEP_IDS)} ] Prerequisites"
+    assert banner in written
+    # Exactly once: doc 08 §4.2's one-writer rule, and the shape defect 1 in
+    # §12.2 describes on the live path.
+    assert written.count(banner) == 1
+
+    # No cursor arithmetic: nothing moved the cursor up and nothing cleared
+    # below it, which is what a live region is made of and what §7 forbids
+    # here.
+    assert "\033[J" not in written
+    assert not re.search(r"\033\[\d+A", written)
+
+    # Not yet the stronger "not one escape sequence" §7 asks for: `logs`
+    # still colours its level label, because `logs._colour_enabled()` keys on
+    # `sys.stderr.isatty()` alone and never learns about `--non-interactive`.
+    # That is a `logs.py` defect, not a renderer one, and `logs.py` belongs to
+    # U5b; this assertion tightens to a bare `"\033" not in written` once it
+    # is fixed.
+    assert "\033[32m" in written
 
 
 # ---------------------------------------------------------------------------

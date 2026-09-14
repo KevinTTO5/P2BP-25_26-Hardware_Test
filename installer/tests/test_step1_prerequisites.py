@@ -238,6 +238,18 @@ class FakeContext:
         self.non_interactive = non_interactive
         self.asset_path = asset_path or shellout.asset_path
         self.reboot = SimpleNamespace(request=lambda: StepStatus.REBOOT_REQUIRED)
+        # Doc 08 section 3.2: the dispatch loop announces every step it
+        # enters through `ctx.progress`, and one test below feeds this
+        # context to the real `app._dispatch()`. Nothing here asserts on
+        # rendering, so the handle only has to exist and swallow the calls.
+        self.progress = SimpleNamespace(
+            begin_step=lambda step, index: None,
+            end_step=lambda: None,
+            phase=lambda number: None,
+            task=lambda name: None,
+            bytes=lambda done, total: None,
+            line=lambda text: None,
+        )
 
     def report_installed(self, dependency: str, version: str) -> None:
         self.installed.append((dependency, version))

@@ -76,7 +76,7 @@ from mv3dt_installer import reboot as reboot_mod
 from mv3dt_installer import report
 from mv3dt_installer import shellout
 from mv3dt_installer import webapp as webapp_mod
-from mv3dt_installer.logs import log, open_transcript
+from mv3dt_installer.logs import log, open_transcript, transcript
 from mv3dt_installer.privilege import InvokingUser
 from mv3dt_installer.state import (
     CANONICAL_STATE_PATH,
@@ -381,6 +381,18 @@ class ProgressHandle:
         """
         step = self.step if self.step is not None else _UNBOUND_STEP
         if phase_label(step, number) is None:
+            # The unnamed phase is the one transition the renderer cannot
+            # draw: there is no label to put beside the tick, and a
+            # collapsed `✓` with an empty label is worse than no row at
+            # all. Doc 08 §3.3 still wants every transition in the record,
+            # and §7.1 forbids paying for a rendering decision with a hole
+            # in it -- the screen may show less than the transcript, never
+            # the reverse -- so the line goes to the transcript-only sink
+            # rather than being dropped. `transcript` and not `log.info`
+            # for the other half of the same rule: the terminal gets
+            # exactly one writer per line, and here that count is zero.
+            step_id = getattr(step, "id", "?")
+            transcript("info", f"{step_id} phase {number}/1: (unnamed)")
             return
         self.renderer.phase(number)
 
@@ -942,7 +954,8 @@ def _dispatch(sm: StateMachine, ctx: Context, cfg: config_mod.Config) -> int:
       with a one-line log -- "the same skip discipline as a genuinely
       completed step".
     - Else if already `COMPLETE`, skip with the "already complete" log line.
-    - Else run its lifecycle (`preflight -> run -> verify`) and record the
+    - Else announce it with doc 08 §3.2's `[ 3/7 ] <title>` banner, run
+      its lifecycle (`preflight -> run -> verify`), and record the
       effective `StepResult`. On `COMPLETE`, call `report()` and
       `state.mark_complete()`, then continue to the next step. On anything
       else, halt: `REBOOT_REQUIRED` writes the reboot marker and prints the
@@ -954,8 +967,25 @@ def _dispatch(sm: StateMachine, ctx: Context, cfg: config_mod.Config) -> int:
     separate, out-of-scope work), so in practice this loop iterates zero
     times today and falls straight through to the "all complete" banner --
     but the loop itself is implemented generically and correctly regardless.
+
+    The step banner belongs to this loop rather than to a step, because
+    position is the one thing a step cannot know about itself: it is where
+    the step sits among the others, not a property of its own module. Event
+    4 in doc 08 §2 is the gap that closes -- an operator watching Mosquitto
+    setup scroll past had `shellout env: MV3DT_INSTALLER_CONF` as their only
+    signal, and no way at all to tell it was step 1 of 7. Everything below
+    the banner (phase collapse, the bar, the rolling window, the plain-text
+    fallback off a tty) is the renderer's, reached only through
+    `ctx.progress`.
     """
-    for step in STEP_REGISTRY:
+    # Position is counted over every registered step, skipped ones
+    # included, so the numbering stays absolute and agrees with the
+    # renderer's denominator: an operator whose steps 6 and 7 are gated off
+    # still sees step 5 announced as `[ 5/7 ]`. Were the counter advanced
+    # only for the steps that actually run, a resumed install would
+    # renumber the remainder and the banner would contradict both the
+    # previous run and `--status`.
+    for position, step in enumerate(STEP_REGISTRY, start=1):
         gate_value = _gate_value_for_step(step, cfg)
         if gate_value is not None and _gate_is_off(gate_value):
             if sm.status(step.id) is not StepStatus.COMPLETE:
@@ -967,7 +997,23 @@ def _dispatch(sm: StateMachine, ctx: Context, cfg: config_mod.Config) -> int:
             log.info(f"{step.id}: already complete")
             continue
 
-        result = _run_step_lifecycle(step, ctx)
+        # Bind the step before its first lifecycle method runs: `run_root`
+        # streams into the region this opens (doc 08 §4.2), and
+        # `ctx.progress.phase(n)` needs the binding to have a declaration
+        # to index against (doc 08 §9).
+        ctx.progress.begin_step(step, position)
+        try:
+            result = _run_step_lifecycle(step, ctx)
+        finally:
+            # `end_step` collapses the last phase and takes the live region
+            # down, and it has to happen before anything else writes: on a
+            # tty the region is erased by cursor arithmetic over the rows it
+            # drew, so a `report()` line or a USER-ACTION block emitted
+            # while it was still up would be torn through by the erase.
+            # `finally` rather than a plain call, so a step that raises
+            # leaves the terminal in the same clean state as one that
+            # merely fails.
+            ctx.progress.end_step()
 
         if result.status is StepStatus.COMPLETE:
             step.report(ctx)
