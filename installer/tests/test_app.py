@@ -26,7 +26,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mv3dt_installer import __version__  # noqa: E402
-from mv3dt_installer import app  # noqa: E402
+from mv3dt_installer import app
+from mv3dt_installer import logs as logs_mod  # noqa: E402
 from mv3dt_installer import cameras as cameras_mod  # noqa: E402
 from mv3dt_installer import config as config_mod  # noqa: E402
 from mv3dt_installer.privilege import InvokingUser  # noqa: E402
@@ -1872,6 +1873,12 @@ def test_dispatch_banner_degrades_to_a_plain_line_when_non_interactive(
     """
     stream = _TtyStream()
     monkeypatch.setattr(sys, "stderr", stream)
+    # `_minimal_ctx` calls `build_context` directly, so it never reaches
+    # `main()`'s `set_colour(not args.non_interactive)`. Settling it here is
+    # what that line does in production; without it this test would be
+    # asserting against `logs`' conservative pre-parse argv default, which
+    # under pytest sees no flag at all.
+    logs_mod.set_colour(False)
 
     # The control: the same stream with the flag off really does put the
     # renderer in live mode, so `live is False` below is the flag's doing.
@@ -1901,13 +1908,10 @@ def test_dispatch_banner_degrades_to_a_plain_line_when_non_interactive(
     assert "\033[J" not in written
     assert not re.search(r"\033\[\d+A", written)
 
-    # Not yet the stronger "not one escape sequence" §7 asks for: `logs`
-    # still colours its level label, because `logs._colour_enabled()` keys on
-    # `sys.stderr.isatty()` alone and never learns about `--non-interactive`.
-    # That is a `logs.py` defect, not a renderer one, and `logs.py` belongs to
-    # U5b; this assertion tightens to a bare `"\033" not in written` once it
-    # is fixed.
-    assert "\033[32m" in written
+    # The full §7 rule now holds, not just the renderer's half of it: U5b
+    # taught `logs` about the flag and U13 made the *parsed* value settle it,
+    # so nothing colours a level label either.
+    assert "\033" not in written
 
 
 # ---------------------------------------------------------------------------
@@ -2212,3 +2216,24 @@ def test_run_root_streaming_redacts_the_terminal_not_the_parsed_buffer(
 
     assert result.stdout == "key is nvapi-secret-value\n"
     assert recorder.lines == ["key is <redacted>"]
+
+
+def test_main_settles_colour_from_the_parsed_flag(tmp_path, monkeypatch):
+    """Doc 08 §7 and §12.2 defect 4, via U13.
+
+    Until `main()` runs, `logs` answers the colour question by reading
+    `sys.argv` itself, because the decision is needed before `argparse` has
+    run. That default is conservative and not authoritative: it is wrong for
+    any caller passing its own `argv`, which is exactly what `main(argv)`
+    does. This pins the parsed flag settling it.
+    """
+    seen: list[bool | None] = []
+    monkeypatch.setattr(app, "set_colour", seen.append)
+    monkeypatch.setattr(app.privilege, "require_root", lambda: None)
+
+    app.main(["--status", "--non-interactive"], state_path=tmp_path / "state.json")
+    assert seen == [False]
+
+    seen.clear()
+    app.main(["--status"], state_path=tmp_path / "state.json")
+    assert seen == [True]

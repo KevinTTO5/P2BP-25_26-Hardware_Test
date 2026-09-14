@@ -76,7 +76,7 @@ from mv3dt_installer import reboot as reboot_mod
 from mv3dt_installer import report
 from mv3dt_installer import shellout
 from mv3dt_installer import webapp as webapp_mod
-from mv3dt_installer.logs import log, open_transcript, transcript
+from mv3dt_installer.logs import log, open_transcript, set_colour, transcript
 from mv3dt_installer.privilege import InvokingUser
 from mv3dt_installer.state import (
     CANONICAL_STATE_PATH,
@@ -849,6 +849,11 @@ def _bootstrap_subcommand_context(
     peek.add_argument("--log-dir", default=None)
     known, _unused = peek.parse_known_args(argv)
 
+    # The subcommand path never reaches `main()`'s `parse_args`, so it owes
+    # the same settlement (U13); without it a subcommand run under
+    # `--non-interactive` keeps the pre-parse default.
+    set_colour(not known.non_interactive)
+
     if requires_root:
         privilege.require_root()
     user = onboarding.run_platform_preflight()
@@ -1253,6 +1258,17 @@ def main(
         return registration.handler(rest, ctx)
 
     args = parse_args(argv)
+
+    # doc 08 §7 and §12.2 defect 4, via U13: until this line runs, `logs`
+    # answers the colour question by reading `sys.argv` itself, because the
+    # decision is needed before `argparse` has run and `logs` cannot import
+    # this module. That default is deliberately conservative and not
+    # authoritative -- it has to hand-implement argparse's
+    # unambiguous-prefix rule, and it is simply wrong for any caller that
+    # passes its own `argv` rather than the process's. The parsed flag is
+    # the real answer, so it settles the question here, once, for every line
+    # from this point on.
+    set_colour(not args.non_interactive)
 
     sm_path = state_path if state_path is not None else CANONICAL_STATE_PATH
     sm = StateMachine(path=sm_path)
