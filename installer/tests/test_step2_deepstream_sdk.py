@@ -30,6 +30,7 @@ from mv3dt_installer.steps import step2_deepstream_sdk as step2  # noqa: E402
 PINS_OK = {
     "nvidia-smi": ("595.58.03\n", 0),
 }
+PERF_OK = "**PERF: FPS 0 (Avg)\n**PERF: 30.0 (30.0)\n"
 
 
 @pytest.fixture(autouse=True)
@@ -587,7 +588,7 @@ def _host_ready_runner(*, version_ok=True, app_version_ok=True) -> ScriptedRunne
         stdout=f"Version: {step2.DS_VERSION_DEB if version_ok else '9.0.0-1'}\n",
     )
     version_stdout = "deepstream-app version 9.1.0\nDeepStreamSDK 9.1.0\n" if app_version_ok else "unknown\n"
-    runner.when(lambda a: a[:1] == ("timeout",), stdout="PERF: FPS 30.0 (30.0)\nPLAYING\n")
+    runner.when(lambda a: a[:1] == ("timeout",), stdout=PERF_OK)
     runner.when(lambda a: a[:1] == ("deepstream-app",), stdout=version_stdout)
     return runner
 
@@ -699,6 +700,96 @@ def test_verify_host_fails_on_smoke_test_error(tmp_path, _sdk_paths):
     assert "smoke test failed" in result.message
 
 
+def test_v039_runtime_prompt_without_perf_is_not_frame_flow(tmp_path, _sdk_paths):
+    """Regression for the workstation transcript from release v0.3.9."""
+    sdk_dir, symlink, profile = _sdk_paths
+    runner = _host_ready_runner()
+    fixture = pathlib.Path(__file__).with_name("fixtures").joinpath(
+        "step2_v039_no_perf.txt"
+    )
+    runner.when(
+        lambda a: a[:1] == ("timeout",),
+        returncode=124,
+        stdout=fixture.read_text(encoding="utf-8"),
+    )
+    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
+    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
+
+    result = step2.Step2DeepStreamSdk().verify(ctx)
+
+    assert result.status is StepStatus.FAILED
+    assert "no positive FPS sample" in result.message
+
+
+def test_smoke_accepts_timeout_only_with_positive_fps(tmp_path):
+    runner = ScriptedRunner()
+    runner.when(
+        lambda a: a[:1] == ("timeout",),
+        returncode=124,
+        stdout="**PERF: FPS 0 (Avg)\n**PERF: 0.0 (0.0)\n",
+    )
+    ctx = FakeContext(tmp_path, runner_root=runner)
+
+    passed, message = step2._run_smoke_test(ctx, docker=False)
+
+    assert passed is False
+    assert "no positive FPS sample" in message
+
+
+@pytest.mark.parametrize("returncode", [1, 125, 137])
+def test_smoke_rejects_non_success_exit_even_with_positive_fps(tmp_path, returncode):
+    runner = ScriptedRunner()
+    runner.when(
+        lambda a: a[:1] == ("timeout",),
+        returncode=returncode,
+        stdout=PERF_OK,
+    )
+    ctx = FakeContext(tmp_path, runner_root=runner)
+
+    passed, _ = step2._run_smoke_test(ctx, docker=False)
+
+    assert passed is False
+
+
+def test_host_smoke_uses_bounded_line_buffered_command(tmp_path):
+    runner = ScriptedRunner()
+    runner.when(lambda a: a[:1] == ("timeout",), returncode=124, stdout=PERF_OK)
+    ctx = FakeContext(tmp_path, runner_root=runner)
+
+    passed, _ = step2._run_smoke_test(ctx, docker=False)
+
+    assert passed is True
+    smoke_call = next(call for call in runner.calls if call[:1] == ("timeout",))
+    assert smoke_call[:9] == (
+        "timeout",
+        "--signal=INT",
+        "--kill-after=5s",
+        "30s",
+        "stdbuf",
+        "-oL",
+        "-eL",
+        "deepstream-app",
+        "-c",
+    )
+
+
+def test_smoke_assets_pin_loop_perf_tracker_and_batch_one_engine():
+    assets = (
+        pathlib.Path(step2.__file__).resolve().parents[1] / "assets" / "deepstream"
+    )
+    app_config = (assets / "smoke_app_config.txt").read_text(encoding="utf-8")
+    infer_config = (assets / "smoke_infer_config.txt").read_text(encoding="utf-8")
+
+    assert "perf-measurement-interval-sec=1" in app_config
+    assert "file-loop=1" in app_config
+    assert "ll-config-file=" in app_config
+    assert "config_tracker_IOU.yml" in app_config
+    assert "config-file=smoke_infer_config.txt" in app_config
+    assert "onnx_b1_gpu0_fp16.engine" in infer_config
+    assert "_b30_" not in infer_config
+    assert "batch-size=1" in infer_config
+
+
 @pytest.mark.parametrize("phrase", ["open error", "OPEN ERROR"])
 def test_verify_host_passes_when_warning_prose_contains_open_error(
     tmp_path, _sdk_paths, phrase
@@ -708,7 +799,7 @@ def test_verify_host_passes_when_warning_prose_contains_open_error(
     runner.when(
         lambda a: a[:1] == ("timeout",),
         returncode=124,
-        stdout="Successfully loaded model engine\nPLAYING\nPERF: FPS 30.0 (30.0)\n",
+        stdout=f"Successfully loaded model engine\n{PERF_OK}",
         stderr=(
             "WARNING: Deserialize engine failed because file path "
             f"model.engine {phrase}\n"
@@ -730,7 +821,7 @@ def test_verify_host_fails_on_error_diagnostic_after_pipeline_started(
     runner.when(
         lambda a: a[:1] == ("timeout",),
         returncode=124,
-        stdout="PLAYING\nPERF: FPS 30.0 (30.0)\n",
+        stdout=PERF_OK,
         stderr="** ERROR: <pipeline> streaming stopped unexpectedly\n",
     )
     ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
@@ -757,7 +848,7 @@ def test_verify_host_fails_on_prefixed_error_diagnostic(
     runner.when(
         lambda a: a[:1] == ("timeout",),
         returncode=124,
-        stdout="PLAYING\nPERF: FPS 30.0 (30.0)\n",
+        stdout=PERF_OK,
         stderr=diagnostic,
     )
     ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
@@ -839,7 +930,7 @@ def test_verify_docker_passes_end_to_end(tmp_path):
     )
     runner_user.when(
         lambda a: a[:2] == ("docker", "run") and "timeout" in a,
-        stdout="PERF: FPS 30.0\nPLAYING\n",
+        stdout=PERF_OK,
     )
     runner_user.when(lambda a: a[:2] == ("docker", "info"), stdout="Runtimes: nvidia runc\n")
     ctx = FakeContext(
@@ -854,6 +945,27 @@ def test_verify_docker_passes_end_to_end(tmp_path):
     result = step.verify(ctx)
 
     assert result.status is StepStatus.COMPLETE
+
+
+def test_docker_smoke_line_buffers_inside_mounted_workdir(tmp_path):
+    runner = ScriptedRunner()
+    runner.when(
+        lambda a: a[:2] == ("docker", "run"),
+        returncode=124,
+        stdout=PERF_OK,
+    )
+    ctx = FakeContext(tmp_path, runner_user=runner)
+
+    passed, _ = step2._run_smoke_test(ctx, docker=True)
+
+    assert passed is True
+    call = runner.calls[0]
+    assert call[:4] == ("docker", "run", "--rm", "--gpus")
+    workdir_index = call.index("-w")
+    assert ("-w", "/tmp/mv3dt-smoke") == call[workdir_index : workdir_index + 2]
+    assert ("stdbuf", "-oL", "-eL") == call[
+        call.index("stdbuf") : call.index("stdbuf") + 3
+    ]
 
 
 def test_verify_unrecognized_method_is_failed(tmp_path):
@@ -950,7 +1062,7 @@ def test_full_lifecycle_all_pass_is_complete(tmp_path, _sdk_paths):
         lambda a: a[:2] == ("dpkg", "-s") and a[-1] == "deepstream-9.1",
         stdout=f"Version: {step2.DS_VERSION_DEB}\n",
     )
-    runner_root.when(lambda a: a[:1] == ("timeout",), stdout="PERF: FPS 30.0\nPLAYING\n")
+    runner_root.when(lambda a: a[:1] == ("timeout",), stdout=PERF_OK)
     runner_root.when(lambda a: a[:1] == ("deepstream-app",), stdout="deepstream-app version 9.1.0\n")
 
     ngc = FakeNgc()
