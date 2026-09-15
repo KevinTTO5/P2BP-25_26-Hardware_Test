@@ -2243,6 +2243,42 @@ def test_follow_apt_collapses_retrieval_countdown_but_keeps_file_transitions():
     assert "remaining)" not in rendered
 
 
+@pytest.mark.parametrize(
+    "duration",
+    ["15s", "2min 15s", "1h 2min 15s", "1d 1h 2min 15s"],
+)
+def test_follow_apt_collapses_apt_duration_variants(duration):
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+
+    outcome = progress.follow_apt(
+        _apt_stream(
+            [f"dlstatus:1:10.0:Retrieving file 2 of 6 ({duration} remaining)"],
+            clock,
+        ),
+        renderer=bar,
+        clock=clock,
+    )
+
+    assert _window_rows(out) == ["Retrieving file 2 of 6"]
+    assert outcome.description == "Retrieving file 2 of 6"
+
+
+def test_follow_apt_retains_non_duration_retrieval_parentheses():
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+    description = "Retrieving file 2 of 6 (checksum verification remaining)"
+
+    outcome = progress.follow_apt(
+        _apt_stream([f"dlstatus:1:10.0:{description}"], clock),
+        renderer=bar,
+        clock=clock,
+    )
+
+    assert _window_rows(out) == [description]
+    assert outcome.description == description
+
+
 def test_follow_apt_does_not_normalise_pmstatus_parentheses():
     out, clock = FakeTty(), FakeClock()
     bar = _apt_progress(clock, out)

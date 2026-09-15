@@ -1188,7 +1188,9 @@ _APT_MAX_ITEM_FIELDS = 3
 # a new event. Keep the file transition and discard only this exact dlstatus
 # suffix; package status/error parentheses remain operator evidence.
 _APT_RETRIEVAL_ETA = re.compile(
-    r"^(Retrieving file \d+ of \d+)\s+\([^()]+ remaining\)$"
+    r"^(Retrieving file \d+ of \d+)\s+\("
+    r"(?:\d+d \d+h \d+min \d+s|\d+h \d+min \d+s|\d+min \d+s|\d+s)"
+    r" remaining\)$"
 )
 
 
