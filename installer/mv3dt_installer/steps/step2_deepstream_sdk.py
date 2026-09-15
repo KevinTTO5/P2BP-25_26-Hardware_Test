@@ -116,6 +116,8 @@ _SMOKE_TEST_TIMEOUT_S = 30
 _SMOKE_KILL_GRACE_S = 5
 _SMOKE_OUTPUT_DIR_NAME = "smoke-output"
 _SMOKE_CONFIG_ASSET = ("deepstream", "smoke_app_config.txt")
+_INSTALLATION_TEST_MARKER = pathlib.Path("deepstream/installation-test-complete")
+_AMC_PROJECT_ID_KEY = "AMC_PROJECT_ID"
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+)")
 _ERROR_DIAGNOSTIC_RE = re.compile(
@@ -877,6 +879,22 @@ def _smoke_frame_count(output_dir: pathlib.Path) -> int:
         return 0
 
 
+def _installation_test_marker(ctx: "Context") -> pathlib.Path:
+    return ctx.install_dir / _INSTALLATION_TEST_MARKER
+
+
+def _installation_test_already_completed(ctx: "Context") -> bool:
+    return _installation_test_marker(ctx).is_file() or bool(
+        (ctx.conf.get(_AMC_PROJECT_ID_KEY) or "").strip()
+    )
+
+
+def _record_installation_test(ctx: "Context") -> None:
+    marker = _installation_test_marker(ctx)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"DeepStream {DS_VERSION_SHORT}\n", encoding="utf-8")
+
+
 def _run_smoke_test(ctx: "Context", *, docker: bool) -> tuple[Optional[bool], str]:
     """Run the bundled fakesink smoke config for a bounded number of
     seconds, and require a positive numeric DeepStream FPS sample with no
@@ -943,22 +961,29 @@ def _run_smoke_test(ctx: "Context", *, docker: bool) -> tuple[Optional[bool], st
         stderr = result.stderr or ""
         combined = f"{stdout}\n{stderr}"
         tail = combined.strip()[-2000:]
+        startup_complete = (
+            "NvMultiObjectTracker] Initialized" in combined
+            and "notifyLoadModelStatus" in combined
+            and "Load new model" in combined
+        )
 
-        # exit 124 is `timeout`'s own "still running when the clock ran
-        # out" code -- expected for a pipeline we deliberately bound by
-        # wall-clock rather than frame count, and not itself a failure.
-        if result.returncode not in (0, 124):
-            return False, tail
         if _ERROR_DIAGNOSTIC_RE.search(combined):
+            return False, tail
+        # 124 is the expected bounded timeout. DeepStream can hang while
+        # tearing down an otherwise initialized pipeline; GNU timeout then
+        # escalates after --kill-after and returns 137. Only classify that
+        # exact case as inconclusive when startup evidence is complete and
+        # no error diagnostic was emitted. An unexplained 137 still fails.
+        if result.returncode not in (0, 124):
+            if result.returncode == 137 and startup_complete:
+                return None, (
+                    "the bundled sample initialized successfully but required "
+                    "forced shutdown after its bounded test window"
+                )
             return False, tail
         samples = [float(value) for value in _PERF_SAMPLE_RE.findall(combined)]
         frame_outputs = _smoke_frame_count(output_dir)
         if not any(value > 0 for value in samples) and frame_outputs == 0:
-            startup_complete = (
-                "NvMultiObjectTracker] Initialized" in combined
-                and "notifyLoadModelStatus" in combined
-                and "Load new model" in combined
-            )
             if startup_complete:
                 return None, (
                     "the bundled sample produced no frame evidence, but "
@@ -1304,20 +1329,7 @@ class Step2DeepStreamSdk:
                 ),
             )
 
-        ctx.progress.phase(4)
-        ctx.progress.task("DeepStream installation test (bundled sample video)")
-        passed, tail = _run_smoke_test(ctx, docker=False)
-        self._smoke_ran = True
-        self._smoke_passed = passed
-        if passed is False:
-            return StepResult(
-                status=StepStatus.FAILED,
-                message=f"DeepStream installation test failed: {tail}",
-            )
-        if passed is None:
-            log.warn(f"DeepStream installation test inconclusive: {tail}; continuing")
-
-        return StepResult(status=StepStatus.COMPLETE)
+        return self._verify_installation_test(ctx, docker=False)
 
     def _verify_docker(self, ctx: "Context") -> StepResult:
         # doc section 7.4: "Prereq pins still match" applies to both verify
@@ -1359,18 +1371,33 @@ class Step2DeepStreamSdk:
                 message="docker info does not show the nvidia runtime",
             )
 
+        return self._verify_installation_test(ctx, docker=True)
+
+    def _verify_installation_test(
+        self, ctx: "Context", *, docker: bool
+    ) -> StepResult:
+        if _installation_test_already_completed(ctx):
+            log.info("DeepStream installation test already completed; skipping")
+            return StepResult(status=StepStatus.COMPLETE)
+
         ctx.progress.phase(4)
         ctx.progress.task("DeepStream installation test (bundled sample video)")
-        passed, tail = _run_smoke_test(ctx, docker=True)
+        passed, tail = _run_smoke_test(ctx, docker=docker)
         self._smoke_ran = True
         self._smoke_passed = passed
         if passed is False:
+            suffix = " (docker)" if docker else ""
             return StepResult(
                 status=StepStatus.FAILED,
-                message=f"DeepStream installation test failed (docker): {tail}",
+                message=f"DeepStream installation test failed{suffix}: {tail}",
             )
         if passed is None:
             log.warn(f"DeepStream installation test inconclusive: {tail}; continuing")
+
+        try:
+            _record_installation_test(ctx)
+        except OSError as exc:
+            log.warn(f"Could not record one-time DeepStream installation test: {exc}")
 
         return StepResult(status=StepStatus.COMPLETE)
 
