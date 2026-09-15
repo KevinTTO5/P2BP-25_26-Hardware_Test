@@ -71,8 +71,12 @@ __all__ = ["Method", "detect_method", "Step2DeepStreamSdk"]
 DRIVER_VERSION = "595.58.03"
 CUDA_VERSION = "13.2"
 CUDNN_VERSION = "9.20.0.48"
+CUDNN_APT_VERSION = f"{CUDNN_VERSION}-1"
 TENSORRT_VERSION = "10.16.0.72-1+cuda13.2"
 GSTREAMER_VERSION = "1.24.2"
+CUDA_HOME = f"/usr/local/cuda-{CUDA_VERSION}"
+CUDA_NVCC_PATH = f"{CUDA_HOME}/bin/nvcc"
+CUDNN_QUERY_PACKAGE = "libcudnn9-cuda-13"
 
 DS_VERSION_DEB = "9.1.0-1"  # dpkg Version field.
 DS_VERSION_SHORT = "9.1.0"  # tar/docker normalized version.
@@ -342,7 +346,7 @@ def _probe_driver(ctx: "Context") -> Optional[str]:
 
 
 def _probe_cuda(ctx: "Context") -> Optional[str]:
-    result = _run_root(ctx, "nvcc", "--version")
+    result = _run_root(ctx, CUDA_NVCC_PATH, "--version")
     if result.returncode != 0:
         return None
     match = re.search(r"release (\d+\.\d+)", result.stdout or "")
@@ -350,13 +354,15 @@ def _probe_cuda(ctx: "Context") -> Optional[str]:
 
 
 def _probe_cudnn(ctx: "Context") -> Optional[str]:
-    # dpkg-query supports package-name globbing without a shell, matching
-    # doc section 2 point 2's "dpkg -l | grep libcudnn9" intent.
-    result = _run_root(ctx, "dpkg-query", "-W", "-f=${Version}", "libcudnn9*")
+    result = _run_root(
+        ctx, "dpkg-query", "-W", "-f=${Version}", CUDNN_QUERY_PACKAGE
+    )
     if result.returncode != 0:
         return None
-    first_line = (result.stdout or "").strip().splitlines()
-    return first_line[0].strip() if first_line else None
+    raw = (result.stdout or "").strip() or None
+    if raw == CUDNN_APT_VERSION:
+        return CUDNN_VERSION
+    return raw
 
 
 def _probe_tensorrt(ctx: "Context") -> Optional[str]:

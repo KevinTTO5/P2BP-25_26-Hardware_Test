@@ -60,8 +60,11 @@ runtime facts because a step must not trust prior state blindly.
    these are Step 1's deliverables, re-checked as *inputs* here:
    - NVIDIA driver `595.58.03`
      (`nvidia-smi --query-gpu=driver_version --format=csv,noheader`)
-   - CUDA `13.2` (`nvcc --version` release)
-   - cuDNN `9.20.0.48` (`dpkg -l | grep libcudnn9`)
+   - CUDA `13.2`
+     (`/usr/local/cuda-13.2/bin/nvcc --version` release)
+   - cuDNN `9.20.0.48` (`dpkg-query -W -f='${Version}'
+     libcudnn9-cuda-13` reports the exact apt pin `9.20.0.48-1`, normalized
+     to the human-facing DeepStream pin only on that exact match)
    - TensorRT `10.16.0.72-1+cuda13.2` (`dpkg -s libnvinfer10`)
    - GStreamer `1.24.2` (`gst-inspect-1.0 --version`)
    Any mismatch → `FAILED` with remediation "re-run Step 1"
@@ -400,8 +403,10 @@ Step 1).
 
 ### 7.4 `verify()` checklist (summary)
 
-- [ ] Prereq pins still match (driver/CUDA/cuDNN/TRT/GStreamer) — else the
-      DS runtime loader would refuse to start.
+- [ ] Prereq pins still match (driver/CUDA/cuDNN/TRT/GStreamer) — including
+      CUDA through `/usr/local/cuda-13.2/bin/nvcc` and cuDNN through the
+      concrete `libcudnn9-cuda-13` package at `9.20.0.48-1` — else the DS
+      runtime loader would refuse to start.
 - [ ] DS SDK present at the fixed path (deb/tar) **or** image present (docker).
 - [ ] `verify_pinned("DeepStream", actual, "9.1.0-1"/"9.1.0")` passes.
 - [ ] `deepstream-app --version-all` reports 9.1.

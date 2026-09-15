@@ -44,6 +44,12 @@ def _force_no_colour(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _supported_arch(monkeypatch):
+    """Exercise the supported workstation architecture on every dev host."""
+    monkeypatch.setattr(step2.platform, "machine", lambda: "x86_64")
+
+
+@pytest.fixture(autouse=True)
 def _sdk_paths(tmp_path, monkeypatch):
     """Point every fixed filesystem constant at a scratch tree so a bug in
     the code under test can never touch /opt/nvidia or /etc/profile.d."""
@@ -171,10 +177,14 @@ def _passing_pin_runner() -> ScriptedRunner:
     with the pinned value."""
     runner = ScriptedRunner()
     runner.when(lambda a: a[:1] == ("nvidia-smi",), stdout="595.58.03\n")
-    runner.when(lambda a: a[:1] == ("nvcc",), stdout="Cuda compilation tools, release 13.2, V13.2.1\n")
     runner.when(
-        lambda a: a[:2] == ("dpkg-query", "-W") and a[-1] == "libcudnn9*",
-        stdout="9.20.0.48\n",
+        lambda a: a[:1] == (step2.CUDA_NVCC_PATH,),
+        stdout="Cuda compilation tools, release 13.2, V13.2.1\n",
+    )
+    runner.when(
+        lambda a: a[:2] == ("dpkg-query", "-W")
+        and a[-1] == step2.CUDNN_QUERY_PACKAGE,
+        stdout=f"{step2.CUDNN_APT_VERSION}\n",
     )
     runner.when(
         lambda a: a[:2] == ("dpkg-query", "-W") and a[-1] == "libnvinfer10",
@@ -474,6 +484,50 @@ def test_run_docker_success_reports_installed(tmp_path):
 # ---------------------------------------------------------------------------
 # preflight() -- doc section 2 / 12
 # ---------------------------------------------------------------------------
+
+
+def test_prereq_probe_uses_absolute_cuda_path_and_concrete_cudnn_package(tmp_path):
+    runner = _passing_pin_runner()
+    ctx = FakeContext(tmp_path, runner_root=runner)
+
+    result = step2.Step2DeepStreamSdk().preflight(ctx)
+
+    assert result.status is StepStatus.COMPLETE
+    assert (step2.CUDA_NVCC_PATH, "--version") in runner.calls
+    assert (
+        "dpkg-query",
+        "-W",
+        "-f=${Version}",
+        step2.CUDNN_QUERY_PACKAGE,
+    ) in runner.calls
+    assert not runner.called_with_prefix("nvcc")
+
+
+def test_probe_cudnn_normalizes_only_the_exact_apt_pin(tmp_path):
+    runner = ScriptedRunner()
+    runner.when(
+        lambda a: a[-1] == step2.CUDNN_QUERY_PACKAGE,
+        stdout=f"{step2.CUDNN_APT_VERSION}\n",
+    )
+    ctx = FakeContext(tmp_path, runner_root=runner)
+
+    assert step2._probe_cudnn(ctx) == step2.CUDNN_VERSION
+
+
+def test_preflight_rejects_different_cudnn_debian_revision(tmp_path):
+    runner = _passing_pin_runner()
+    wrong_revision = f"{step2.CUDNN_VERSION}-2"
+    runner.when(
+        lambda a: a[-1] == step2.CUDNN_QUERY_PACKAGE,
+        stdout=f"{wrong_revision}\n",
+    )
+    ctx = FakeContext(tmp_path, runner_root=runner)
+
+    result = step2.Step2DeepStreamSdk().preflight(ctx)
+
+    assert result.status is StepStatus.FAILED
+    assert "cuDNN" in result.message
+    assert wrong_revision in result.message
 
 
 def test_preflight_fails_on_prereq_pin_mismatch(tmp_path):
