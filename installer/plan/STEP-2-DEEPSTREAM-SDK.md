@@ -405,8 +405,13 @@ Quickstart. Sample configs live under
   minimal sample config with the display `[sink0]` set to `type=1`
   (fakesink) / `enable-perf-measurement=1`, run for a bounded number of
   frames, and assert the app reaches PLAYING and emits perf/FPS output
-  without error, then exits 0. This avoids requiring X/Wayland while still
-  exercising decode + nvinfer (TensorRT) + tracker on the real GPU.
+  without a DeepStream or GStreamer error-severity diagnostic, then exits 0
+  or the bounded run's timeout code. This includes GStreamer's prefixed
+  `ERROR` severity field and DeepStream's `ERROR:`, `ERROR from`, and
+  `[ERROR]` forms. Warning prose that contains the word `error` (for example,
+  TensorRT reporting an engine-cache open miss before rebuilding it) is not
+  itself a failure. This avoids requiring X/Wayland while still exercising
+  decode + nvinfer (TensorRT) + tracker on the real GPU.
 - Docker: the same smoke config is run inside the container with
   `--gpus all` and a fakesink; success criteria identical.
 - The smoke config is a bundled asset (doc 00 §4.2, `ctx.asset_path(...)`),

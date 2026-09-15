@@ -699,6 +699,76 @@ def test_verify_host_fails_on_smoke_test_error(tmp_path, _sdk_paths):
     assert "smoke test failed" in result.message
 
 
+@pytest.mark.parametrize("phrase", ["open error", "OPEN ERROR"])
+def test_verify_host_passes_when_warning_prose_contains_open_error(
+    tmp_path, _sdk_paths, phrase
+):
+    sdk_dir, symlink, profile = _sdk_paths
+    runner = _host_ready_runner()
+    runner.when(
+        lambda a: a[:1] == ("timeout",),
+        returncode=124,
+        stdout="Successfully loaded model engine\nPLAYING\nPERF: FPS 30.0 (30.0)\n",
+        stderr=(
+            "WARNING: Deserialize engine failed because file path "
+            f"model.engine {phrase}\n"
+        ),
+    )
+    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
+    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
+
+    result = step2.Step2DeepStreamSdk().verify(ctx)
+
+    assert result.status is StepStatus.COMPLETE
+
+
+def test_verify_host_fails_on_error_diagnostic_after_pipeline_started(
+    tmp_path, _sdk_paths
+):
+    sdk_dir, symlink, profile = _sdk_paths
+    runner = _host_ready_runner()
+    runner.when(
+        lambda a: a[:1] == ("timeout",),
+        returncode=124,
+        stdout="PLAYING\nPERF: FPS 30.0 (30.0)\n",
+        stderr="** ERROR: <pipeline> streaming stopped unexpectedly\n",
+    )
+    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
+    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
+
+    result = step2.Step2DeepStreamSdk().verify(ctx)
+
+    assert result.status is StepStatus.FAILED
+    assert "smoke test failed" in result.message
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "0:00:01.234567890 1234 0x7f00 ERROR GST_PIPELINE pipeline failed\n",
+        "[ERROR] DeepStream pipeline failed\n",
+    ],
+)
+def test_verify_host_fails_on_prefixed_error_diagnostic(
+    tmp_path, _sdk_paths, diagnostic
+):
+    sdk_dir, symlink, profile = _sdk_paths
+    runner = _host_ready_runner()
+    runner.when(
+        lambda a: a[:1] == ("timeout",),
+        returncode=124,
+        stdout="PLAYING\nPERF: FPS 30.0 (30.0)\n",
+        stderr=diagnostic,
+    )
+    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
+    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
+
+    result = step2.Step2DeepStreamSdk().verify(ctx)
+
+    assert result.status is StepStatus.FAILED
+    assert "smoke test failed" in result.message
+
+
 def test_verify_host_passes_end_to_end(tmp_path, _sdk_paths):
     sdk_dir, symlink, profile = _sdk_paths
     runner = _host_ready_runner()
