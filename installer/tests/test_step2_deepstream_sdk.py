@@ -12,9 +12,11 @@ socket -- every `ctx.run_root`/`ctx.run_as_user` call is served by a
 
 from __future__ import annotations
 
+import hashlib
 import pathlib
 import subprocess
 import sys
+import zipfile
 from types import SimpleNamespace
 
 import pytest
@@ -950,7 +952,7 @@ def test_ensure_peoplenet_writes_labels_when_onnx_present_but_labels_missing(tmp
     assert labels_path.read_text(encoding="utf-8") == "person\nbag\nface\n"
 
 
-def test_ensure_peoplenet_user_action_required_when_ngc_cli_missing(tmp_path):
+def test_ensure_peoplenet_user_action_required_when_ngc_cli_download_fails(tmp_path):
     runner_user = ScriptedRunner(default_returncode=1)  # `which ngc` -> not found
     ctx = FakeContext(tmp_path, runner_user=runner_user)
 
@@ -960,7 +962,95 @@ def test_ensure_peoplenet_user_action_required_when_ngc_cli_missing(tmp_path):
     assert result.status is StepStatus.USER_ACTION_REQUIRED
     assert "NGC CLI" in result.message
     assert result.user_actions
-    assert "ngc config set" in result.user_actions[0].text
+    assert "installer will verify and configure it" in result.user_actions[0].text
+    assert "ngc config set" not in result.user_actions[0].text
+
+
+def _write_ngc_cli_archive(path, *, member="ngc-cli/ngc"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as bundle:
+        bundle.writestr(member, b"#!/bin/sh\n")
+
+
+def test_ensure_ngc_cli_downloads_verifies_and_installs(tmp_path, monkeypatch):
+    runner_user = ScriptedRunner(default_returncode=1)
+    ctx = FakeContext(tmp_path, runner_user=runner_user)
+    archive = (
+        ctx.install_dir
+        / step2.NGC_CLI_DOWNLOAD_RELATIVE_DIR
+        / step2.NGC_CLI_ARCHIVE
+    )
+
+    def _download():
+        _write_ngc_cli_archive(archive)
+
+    runner_user.when(
+        lambda a: a[:2] == ("curl", "-fsSL"),
+        returncode=0,
+        side_effect=_download,
+    )
+    _download()
+    expected_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
+    archive.unlink()
+    monkeypatch.setattr(step2, "NGC_CLI_SHA256", expected_hash)
+
+    ngc_path, failure = step2._ensure_ngc_cli(ctx)
+
+    assert failure is None
+    assert ngc_path == str(
+        ctx.install_dir / step2.NGC_CLI_INSTALL_RELATIVE_DIR / "ngc"
+    )
+    assert pathlib.Path(ngc_path).is_file()
+    assert pathlib.Path(ngc_path).stat().st_mode & 0o111
+    assert runner_user.called_with_prefix("curl", "-fsSL")
+
+
+def test_ensure_ngc_cli_reuses_managed_install_without_download(tmp_path):
+    runner_user = ScriptedRunner(default_returncode=1)
+    ctx = FakeContext(tmp_path, runner_user=runner_user)
+    binary = ctx.install_dir / step2.NGC_CLI_INSTALL_RELATIVE_DIR / "ngc"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+
+    ngc_path, failure = step2._ensure_ngc_cli(ctx)
+
+    assert failure is None
+    assert ngc_path == str(binary)
+    assert not runner_user.called_with_prefix("curl")
+
+
+def test_ensure_ngc_cli_rejects_bad_download_checksum(tmp_path):
+    runner_user = ScriptedRunner(default_returncode=1)
+    ctx = FakeContext(tmp_path, runner_user=runner_user)
+    archive = (
+        ctx.install_dir
+        / step2.NGC_CLI_DOWNLOAD_RELATIVE_DIR
+        / step2.NGC_CLI_ARCHIVE
+    )
+    runner_user.when(
+        lambda a: a[:2] == ("curl", "-fsSL"),
+        returncode=0,
+        side_effect=lambda: _write_ngc_cli_archive(archive),
+    )
+
+    ngc_path, failure = step2._ensure_ngc_cli(ctx)
+
+    assert ngc_path is None
+    assert failure is not None
+    assert failure.status is StepStatus.FAILED
+    assert "checksum mismatch" in failure.message
+    assert not archive.exists()
+
+
+def test_extract_ngc_cli_rejects_path_traversal(tmp_path):
+    archive = tmp_path / "ngc.zip"
+    _write_ngc_cli_archive(archive, member="ngc-cli/../../escaped")
+
+    with pytest.raises(ValueError, match="unsafe NGC CLI archive member"):
+        step2._extract_ngc_cli(archive, tmp_path / "tools" / "ngc-cli")
+
+    assert not (tmp_path / "escaped").exists()
 
 
 def test_ensure_peoplenet_downloads_and_places_model(tmp_path):

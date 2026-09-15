@@ -291,13 +291,29 @@ method was chosen.
   `laptop/config/laptop.env.example`'s `PEOPLENET_NGC_TAG` pins.
 - **Idempotency:** skipped entirely if `resnet34_peoplenet.onnx` already
   exists non-empty at the target location.
-- **Procedure, as the invoking user (doc 00 §9.2 — `ngc`, like `docker` and
-  the AMC clone, must never run unwrapped as root):**
-  1. `which ngc` — if absent, `USER_ACTION_REQUIRED` with manual NGC CLI
-     install instructions (mirrors `00_bootstrap.sh` Phase 5's banner; this
-     installer does not auto-install the NGC CLI itself).
-  2. `ctx.ngc.configure_ngc_cli()` (doc 00 §10.2) writes `~/.ngc/config`.
-  3. `ngc registry model download-version <tag> --dest <tmp>` into a
+- **NGC CLI:** use an existing `ngc` on `PATH`; otherwise download NVIDIA's
+  AMD64 Linux NGC CLI `4.10.0` archive to
+  `<install_dir>/downloads/ngc/`, verify its pinned SHA-256 digest, and
+  extract it atomically to `<install_dir>/tools/ngc-cli-4.10.0/`. The
+  installer invokes the managed binary by absolute path, so it does not
+  modify `.bashrc`, `.profile`, or `/usr/local`.
+
+  | Pin | Value |
+  |-----|-------|
+  | Version | `4.10.0` |
+  | Platform | AMD64 Linux |
+  | Archive | `ngccli_linux-4.10.0.zip` |
+  | SHA-256 | `3e1d3ab23e5b4e8ffc704bf1da4c775a1d68d7bdf8f6d7101b4c85da604d1a58` |
+- **Procedure, as the invoking user ([`00` §9.2](00-FRAMEWORK-AND-BOOTSTRAP.md#92-running-as-the-invoking-user) —
+  `ngc`, like `docker` and the AMC clone, must never run unwrapped as root):**
+  1. Resolve an existing `ngc` on `PATH`, or install the pinned managed CLI
+     described above. A network failure is `USER_ACTION_REQUIRED` with the
+     exact offline archive-placement path; extraction or checksum failure is
+     `FAILED`.
+  2. `ctx.ngc.configure_ngc_cli()` ([`00` §10.2](00-FRAMEWORK-AND-BOOTSTRAP.md#102-capture-and-write))
+     writes `~/.ngc/config` from the API key captured during onboarding. No
+     interactive `ngc config set` call or second key prompt occurs.
+  3. `<resolved-ngc-path> registry model download-version <tag> --dest <tmp>` into a
      throwaway directory chowned to the invoking user, then copy every file
      under the one versioned subdirectory NGC creates into the target
      location.
@@ -536,7 +552,8 @@ and later steps.
 | Ambiguous method, `--non-interactive` | proceed with **deb** default |
 | deb/tar/docker install + post-install + smoke all pass | `COMPLETE` |
 | Smoke test or version pin fails | `FAILED` (with captured stderr tail) |
-| NGC CLI (`ngc`) not on `PATH` | `USER_ACTION_REQUIRED` (manual NGC CLI install, §5.4) |
+| NGC CLI absent and automatic download fails | `USER_ACTION_REQUIRED` (offline archive placement, §5.4) |
+| NGC CLI checksum, extraction, or automatic configuration fails | `FAILED` (§5.4) |
 | `ngc registry model download-version` fails (bad tag, auth) | `USER_ACTION_REQUIRED` (§5.4) |
 | Download succeeds but produces no versioned subdirectory | `FAILED` (unexpected NGC output shape, not operator-actionable, §5.4) |
 | PeopleNet model missing at `verify()` | `FAILED` (re-run Step 2, §5.4) |
@@ -556,8 +573,9 @@ SDK install needs no reboot on top of Step 1's driver reboot.
   to `nvcr.io` by hand, re-run (§5.2).
 - **Method choice** (ambiguous auto-detect, interactive) — pick deb/tar/docker
   from the three descriptions (§4).
-- **Manual NGC CLI install** (`ngc` not on `PATH`) — install it as the
-  invoking user, run `ngc config set`, re-run (§5.4).
+- **Offline NGC CLI archive placement** (automatic fetch failed) — place the
+  pinned AMD64 Linux archive in `<install_dir>/downloads/ngc/`; the installer
+  verifies, extracts, and configures it on re-run (§5.4).
 - **Check `peoplenet_ngc_tag` / NGC auth** (`ngc registry model
   download-version` failed) — re-run once the tag/auth issue is fixed
   (§5.4).
@@ -589,6 +607,12 @@ DeepStream **9.1** official documentation. DS 9.1 only.
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Release_notes.html>
 - NVIDIA/DeepStream GitHub Releases (deb/tar distribution, v9.1.0):
   <https://github.com/NVIDIA/DeepStream/releases/tag/v9.1.0>
+- NVIDIA VSS prerequisites — supported NGC CLI `4.10.0` AMD64 Linux archive,
+  installation layout, and version verification:
+  <https://docs.nvidia.com/vss/latest/warehouse-docs/Prerequisites.html#install-ngc-cli>
+- NVIDIA NGC Catalog User Guide — personal/service API keys can authenticate
+  model downloads directly, and API keys must be handled as secrets:
+  <https://docs.nvidia.com/ngc/latest/ngc-catalog-user-guide.html>
 
 Repo files referenced:
 
