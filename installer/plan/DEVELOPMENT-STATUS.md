@@ -15,8 +15,8 @@ connected across the step modules.** A reader who finds `report.py` can
 reasonably conclude the diagnostic work is done. It is not.
 [Section 5](#5-what-remains) is the honest list.
 
-Current release: **v0.4.0**. Current version string:
-`installer/mv3dt_installer/__init__.py` `__version__ = "0.4.0"`.
+Current release: **v0.4.1**. Current version string:
+`installer/mv3dt_installer/__init__.py` `__version__ = "0.4.1"`.
 
 ---
 
@@ -71,7 +71,7 @@ python3 -m pytest tests/ -q
 Current result on an **arm64 macOS** development machine:
 
 ```
-1 failed, 1317 passed, 7 skipped
+1 failed, 1321 passed, 7 skipped
 ```
 
 **The single failure is environmental, not a regression (REQUIRED to know
@@ -97,7 +97,7 @@ and register into `STEP_REGISTRY` at import.
 | Step | Module | Lines | Tests | Spec |
 |---|---|---|---|---|
 | 1 | `step1_prerequisites.py` | 1536 | 76 | [`STEP-1`](STEP-1-PREREQUISITES.md) |
-| 2 | `step2_deepstream_sdk.py` | 1321 | 76 | [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) |
+| 2 | `step2_deepstream_sdk.py` | 1398 | 79 | [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) |
 | 3 | `step3_amc_launcher.py` | 1652 | 91 | [`STEP-3`](STEP-3-AMC-LAUNCHER.md) |
 | 4 | `step4_calib_output_wiring.py` | 963 | 43 | [`STEP-4`](STEP-4-CALIB-OUTPUT-WIRING.md) |
 | 5 | `step5_per_project_exes.py` | 1578 | 69 | [`STEP-5`](STEP-5-PER-PROJECT-EXES.md) |
@@ -220,7 +220,12 @@ calibration result:
 
 - Step 2 uses deterministic looped input, a batch-one inference engine and
   tracker configuration, and requires a positive numeric FPS value before
-  its DeepStream smoke test passes.
+  its DeepStream smoke test passes. Release v0.4.1 separates that smoke test
+  from the PeopleNet phase, displays its bounded runtime as a progress bar
+  with observed detector-frame counts, and accepts per-frame inference output
+  as direct frame-flow evidence when DeepStream omits console FPS text. An
+  actual PeopleNet download uses authenticated byte, rate and ETA progress
+  when NVIDIA declares the archive size.
 - Step 3 installs Docker Engine, Compose v2 and the NVIDIA Container Toolkit
   when needed, checks out the pinned AutoMagicCalib 3.2.1 commit, validates
   container readiness, and persists the AMC location, project and API
@@ -315,7 +320,7 @@ before it needs code.
 
 For the current state to be what this document claims:
 
-- [x] `python3 -m pytest tests/ -q` from `installer/` gives 1317 passed,
+- [x] `python3 -m pytest tests/ -q` from `installer/` gives 1321 passed,
       7 skipped and exactly the one environmental failure in
       [section 2.1](#21-test-suite) on arm64 macOS.
 - [ ] `grep` for `follow_apt` and `follow_download` finds the Step 1 and
@@ -324,7 +329,7 @@ For the current state to be what this document claims:
       `phase(len(phases))` — pinned by
       `tests/test_steps_protocol.py::test_every_step_declares_phases_that_match_the_indices_it_uses`.
 - [ ] `__version__` equals the most recent `v*` tag.
-- [x] `gh pr list --state open` is empty at the v0.4.0 release cut.
+- [x] `gh pr list --state open` is empty at the v0.4.1 release cut.
 
 ---
 
@@ -349,7 +354,7 @@ Settled exclusions, carried from [`08` §11](08-PROGRESS-AND-OBSERVABILITY.md#11
 ## References
 
 Facts in this document are drawn from the repository through release
-`v0.4.0` and from the workstation install runs of `mv3dt-installer`
+`v0.4.1` and from the workstation install runs of `mv3dt-installer`
 0.1.2 through 0.1.9, which are the source of the observed-failure inventory
 in [`08` §2](08-PROGRESS-AND-OBSERVABILITY.md#2-observed-failures-this-doc-exists-to-fix).
 Test counts and the arm64 failure list were produced by running the suite,
