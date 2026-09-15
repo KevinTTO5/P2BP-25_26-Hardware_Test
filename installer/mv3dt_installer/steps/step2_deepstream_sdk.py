@@ -49,6 +49,7 @@ import re
 import shutil
 import stat
 import tempfile
+import time
 import urllib.parse
 import zipfile
 from dataclasses import dataclass
@@ -112,6 +113,8 @@ _PROFILE_D_CONTENT = (
 )
 
 _SMOKE_TEST_TIMEOUT_S = 30
+_SMOKE_KILL_GRACE_S = 5
+_SMOKE_OUTPUT_DIR_NAME = "smoke-output"
 _SMOKE_CONFIG_ASSET = ("deepstream", "smoke_app_config.txt")
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+)")
@@ -197,6 +200,19 @@ _NGC_API_DOWNLOAD_SCRIPT = (
     "\"header = \\\"Authorization: Bearer $NGC_API_KEY\\\"\" "
     "\"url = \\\"$NGC_MODEL_URL\\\"\" "
     "\"output = \\\"$NGC_MODEL_ARCHIVE\\\"\" | curl --config -"
+)
+
+# The authenticated ZIP endpoint cannot be probed by progress.content_length,
+# whose HEAD request intentionally carries no secrets. Ask curl for the final
+# response's declared length through the same stdin-config pattern as the
+# download. If NGC omits it, the download remains an honest spinner.
+_NGC_API_CONTENT_LENGTH_SCRIPT = (
+    'set -e; set -a; . "$NGC_ENV_FILE"; set +a; '
+    "printf '%s\\n' "
+    "'fail' 'location' 'silent' 'show-error' 'head' 'output = /dev/null' "
+    "'write-out = %header{content-length}' "
+    "\"header = \\\"Authorization: Bearer $NGC_API_KEY\\\"\" "
+    "\"url = \\\"$NGC_MODEL_SIZE_URL\\\"\" | curl --config -"
 )
 
 
@@ -588,6 +604,25 @@ def _download_peoplenet(
     try:
         archive = tmp_dir / _PEOPLENET_ARCHIVE_NAME
         secrets_path = ctx.install_dir / "secrets" / "ngc.env"
+        size_result = _run_as_user(
+            ctx,
+            "env",
+            f"NGC_ENV_FILE={secrets_path}",
+            f"NGC_MODEL_SIZE_URL={url}",
+            "bash",
+            "-lc",
+            _NGC_API_CONTENT_LENGTH_SCRIPT,
+            stream=False,
+        )
+        try:
+            declared_size = int((size_result.stdout or "").strip())
+        except (TypeError, ValueError):
+            declared_size = 0
+        known_total = (
+            declared_size
+            if size_result.returncode == 0 and declared_size > 0
+            else None
+        )
         result = progress_exec.download(
             ctx,
             archive,
@@ -605,6 +640,7 @@ def _download_peoplenet(
             ),
             task="PeopleNet model archive",
             probe_content_length=False,
+            known_total=known_total,
         )
         if result.returncode != 0 or not archive.is_file():
             return (
@@ -833,6 +869,14 @@ def _deepstream_app_version(ctx: "Context", *, docker: bool) -> Optional[str]:
     return result.stdout or ""
 
 
+def _smoke_frame_count(output_dir: pathlib.Path) -> int:
+    """Count direct per-frame inference evidence without trusting log text."""
+    try:
+        return sum(1 for path in output_dir.iterdir() if path.is_file())
+    except OSError:
+        return 0
+
+
 def _run_smoke_test(ctx: "Context", *, docker: bool) -> tuple[bool, str]:
     """Run the bundled fakesink smoke config for a bounded number of
     seconds, and require a positive numeric DeepStream FPS sample with no
@@ -845,28 +889,52 @@ def _run_smoke_test(ctx: "Context", *, docker: bool) -> tuple[bool, str]:
         if not config_path.is_file():
             return False, f"smoke config asset missing: {config_path}"
 
-        if docker:
-            container_config = "/tmp/mv3dt-smoke/smoke_app_config.txt"
-            result = _run_as_user(
+        output_dir = config_path.parent / _SMOKE_OUTPUT_DIR_NAME
+        output_dir.mkdir()
+
+        def run_command():
+            if docker:
+                container_config = "/tmp/mv3dt-smoke/smoke_app_config.txt"
+                return _run_as_user(
+                    ctx,
+                    "docker", "run", "--rm", "--gpus", "all",
+                    "-v", f"{config_path.parent}:/tmp/mv3dt-smoke",
+                    "-w", "/tmp/mv3dt-smoke",
+                    DOCKER_IMAGE,
+                    "timeout", "--signal=INT",
+                    f"--kill-after={_SMOKE_KILL_GRACE_S}s",
+                    f"{_SMOKE_TEST_TIMEOUT_S}s",
+                    "stdbuf", "-oL", "-eL",
+                    "deepstream-app", "-c", container_config,
+                )
+            return _run_root(
                 ctx,
-                "docker", "run", "--rm", "--gpus", "all",
-                "-v", f"{config_path.parent}:/tmp/mv3dt-smoke:ro",
-                "-w", "/tmp/mv3dt-smoke",
-                DOCKER_IMAGE,
-                "timeout", "--signal=INT", "--kill-after=5s",
-                f"{_SMOKE_TEST_TIMEOUT_S}s",
-                "stdbuf", "-oL", "-eL",
-                "deepstream-app", "-c", container_config,
-            )
-        else:
-            result = _run_root(
-                ctx,
-                "timeout", "--signal=INT", "--kill-after=5s",
+                "timeout", "--signal=INT",
+                f"--kill-after={_SMOKE_KILL_GRACE_S}s",
                 f"{_SMOKE_TEST_TIMEOUT_S}s",
                 "stdbuf", "-oL", "-eL",
                 "deepstream-app", "-c", str(config_path),
                 cwd=str(config_path.parent),
             )
+
+        observed = getattr(ctx, "run_observed", None)
+        if observed is None:
+            result = run_command()
+        else:
+            started = time.monotonic()
+            maximum_s = _SMOKE_TEST_TIMEOUT_S + _SMOKE_KILL_GRACE_S
+
+            def follow(is_running):
+                while is_running():
+                    elapsed = time.monotonic() - started
+                    frames = _smoke_frame_count(output_dir)
+                    percent = min(elapsed * 100 / maximum_s, 99.0)
+                    ctx.progress.percent(percent, f"{frames} frame outputs observed")
+                    time.sleep(0.1)
+                frames = _smoke_frame_count(output_dir)
+                ctx.progress.percent(100.0, f"{frames} frame outputs observed")
+
+            result = observed(run_command, follow)
 
         stdout = result.stdout or ""
         stderr = result.stderr or ""
@@ -881,8 +949,12 @@ def _run_smoke_test(ctx: "Context", *, docker: bool) -> tuple[bool, str]:
         if _ERROR_DIAGNOSTIC_RE.search(combined):
             return False, tail
         samples = [float(value) for value in _PERF_SAMPLE_RE.findall(combined)]
-        if not any(value > 0 for value in samples):
-            return False, "no positive FPS sample observed within the bounded run"
+        frame_outputs = _smoke_frame_count(output_dir)
+        if not any(value > 0 for value in samples) and frame_outputs == 0:
+            return False, (
+                "no positive FPS sample or detector frame output observed "
+                "within the bounded run"
+            )
 
         return True, ""
     finally:
@@ -917,6 +989,7 @@ class Step2DeepStreamSdk:
         "install method",
         "DeepStream SDK",
         "PeopleNet model",
+        "DeepStream frame flow",
     )
     order = 2
 
@@ -1215,6 +1288,8 @@ class Step2DeepStreamSdk:
                 ),
             )
 
+        ctx.progress.phase(4)
+        ctx.progress.task("DeepStream frame-flow verification")
         passed, tail = _run_smoke_test(ctx, docker=False)
         self._smoke_passed = passed
         if not passed:
@@ -1265,6 +1340,8 @@ class Step2DeepStreamSdk:
                 message="docker info does not show the nvidia runtime",
             )
 
+        ctx.progress.phase(4)
+        ctx.progress.task("DeepStream frame-flow verification")
         passed, tail = _run_smoke_test(ctx, docker=True)
         self._smoke_passed = passed
         if not passed:

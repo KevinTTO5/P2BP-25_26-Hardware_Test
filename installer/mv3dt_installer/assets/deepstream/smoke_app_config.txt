@@ -11,6 +11,7 @@
 [application]
 enable-perf-measurement=1
 perf-measurement-interval-sec=1
+gie-kitti-output-dir=smoke-output
 
 [tiled-display]
 enable=0
@@ -61,7 +62,6 @@ tracker-height=384
 ll-lib-file=/opt/nvidia/deepstream/deepstream-9.1/lib/libnvds_nvmultiobjecttracker.so
 ll-config-file=/opt/nvidia/deepstream/deepstream-9.1/samples/configs/deepstream-app/config_tracker_IOU.yml
 gpu-id=0
-enable-batch-process=1
 
 [tests]
 file-loop=1
