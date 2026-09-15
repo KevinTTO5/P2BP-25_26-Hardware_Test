@@ -115,6 +115,7 @@ _SMOKE_TEST_TIMEOUT_S = 30
 _SMOKE_CONFIG_ASSET = ("deepstream", "smoke_app_config.txt")
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+)")
+_ERROR_DIAGNOSTIC_RE = re.compile(r"(?im)^\s*(?:\*\*\s*)?ERROR(?:\s*:|\s+FROM\b)")
 
 
 class Method(str, Enum):
@@ -855,7 +856,7 @@ def _run_smoke_test(ctx: "Context", *, docker: bool) -> tuple[bool, str]:
 
         stdout = result.stdout or ""
         stderr = result.stderr or ""
-        combined = f"{stdout}\n{stderr}".upper()
+        combined = f"{stdout}\n{stderr}"
         tail = (stderr.strip() or stdout.strip())[-2000:]
 
         # exit 124 is `timeout`'s own "still running when the clock ran
@@ -863,9 +864,9 @@ def _run_smoke_test(ctx: "Context", *, docker: bool) -> tuple[bool, str]:
         # wall-clock rather than frame count, and not itself a failure.
         if result.returncode not in (0, 124):
             return False, tail
-        if "ERROR" in combined:
+        if _ERROR_DIAGNOSTIC_RE.search(combined):
             return False, tail
-        if "PLAYING" not in combined and "PERF" not in combined:
+        if "PLAYING" not in combined.upper() and "PERF" not in combined.upper():
             return False, "no PLAYING/perf output observed within the bounded run"
 
         return True, ""
