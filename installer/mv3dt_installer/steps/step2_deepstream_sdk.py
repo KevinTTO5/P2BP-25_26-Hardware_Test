@@ -42,7 +42,6 @@ below reads `ctx.non_interactive` directly rather than inferring it from
 
 from __future__ import annotations
 
-import hashlib
 import os
 import pathlib
 import platform
@@ -50,6 +49,7 @@ import re
 import shutil
 import stat
 import tempfile
+import urllib.parse
 import zipfile
 from dataclasses import dataclass
 from enum import Enum
@@ -166,20 +166,6 @@ CONF_HOST_PIPELINE_KEY = "ds_host_pipeline_required"
 CONF_PEOPLENET_TAG_KEY = "peoplenet_ngc_tag"
 PEOPLENET_NGC_TAG_DEFAULT = "nvidia/tao/peoplenet:deployable_quantized_onnx_v2.6.3"
 
-# NVIDIA's documented AMD64 Linux CLI archive.  Step 2 owns this small tool
-# because it is only needed for the PeopleNet acquisition tail; keeping it
-# below install_dir avoids mutating the operator's shell profile or replacing
-# an unrelated system-wide ngc installation.
-NGC_CLI_VERSION = "4.10.0"
-NGC_CLI_ARCHIVE = f"ngccli_linux-{NGC_CLI_VERSION}.zip"
-NGC_CLI_URL = (
-    "https://api.ngc.nvidia.com/v2/resources/nvidia/ngc-apps/ngc_cli/"
-    f"versions/{NGC_CLI_VERSION}/files/ngccli_linux.zip"
-)
-NGC_CLI_SHA256 = "3e1d3ab23e5b4e8ffc704bf1da4c775a1d68d7bdf8f6d7101b4c85da604d1a58"
-NGC_CLI_DOWNLOAD_RELATIVE_DIR = pathlib.Path("downloads") / "ngc"
-NGC_CLI_INSTALL_RELATIVE_DIR = pathlib.Path("tools") / f"ngc-cli-{NGC_CLI_VERSION}"
-
 # Relative to `ctx.install_dir` -- where `config_infer_primary.txt`'s
 # relative `onnx-file=models/peoplenet/...` / `labelfile-path=...` resolve
 # once Step 5 execs `deepstream-app` with `cwd=<install_dir>/deepstream`
@@ -190,6 +176,18 @@ PEOPLENET_LABELS_NAME = "labels.txt"
 # Fixed PeopleNet 3-class label set -- not downloaded, just written verbatim
 # (laptop/scripts/00_bootstrap.sh Phase 10, lines ~1006-1011).
 _PEOPLENET_LABELS_CONTENT = "person\nbag\nface\n"
+_PEOPLENET_ARCHIVE_NAME = "peoplenet.zip"
+
+# The key is sourced from the user-owned 0600 env file and sent to curl over
+# stdin as config.  It never appears in argv, Python source, or transcript.
+_NGC_API_DOWNLOAD_SCRIPT = (
+    'set -e; set -a; . "$NGC_ENV_FILE"; set +a; '
+    "printf '%s\\n' "
+    "'fail' 'location' 'silent' 'show-error' "
+    "\"header = \\\"Authorization: Bearer $NGC_API_KEY\\\"\" "
+    "\"url = \\\"$NGC_MODEL_URL\\\"\" "
+    "\"output = \\\"$NGC_MODEL_ARCHIVE\\\"\" | curl --config -"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -511,12 +509,10 @@ def _docker_login(ctx: "Context"):
 # ---------------------------------------------------------------------------
 # doc STEP-4 section 6.3 -- PeopleNet model acquisition
 #
-# Ported from laptop/scripts/00_bootstrap.sh Phase 10 (lines ~942-1014):
-# `ngc registry model download-version <tag> --dest <tmp>`, copy the one
-# versioned subdirectory NGC creates into place, write the fixed 3-class
-# labels.txt. Runs as the invoking user (doc 00 section 9.2 -- `ngc`, like
-# `docker` and the AMC clone, must never run unwrapped as root), same as
-# `ngc.configure_ngc_cli()`.
+# Ported from laptop/scripts/00_bootstrap.sh Phase 10 (lines ~942-1014), but
+# uses NVIDIA's authenticated model ZIP API instead of the interactive NGC
+# CLI. The API fetch runs as the invoking user (doc 00 section 9.2), and the
+# fixed 3-class labels.txt is written locally as before.
 # ---------------------------------------------------------------------------
 
 
@@ -544,155 +540,35 @@ def _write_peoplenet_labels(ctx: "Context") -> None:
         pass  # best-effort, e.g. under a non-root test process
 
 
-def _ngc_cli_download_action(ctx: "Context") -> UserAction:
-    """Offline fallback for the installer-managed NGC CLI archive."""
-    download_dir = pathlib.Path(ctx.install_dir) / NGC_CLI_DOWNLOAD_RELATIVE_DIR
-    return UserAction(
-        text=(
-            f"Download the NVIDIA NGC CLI {NGC_CLI_VERSION} AMD64 Linux "
-            f"archive, place it at {download_dir / NGC_CLI_ARCHIVE}, then "
-            "re-run this step. The installer will verify and configure it."
-        ),
-        command=f"curl -fL -o {NGC_CLI_ARCHIVE} {NGC_CLI_URL}",
-        path=str(download_dir),
-    )
-
-
-def _sha256(path: pathlib.Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _extract_ngc_cli(archive: pathlib.Path, target: pathlib.Path) -> None:
-    """Extract the pinned archive atomically after validating its layout."""
-    target.parent.mkdir(parents=True, exist_ok=True)
-    stage = pathlib.Path(tempfile.mkdtemp(prefix=".ngc-cli-", dir=target.parent))
-    try:
-        with zipfile.ZipFile(archive) as bundle:
-            for member in bundle.infolist():
-                path = pathlib.PurePosixPath(member.filename)
-                mode = member.external_attr >> 16
-                allowed_root = path.parts and (
-                    path.parts[0] == "ngc-cli" or path == pathlib.PurePosixPath("ngc-cli.md5")
-                )
-                if (
-                    path.is_absolute()
-                    or ".." in path.parts
-                    or not path.parts
-                    or not allowed_root
-                    or stat.S_ISLNK(mode)
-                ):
-                    raise ValueError(f"unsafe NGC CLI archive member: {member.filename}")
-            bundle.extractall(stage)
-
-        extracted = stage / "ngc-cli"
-        binary = extracted / "ngc"
-        if not binary.is_file():
-            raise ValueError("NGC CLI archive does not contain ngc-cli/ngc")
-        binary.chmod(0o755)
-
-        if target.exists():
-            shutil.rmtree(target)
-        os.replace(extracted, target)
-    finally:
-        shutil.rmtree(stage, ignore_errors=True)
-
-
-def _ensure_ngc_cli(ctx: "Context") -> tuple[Optional[str], Optional[StepResult]]:
-    """Return a usable NGC CLI path, installing the pinned CLI if absent."""
-    discovered = _run_as_user(ctx, "which", "ngc")
-    if discovered.returncode == 0:
-        return (discovered.stdout or "").strip() or "ngc", None
-
-    target = pathlib.Path(ctx.install_dir) / NGC_CLI_INSTALL_RELATIVE_DIR
-    binary = target / "ngc"
-    if binary.is_file() and os.access(binary, os.X_OK):
-        ctx.report_already_installed("NGC CLI", NGC_CLI_VERSION)
-        return str(binary), None
-
-    download_dir = pathlib.Path(ctx.install_dir) / NGC_CLI_DOWNLOAD_RELATIVE_DIR
-    download_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chown(download_dir, ctx.user.uid, ctx.user.gid)
-    except OSError:
-        pass
-    archive = download_dir / NGC_CLI_ARCHIVE
-    cached_hash_mismatch = None
-    if archive.is_file():
-        cached_hash = _sha256(archive)
-        if cached_hash != NGC_CLI_SHA256:
-            cached_hash_mismatch = cached_hash
-            archive.unlink()
-
-    if not archive.is_file():
-        result = progress_exec.download(
-            ctx,
-            archive,
-            NGC_CLI_URL,
-            lambda: _run_as_user(
-                ctx,
-                "curl",
-                "-fsSL",
-                "-o",
-                NGC_CLI_ARCHIVE,
-                NGC_CLI_URL,
-                cwd=str(download_dir),
-                stream=True,
-            ),
-            task=NGC_CLI_ARCHIVE,
-        )
-        if result.returncode != 0 or not archive.is_file():
-            if cached_hash_mismatch is not None:
-                return None, StepResult(
-                    status=StepStatus.FAILED,
-                    message=(
-                        "cached NGC CLI archive checksum mismatch: expected "
-                        f"{NGC_CLI_SHA256}, got {cached_hash_mismatch}; "
-                        "automatic replacement download also failed"
-                    ),
-                )
-            return None, StepResult(
-                status=StepStatus.USER_ACTION_REQUIRED,
-                message=f"could not download NVIDIA NGC CLI {NGC_CLI_VERSION}",
-                user_actions=[_ngc_cli_download_action(ctx)],
-            )
-
-    actual_hash = _sha256(archive)
-    if actual_hash != NGC_CLI_SHA256:
-        archive.unlink(missing_ok=True)
-        return None, StepResult(
-            status=StepStatus.FAILED,
-            message=(
-                f"NGC CLI archive checksum mismatch: expected {NGC_CLI_SHA256}, "
-                f"got {actual_hash}"
-            ),
+def _peoplenet_api_url(tag: str) -> str:
+    """Translate `org[/team]/model:version` into NVIDIA's model ZIP API."""
+    resource, separator, version = tag.rpartition(":")
+    parts = resource.split("/")
+    if not separator or len(parts) not in (2, 3) or not version or not all(parts):
+        raise ValueError(
+            f"invalid {CONF_PEOPLENET_TAG_KEY}: expected org[/team]/model:version"
         )
 
-    try:
-        _extract_ngc_cli(archive, target)
-    except (OSError, ValueError, zipfile.BadZipFile) as exc:
-        return None, StepResult(
-            status=StepStatus.FAILED,
-            message=f"could not install NVIDIA NGC CLI {NGC_CLI_VERSION}: {exc}",
-        )
-
-    ctx.report_installed("NGC CLI", NGC_CLI_VERSION)
-    return str(binary), None
+    encoded = [urllib.parse.quote(part, safe="") for part in parts]
+    encoded_version = urllib.parse.quote(version, safe="")
+    if len(encoded) == 2:
+        org, model = encoded
+        scope = f"org/{org}/models/{model}"
+    else:
+        org, team, model = encoded
+        scope = f"org/{org}/team/{team}/models/{model}"
+    return f"https://api.ngc.nvidia.com/v2/{scope}/versions/{encoded_version}/zip"
 
 
 def _download_peoplenet(
-    ctx: "Context", ngc_path: str, target_dir: pathlib.Path, tag: str
-) -> Optional[tuple[str, StepStatus]]:
-    """Runs `ngc registry model download-version` into a throwaway tmp dir
-    (chowned to the invoking user so `ngc`, run as that user, can write
-    into it) and copies every file under the one versioned subdirectory NGC
-    creates into `target_dir`. Returns `(error_message, status)` on failure
-    -- `USER_ACTION_REQUIRED` for a command failure the operator can act on
-    (bad tag, auth), `FAILED` for an unexpected NGC output shape -- or
-    `None` on success."""
+    ctx: "Context", target_dir: pathlib.Path, tag: str
+) -> Optional[str]:
+    """Download the model ZIP through the authenticated NGC Catalog API."""
+    try:
+        url = _peoplenet_api_url(tag)
+    except ValueError as exc:
+        return str(exc)
+
     tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="mv3dt-peoplenet-"))
     try:
         os.chown(tmp_dir, ctx.user.uid, ctx.user.gid)
@@ -700,39 +576,65 @@ def _download_peoplenet(
         pass
 
     try:
-        result = _run_as_user(
+        archive = tmp_dir / _PEOPLENET_ARCHIVE_NAME
+        secrets_path = ctx.install_dir / "secrets" / "ngc.env"
+        result = progress_exec.download(
             ctx,
-            ngc_path,
-            "registry",
-            "model",
-            "download-version",
-            tag,
-            "--dest",
-            str(tmp_dir),
+            archive,
+            url,
+            lambda: _run_as_user(
+                ctx,
+                "env",
+                f"NGC_ENV_FILE={secrets_path}",
+                f"NGC_MODEL_URL={url}",
+                f"NGC_MODEL_ARCHIVE={archive}",
+                "bash",
+                "-lc",
+                _NGC_API_DOWNLOAD_SCRIPT,
+                stream=True,
+            ),
+            task="PeopleNet model archive",
+            probe_content_length=False,
         )
-        if result.returncode != 0:
+        if result.returncode != 0 or not archive.is_file():
             return (
-                f"ngc registry model download-version {tag} failed "
-                f"(exit {result.returncode}): {(result.stderr or '').strip()[-2000:]}",
-                StepStatus.USER_ACTION_REQUIRED,
+                f"NGC Catalog API download failed for {tag} "
+                f"(exit {result.returncode}): {(result.stderr or '').strip()[-2000:]}"
             )
 
-        version_dirs = [p for p in tmp_dir.iterdir() if p.is_dir()]
-        if not version_dirs:
-            return (
-                f"ngc registry model download-version {tag} produced no "
-                f"versioned subdirectory under its --dest",
-                StepStatus.FAILED,
-            )
+        try:
+            with zipfile.ZipFile(archive) as bundle:
+                candidates = [
+                    member
+                    for member in bundle.infolist()
+                    if pathlib.PurePosixPath(member.filename).name
+                    == PEOPLENET_ONNX_NAME
+                    and not member.is_dir()
+                    and not stat.S_ISLNK(member.external_attr >> 16)
+                ]
+                if len(candidates) != 1:
+                    return (
+                        f"NGC model archive contained {len(candidates)} "
+                        f"copies of {PEOPLENET_ONNX_NAME}; expected exactly one"
+                    )
 
-        target_dir.mkdir(parents=True, exist_ok=True)
-        for version_dir in version_dirs:
-            for entry in version_dir.rglob("*"):
-                if not entry.is_file():
-                    continue
-                dest = target_dir / entry.relative_to(version_dir)
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(entry, dest)
+                target_dir.mkdir(parents=True, exist_ok=True)
+                staged = target_dir / f".{PEOPLENET_ONNX_NAME}.tmp"
+                try:
+                    with bundle.open(candidates[0]) as source, staged.open("wb") as dest:
+                        shutil.copyfileobj(source, dest)
+                    if staged.stat().st_size == 0:
+                        return f"NGC model archive contained an empty {PEOPLENET_ONNX_NAME}"
+                    os.replace(staged, target_dir / PEOPLENET_ONNX_NAME)
+                finally:
+                    staged.unlink(missing_ok=True)
+        except (
+            OSError,
+            NotImplementedError,
+            RuntimeError,
+            zipfile.BadZipFile,
+        ) as exc:
+            return f"could not extract PeopleNet model archive: {exc}"
 
         return None
     finally:
@@ -751,46 +653,16 @@ def _ensure_peoplenet_model(ctx: "Context") -> Optional[StepResult]:
         _write_peoplenet_labels(ctx)
         return None
 
-    ngc_path, cli_failure = _ensure_ngc_cli(ctx)
-    if cli_failure is not None:
-        return cli_failure
-    assert ngc_path is not None
-
-    if ctx.ngc.configure_ngc_cli() is None:
-        return StepResult(
-            status=StepStatus.FAILED,
-            message="could not configure the NGC CLI from the stored API key",
-        )
-
     tag = _peoplenet_tag(ctx)
-    failure = _download_peoplenet(ctx, ngc_path, target_dir, tag)
+    failure = _download_peoplenet(ctx, target_dir, tag)
     if failure is not None:
-        message, status = failure
-        user_actions = (
-            [
-                UserAction(
-                    text=(
-                        f"Check {CONF_PEOPLENET_TAG_KEY} and that the stored "
-                        "NGC API key has Catalog download permission, then "
-                        "re-run this step."
-                    ),
-                    command=(
-                        f"{ngc_path} registry model download-version "
-                        f"{tag} --dest <dir>"
-                    ),
-                    path=str(target_dir),
-                )
-            ]
-            if status is StepStatus.USER_ACTION_REQUIRED
-            else []
-        )
-        return StepResult(status=status, message=message, user_actions=user_actions)
+        return StepResult(status=StepStatus.FAILED, message=failure)
 
     if not _peoplenet_model_present(ctx):
         return StepResult(
             status=StepStatus.FAILED,
             message=(
-                f"ngc download completed but {PEOPLENET_ONNX_NAME} still "
+                f"NGC API download completed but {PEOPLENET_ONNX_NAME} still "
                 f"not found under {target_dir}"
             ),
         )

@@ -69,13 +69,14 @@ def download(
     run: Callable[[], Any],
     *,
     task: str | None = None,
+    probe_content_length: bool = True,
 ):
     """Run one fetch while following the destination file's real byte count."""
     observed = getattr(ctx, "run_observed", None)
     if observed is None:
         return run()
 
-    total = progress.content_length(url)
+    total = progress.content_length(url) if probe_content_length else None
     return observed(
         run,
         lambda is_running: progress.follow_download(

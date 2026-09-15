@@ -273,9 +273,10 @@ login) and continue without re-prompting.
 
 **RESOLVED.** [§11](#11-ds-91-breaking-changes-relevant-to-installverify)
 previously flagged "Step 2 owns the PeopleNet model fetch" as aspirational —
-no code path existed. It is now implemented, ported from
-`laptop/scripts/00_bootstrap.sh` Phase 10 (`ngc registry model
-download-version`), and runs unconditionally at the end of `run()` after
+no code path existed. It is now implemented, with its model/tag contract
+ported from `laptop/scripts/00_bootstrap.sh` Phase 10 and its acquisition
+updated to NVIDIA's authenticated model ZIP API. It runs unconditionally at
+the end of `run()` after
 whichever install-method branch (§3.1–§3.3) completes — the model Step 5's
 `deepstream-app` needs at runtime does not depend on which DS SDK install
 method was chosen.
@@ -291,39 +292,37 @@ method was chosen.
   `laptop/config/laptop.env.example`'s `PEOPLENET_NGC_TAG` pins.
 - **Idempotency:** skipped entirely if `resnet34_peoplenet.onnx` already
   exists non-empty at the target location.
-- **NGC CLI:** use an existing `ngc` on `PATH`; otherwise download NVIDIA's
-  AMD64 Linux NGC CLI `4.10.0` archive to
-  `<install_dir>/downloads/ngc/`, verify its pinned SHA-256 digest, and
-  extract it atomically to `<install_dir>/tools/ngc-cli-4.10.0/`. The
-  installer invokes the managed binary by absolute path, so it does not
-  modify `.bashrc`, `.profile`, or `/usr/local`.
-
-  | Pin | Value |
-  |-----|-------|
-  | Version | `4.10.0` |
-  | Platform | AMD64 Linux |
-  | Archive | `ngccli_linux-4.10.0.zip` |
-  | SHA-256 | `3e1d3ab23e5b4e8ffc704bf1da4c775a1d68d7bdf8f6d7101b4c85da604d1a58` |
+- **Acquisition client:** **RESOLVED** — use NVIDIA's authenticated NGC
+  Catalog model ZIP API directly. The CLI path was removed after workstation
+  testing showed that an API key alone is insufficient for non-interactive
+  CLI configuration: the CLI also requires the account's own org, which is
+  not the publishing org encoded in the model tag and can be ambiguous for a
+  multi-org account. NVIDIA documents personal and service keys as direct
+  bearer tokens for this endpoint.
 - **Procedure, as the invoking user ([`00` §9.2](00-FRAMEWORK-AND-BOOTSTRAP.md#92-running-as-the-invoking-user) —
-  `ngc`, like `docker` and the AMC clone, must never run unwrapped as root):**
-  1. Resolve an existing `ngc` on `PATH`, or install the pinned managed CLI
-     described above. A network failure is `USER_ACTION_REQUIRED` with the
-     exact offline archive-placement path; extraction or checksum failure is
-     `FAILED`.
-  2. `ctx.ngc.configure_ngc_cli()` ([`00` §10.2](00-FRAMEWORK-AND-BOOTSTRAP.md#102-capture-and-write))
-     writes `~/.ngc/config` from the API key captured during onboarding. No
-     interactive `ngc config set` call or second key prompt occurs.
-  3. `<resolved-ngc-path> registry model download-version <tag> --dest <tmp>` into a
-     throwaway directory chowned to the invoking user, then copy every file
-     under the one versioned subdirectory NGC creates into the target
-     location.
+  network acquisition, like `docker` and the AMC clone, must never run
+  unwrapped as root):**
+  1. Parse `org[/team]/model:version` from `peoplenet_ngc_tag` and construct
+     NVIDIA's documented `/v2/org/.../models/.../versions/.../zip` URL.
+  2. Source the onboarding-owned `<install_dir>/secrets/ngc.env` only inside
+     the invoking-user child shell. Send the `Authorization: Bearer` header to
+     `curl` through standard input via `--config -`; the key never appears in
+     argv, Python source, or the transcript. No NGC CLI, org prompt,
+     `~/.ngc/config`, or second key entry is involved. The progress adapter
+     intentionally skips its separate unauthenticated content-length probe,
+     so this authenticated download remains entirely in the invoking-user
+     process and displays an activity spinner instead of a percentage bar.
+  3. Read only the single `resnet34_peoplenet.onnx` member from the returned
+     ZIP and atomically place it at the target location. No archive paths are
+     extracted, preventing traversal through an unexpected member name.
   4. Write the fixed 3-class `labels.txt` (`person`/`bag`/`face`) if
      missing — not downloaded, matching Phase 10's own heredoc.
   5. Chown the whole tree to the invoking user (doc 00 §9.2).
-- **Failure modes:** a nonzero `download-version` exit (bad tag, auth) is
-  `USER_ACTION_REQUIRED`; a zero exit with no versioned subdirectory
-  produced (unexpected NGC output shape) is `FAILED` — not
-  operator-actionable the way a bad tag or missing login is.
+- **Failure modes:** malformed tags, rejected authentication, network
+  failures, invalid ZIPs, and missing/duplicate/empty ONNX members are
+  `FAILED` with the concrete reason. There is no manual configuration
+  handoff; re-running after correcting a genuinely invalid or revoked key is
+  sufficient.
 - **`verify()`:** fails if the ONNX file is missing under the target
   location, independent of and in addition to the method-specific checks in
   [§7](#7-verification-verifyctx).
@@ -552,10 +551,8 @@ and later steps.
 | Ambiguous method, `--non-interactive` | proceed with **deb** default |
 | deb/tar/docker install + post-install + smoke all pass | `COMPLETE` |
 | Smoke test or version pin fails | `FAILED` (with captured stderr tail) |
-| NGC CLI absent and automatic download fails | `USER_ACTION_REQUIRED` (offline archive placement, §5.4) |
-| NGC CLI checksum, extraction, or automatic configuration fails | `FAILED` (§5.4) |
-| `ngc registry model download-version` fails (bad tag, auth) | `USER_ACTION_REQUIRED` (§5.4) |
-| Download succeeds but produces no versioned subdirectory | `FAILED` (unexpected NGC output shape, not operator-actionable, §5.4) |
+| PeopleNet NGC API download or authentication fails | `FAILED` (§5.4) |
+| PeopleNet tag or returned model ZIP is invalid | `FAILED` (§5.4) |
 | PeopleNet model missing at `verify()` | `FAILED` (re-run Step 2, §5.4) |
 
 Step 2 does **not** request a reboot (`REBOOT_REQUIRED` is unused here); the DS
@@ -573,12 +570,10 @@ SDK install needs no reboot on top of Step 1's driver reboot.
   to `nvcr.io` by hand, re-run (§5.2).
 - **Method choice** (ambiguous auto-detect, interactive) — pick deb/tar/docker
   from the three descriptions (§4).
-- **Offline NGC CLI archive placement** (automatic fetch failed) — place the
-  pinned AMD64 Linux archive in `<install_dir>/downloads/ngc/`; the installer
-  verifies, extracts, and configures it on re-run (§5.4).
-- **Check `peoplenet_ngc_tag` / NGC auth** (`ngc registry model
-  download-version` failed) — re-run once the tag/auth issue is fixed
-  (§5.4).
+- **Check `peoplenet_ngc_tag` / stored NGC key** (the authenticated API
+  download failed) — correct a genuinely invalid tag, expired/revoked key,
+  or missing Catalog permission, then re-run; no CLI configuration is
+  required (§5.4).
 
 All rendered through the framework `USER_ACTION_REQUIRED` block ending with
 "Then run the installer again to continue." (doc 00 §9.3).
@@ -607,11 +602,9 @@ DeepStream **9.1** official documentation. DS 9.1 only.
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Release_notes.html>
 - NVIDIA/DeepStream GitHub Releases (deb/tar distribution, v9.1.0):
   <https://github.com/NVIDIA/DeepStream/releases/tag/v9.1.0>
-- NVIDIA VSS prerequisites — supported NGC CLI `4.10.0` AMD64 Linux archive,
-  installation layout, and version verification:
-  <https://docs.nvidia.com/vss/latest/warehouse-docs/Prerequisites.html#install-ngc-cli>
 - NVIDIA NGC Catalog User Guide — personal/service API keys can authenticate
-  model downloads directly, and API keys must be handled as secrets:
+  model ZIP downloads directly, the authenticated model endpoint layout, and
+  the requirement to handle API keys as secrets:
   <https://docs.nvidia.com/ngc/latest/ngc-catalog-user-guide.html>
 
 Repo files referenced:

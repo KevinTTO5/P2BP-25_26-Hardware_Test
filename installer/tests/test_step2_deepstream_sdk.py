@@ -12,7 +12,6 @@ socket -- every `ctx.run_root`/`ctx.run_as_user` call is served by a
 
 from __future__ import annotations
 
-import hashlib
 import pathlib
 import subprocess
 import sys
@@ -615,7 +614,7 @@ def test_verify_host_fails_when_sdk_dir_missing(tmp_path, _sdk_paths):
 def _peoplenet_ready(ctx) -> pathlib.Path:
     """Pre-place the PeopleNet ONNX (doc STEP-4 section 6.3) so a test
     about DS SDK install/verify -- not about PeopleNet acquisition itself
-    -- doesn't also have to stub the `ngc` CLI."""
+    -- doesn't also have to stub PeopleNet acquisition."""
     onnx_path = step2._peoplenet_dir(ctx) / step2.PEOPLENET_ONNX_NAME
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
     onnx_path.write_bytes(b"stub-onnx")
@@ -913,21 +912,24 @@ def test_full_lifecycle_all_pass_is_complete(tmp_path, _sdk_paths):
 # ---------------------------------------------------------------------------
 
 
-def _ngc_download_side_effect(runner):
-    """Simulates `ngc registry model download-version`: writes a stub ONNX
-    + labels.txt under a versioned subdirectory of whatever `--dest` the
-    call under test used (read back from `runner.calls[-1]`, appended by
-    `ScriptedRunner.__call__` before rules are matched)."""
+def _api_download_side_effect(runner, *, member=None, contents=b"onnx-bytes"):
+    """Write a model ZIP where the API download command expects it."""
 
     def _write():
         args = runner.calls[-1]
-        dest = pathlib.Path(args[-1])
-        version_dir = dest / "peoplenet_vdeployable_quantized_onnx_v2.6.3"
-        version_dir.mkdir(parents=True)
-        (version_dir / step2.PEOPLENET_ONNX_NAME).write_bytes(b"onnx-bytes")
-        (version_dir / "labels.txt").write_text("person\nbag\nface\n")
+        archive_arg = next(arg for arg in args if str(arg).startswith("NGC_MODEL_ARCHIVE="))
+        archive = pathlib.Path(archive_arg.split("=", 1)[1])
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr(member or f"peoplenet/files/{step2.PEOPLENET_ONNX_NAME}", contents)
 
     return _write
+
+
+def _api_call(args):
+    return args[:1] == ("env",) and any(
+        str(arg).startswith("NGC_MODEL_URL=") for arg in args
+    )
 
 
 def test_ensure_peoplenet_skips_when_already_present(tmp_path):
@@ -938,7 +940,7 @@ def test_ensure_peoplenet_skips_when_already_present(tmp_path):
     result = step2._ensure_peoplenet_model(ctx)
 
     assert result is None
-    assert not runner_user.calls  # never even checked for the ngc CLI
+    assert not runner_user.calls
 
 
 def test_ensure_peoplenet_writes_labels_when_onnx_present_but_labels_missing(tmp_path):
@@ -952,146 +954,32 @@ def test_ensure_peoplenet_writes_labels_when_onnx_present_but_labels_missing(tmp
     assert labels_path.read_text(encoding="utf-8") == "person\nbag\nface\n"
 
 
-def test_ensure_peoplenet_user_action_required_when_ngc_cli_download_fails(tmp_path):
-    runner_user = ScriptedRunner(default_returncode=1)  # `which ngc` -> not found
-    ctx = FakeContext(tmp_path, runner_user=runner_user)
-
-    result = step2._ensure_peoplenet_model(ctx)
-
-    assert result is not None
-    assert result.status is StepStatus.USER_ACTION_REQUIRED
-    assert "NGC CLI" in result.message
-    assert result.user_actions
-    assert "installer will verify and configure it" in result.user_actions[0].text
-    assert "ngc config set" not in result.user_actions[0].text
-
-
-def _write_ngc_cli_archive(path, *, member="ngc-cli/ngc"):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(path, "w") as bundle:
-        bundle.writestr(member, b"#!/bin/sh\n")
-
-
-def test_ensure_ngc_cli_downloads_verifies_and_installs(tmp_path, monkeypatch):
-    runner_user = ScriptedRunner(default_returncode=1)
-    ctx = FakeContext(tmp_path, runner_user=runner_user)
-    archive = (
-        ctx.install_dir
-        / step2.NGC_CLI_DOWNLOAD_RELATIVE_DIR
-        / step2.NGC_CLI_ARCHIVE
+def test_peoplenet_api_url_with_team():
+    assert step2._peoplenet_api_url(step2.PEOPLENET_NGC_TAG_DEFAULT) == (
+        "https://api.ngc.nvidia.com/v2/org/nvidia/team/tao/models/peoplenet/"
+        "versions/deployable_quantized_onnx_v2.6.3/zip"
     )
 
-    def _download():
-        _write_ngc_cli_archive(archive)
 
-    runner_user.when(
-        lambda a: a[:2] == ("curl", "-fsSL"),
-        returncode=0,
-        side_effect=_download,
-    )
-    _download()
-    expected_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
-    archive.unlink()
-    monkeypatch.setattr(step2, "NGC_CLI_SHA256", expected_hash)
-
-    ngc_path, failure = step2._ensure_ngc_cli(ctx)
-
-    assert failure is None
-    assert ngc_path == str(
-        ctx.install_dir / step2.NGC_CLI_INSTALL_RELATIVE_DIR / "ngc"
-    )
-    assert pathlib.Path(ngc_path).is_file()
-    assert pathlib.Path(ngc_path).stat().st_mode & 0o111
-    assert runner_user.called_with_prefix("curl", "-fsSL")
-
-
-def test_ensure_ngc_cli_reuses_managed_install_without_download(tmp_path):
-    runner_user = ScriptedRunner(default_returncode=1)
-    ctx = FakeContext(tmp_path, runner_user=runner_user)
-    binary = ctx.install_dir / step2.NGC_CLI_INSTALL_RELATIVE_DIR / "ngc"
-    binary.parent.mkdir(parents=True)
-    binary.write_text("#!/bin/sh\n", encoding="utf-8")
-    binary.chmod(0o755)
-
-    ngc_path, failure = step2._ensure_ngc_cli(ctx)
-
-    assert failure is None
-    assert ngc_path == str(binary)
-    assert not runner_user.called_with_prefix("curl")
-
-
-def test_ensure_ngc_cli_rejects_bad_download_checksum(tmp_path):
-    runner_user = ScriptedRunner(default_returncode=1)
-    ctx = FakeContext(tmp_path, runner_user=runner_user)
-    archive = (
-        ctx.install_dir
-        / step2.NGC_CLI_DOWNLOAD_RELATIVE_DIR
-        / step2.NGC_CLI_ARCHIVE
-    )
-    runner_user.when(
-        lambda a: a[:2] == ("curl", "-fsSL"),
-        returncode=0,
-        side_effect=lambda: _write_ngc_cli_archive(archive),
+def test_peoplenet_api_url_without_team_and_escapes_version():
+    assert step2._peoplenet_api_url("nvidia/peoplenet:v2+final") == (
+        "https://api.ngc.nvidia.com/v2/org/nvidia/models/peoplenet/"
+        "versions/v2%2Bfinal/zip"
     )
 
-    ngc_path, failure = step2._ensure_ngc_cli(ctx)
 
-    assert ngc_path is None
-    assert failure is not None
-    assert failure.status is StepStatus.FAILED
-    assert "checksum mismatch" in failure.message
-    assert not archive.exists()
-
-
-def test_ensure_ngc_cli_preserves_checksum_failure_when_redownload_fails(tmp_path):
-    runner_user = ScriptedRunner(default_returncode=1)
-    ctx = FakeContext(tmp_path, runner_user=runner_user)
-    archive = (
-        ctx.install_dir
-        / step2.NGC_CLI_DOWNLOAD_RELATIVE_DIR
-        / step2.NGC_CLI_ARCHIVE
-    )
-    _write_ngc_cli_archive(archive)
-
-    ngc_path, failure = step2._ensure_ngc_cli(ctx)
-
-    assert ngc_path is None
-    assert failure is not None
-    assert failure.status is StepStatus.FAILED
-    assert "cached NGC CLI archive checksum mismatch" in failure.message
-    assert "replacement download also failed" in failure.message
-
-
-def test_extract_ngc_cli_rejects_path_traversal(tmp_path):
-    archive = tmp_path / "ngc.zip"
-    _write_ngc_cli_archive(archive, member="ngc-cli/../../escaped")
-
-    with pytest.raises(ValueError, match="unsafe NGC CLI archive member"):
-        step2._extract_ngc_cli(archive, tmp_path / "tools" / "ngc-cli")
-
-    assert not (tmp_path / "escaped").exists()
-
-
-def test_extract_ngc_cli_accepts_official_top_level_md5(tmp_path):
-    archive = tmp_path / "ngc.zip"
-    with zipfile.ZipFile(archive, "w") as bundle:
-        bundle.writestr("ngc-cli/ngc", b"#!/bin/sh\n")
-        bundle.writestr("ngc-cli.md5", b"218ff2aaf30fa54129dadf65eba3b40d  -\n")
-
-    target = tmp_path / "tools" / "ngc-cli"
-    step2._extract_ngc_cli(archive, target)
-
-    assert (target / "ngc").is_file()
-    assert not (target / "ngc-cli.md5").exists()
+@pytest.mark.parametrize("tag", ["", "nvidia/tao/peoplenet", "too/many/path/parts:v1"])
+def test_peoplenet_api_url_rejects_invalid_tag(tag):
+    with pytest.raises(ValueError, match="expected org"):
+        step2._peoplenet_api_url(tag)
 
 
 def test_ensure_peoplenet_downloads_and_places_model(tmp_path):
     runner_user = ScriptedRunner(default_returncode=0)
-    runner_user.when(lambda a: a == ("which", "ngc"), returncode=0)
     runner_user.when(
-        lambda a: a[:4] == ("ngc", "registry", "model", "download-version"),
+        _api_call,
         returncode=0,
-        side_effect=_ngc_download_side_effect(runner_user),
+        side_effect=_api_download_side_effect(runner_user),
     )
     ngc = FakeNgc()
     ctx = FakeContext(tmp_path, runner_user=runner_user, ngc=ngc)
@@ -1099,23 +987,23 @@ def test_ensure_peoplenet_downloads_and_places_model(tmp_path):
     result = step2._ensure_peoplenet_model(ctx)
 
     assert result is None
-    assert ngc.configure_calls == 1
+    assert ngc.configure_calls == 0
     target_dir = step2._peoplenet_dir(ctx)
     assert (target_dir / step2.PEOPLENET_ONNX_NAME).read_bytes() == b"onnx-bytes"
     assert (target_dir / step2.PEOPLENET_LABELS_NAME).is_file()
-    assert runner_user.called_with_prefix(
-        "ngc", "registry", "model", "download-version", step2.PEOPLENET_NGC_TAG_DEFAULT
-    )
+    call = next(call for call in runner_user.calls if _api_call(call))
+    assert any(arg.startswith("NGC_ENV_FILE=") for arg in call)
+    assert "a-fake-ngc-key" not in " ".join(call)
+    assert call[-1] == step2._NGC_API_DOWNLOAD_SCRIPT
 
 
 def test_ensure_peoplenet_uses_conf_override_tag(tmp_path):
     custom_tag = "nvidia/tao/peoplenet:custom_tag"
     runner_user = ScriptedRunner(default_returncode=0)
-    runner_user.when(lambda a: a == ("which", "ngc"), returncode=0)
     runner_user.when(
-        lambda a: a[:4] == ("ngc", "registry", "model", "download-version"),
+        _api_call,
         returncode=0,
-        side_effect=_ngc_download_side_effect(runner_user),
+        side_effect=_api_download_side_effect(runner_user),
     )
     ctx = FakeContext(
         tmp_path, conf={step2.CONF_PEOPLENET_TAG_KEY: custom_tag}, runner_user=runner_user
@@ -1124,16 +1012,33 @@ def test_ensure_peoplenet_uses_conf_override_tag(tmp_path):
     result = step2._ensure_peoplenet_model(ctx)
 
     assert result is None
-    assert runner_user.called_with_prefix(
-        "ngc", "registry", "model", "download-version", custom_tag
+    call = next(call for call in runner_user.calls if _api_call(call))
+    assert (
+        "NGC_MODEL_URL=https://api.ngc.nvidia.com/v2/org/nvidia/team/tao/"
+        "models/peoplenet/versions/custom_tag/zip"
+    ) in call
+
+
+def test_ensure_peoplenet_invalid_tag_is_failed_without_running_command(tmp_path):
+    runner_user = ScriptedRunner(default_returncode=0)
+    ctx = FakeContext(
+        tmp_path,
+        conf={step2.CONF_PEOPLENET_TAG_KEY: "invalid"},
+        runner_user=runner_user,
     )
 
+    result = step2._ensure_peoplenet_model(ctx)
 
-def test_ensure_peoplenet_download_failure_is_user_action_required(tmp_path):
+    assert result is not None
+    assert result.status is StepStatus.FAILED
+    assert "invalid peoplenet_ngc_tag" in result.message
+    assert not runner_user.calls
+
+
+def test_ensure_peoplenet_api_download_failure_is_failed_without_manual_action(tmp_path):
     runner_user = ScriptedRunner(default_returncode=0)
-    runner_user.when(lambda a: a == ("which", "ngc"), returncode=0)
     runner_user.when(
-        lambda a: a[:4] == ("ngc", "registry", "model", "download-version"),
+        _api_call,
         returncode=1,
         stderr="unauthorized",
     )
@@ -1142,17 +1047,20 @@ def test_ensure_peoplenet_download_failure_is_user_action_required(tmp_path):
     result = step2._ensure_peoplenet_model(ctx)
 
     assert result is not None
-    assert result.status is StepStatus.USER_ACTION_REQUIRED
-    assert "download-version" in result.message
+    assert result.status is StepStatus.FAILED
+    assert "NGC Catalog API download failed" in result.message
     assert "unauthorized" in result.message
+    assert not result.user_actions
 
 
-def test_ensure_peoplenet_no_versioned_subdir_is_failed(tmp_path):
+def test_ensure_peoplenet_archive_without_onnx_is_failed(tmp_path):
     runner_user = ScriptedRunner(default_returncode=0)
-    runner_user.when(lambda a: a == ("which", "ngc"), returncode=0)
-    # download-version "succeeds" but writes nothing under --dest.
     runner_user.when(
-        lambda a: a[:4] == ("ngc", "registry", "model", "download-version"), returncode=0
+        _api_call,
+        returncode=0,
+        side_effect=_api_download_side_effect(
+            runner_user, member="peoplenet/README.txt", contents=b"metadata"
+        ),
     )
     ctx = FakeContext(tmp_path, runner_user=runner_user)
 
@@ -1160,7 +1068,38 @@ def test_ensure_peoplenet_no_versioned_subdir_is_failed(tmp_path):
 
     assert result is not None
     assert result.status is StepStatus.FAILED
-    assert "no versioned subdirectory" in result.message
+    assert "contained 0 copies" in result.message
+
+
+@pytest.mark.parametrize(
+    "archive_error",
+    [
+        RuntimeError("password required"),
+        NotImplementedError("unsupported compression method"),
+    ],
+)
+def test_ensure_peoplenet_archive_read_error_is_failed(
+    tmp_path, monkeypatch, archive_error
+):
+    runner_user = ScriptedRunner(default_returncode=0)
+    runner_user.when(
+        _api_call,
+        returncode=0,
+        side_effect=_api_download_side_effect(runner_user),
+    )
+    ctx = FakeContext(tmp_path, runner_user=runner_user)
+    monkeypatch.setattr(
+        step2.shutil,
+        "copyfileobj",
+        lambda source, dest: (_ for _ in ()).throw(archive_error),
+    )
+
+    result = step2._ensure_peoplenet_model(ctx)
+
+    assert result is not None
+    assert result.status is StepStatus.FAILED
+    assert "could not extract PeopleNet model archive" in result.message
+    assert str(archive_error) in result.message
 
 
 def test_run_deb_already_installed_still_fetches_peoplenet(tmp_path):
@@ -1170,11 +1109,10 @@ def test_run_deb_already_installed_still_fetches_peoplenet(tmp_path):
     runner_root = ScriptedRunner()
     runner_root.when(lambda a: a[:2] == ("dpkg", "-s"), stdout="Version: 9.1.0-1\n")
     runner_user = ScriptedRunner(default_returncode=0)
-    runner_user.when(lambda a: a == ("which", "ngc"), returncode=0)
     runner_user.when(
-        lambda a: a[:4] == ("ngc", "registry", "model", "download-version"),
+        _api_call,
         returncode=0,
-        side_effect=_ngc_download_side_effect(runner_user),
+        side_effect=_api_download_side_effect(runner_user),
     )
     ctx = FakeContext(tmp_path, runner_root=runner_root, runner_user=runner_user)
 
@@ -1188,14 +1126,14 @@ def test_run_deb_already_installed_still_fetches_peoplenet(tmp_path):
 def test_run_deb_already_installed_peoplenet_failure_overrides_complete(tmp_path):
     runner_root = ScriptedRunner()
     runner_root.when(lambda a: a[:2] == ("dpkg", "-s"), stdout="Version: 9.1.0-1\n")
-    runner_user = ScriptedRunner(default_returncode=1)  # `which ngc` -> not found
+    runner_user = ScriptedRunner(default_returncode=1)
     ctx = FakeContext(tmp_path, runner_root=runner_root, runner_user=runner_user)
 
     step = step2.Step2DeepStreamSdk()
     result = step.run(ctx)
 
-    assert result.status is StepStatus.USER_ACTION_REQUIRED
-    assert "NGC CLI" in result.message
+    assert result.status is StepStatus.FAILED
+    assert "NGC Catalog API" in result.message
 
 
 def test_verify_host_fails_when_peoplenet_model_missing(tmp_path, _sdk_paths):
