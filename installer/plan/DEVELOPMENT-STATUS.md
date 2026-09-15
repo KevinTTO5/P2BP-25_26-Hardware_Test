@@ -15,8 +15,8 @@ connected across the step modules.** A reader who finds `report.py` can
 reasonably conclude the diagnostic work is done. It is not.
 [Section 5](#5-what-remains) is the honest list.
 
-Current release: **v0.3.9**. Current version string:
-`installer/mv3dt_installer/__init__.py` `__version__ = "0.3.9"`.
+Current release: **v0.4.0**. Current version string:
+`installer/mv3dt_installer/__init__.py` `__version__ = "0.4.0"`.
 
 ---
 
@@ -71,7 +71,7 @@ python3 -m pytest tests/ -q
 Current result on an **arm64 macOS** development machine:
 
 ```
-1 failed, 1302 passed, 7 skipped
+1 failed, 1317 passed, 7 skipped
 ```
 
 **The single failure is environmental, not a regression (REQUIRED to know
@@ -96,10 +96,10 @@ and register into `STEP_REGISTRY` at import.
 
 | Step | Module | Lines | Tests | Spec |
 |---|---|---|---|---|
-| 1 | `step1_prerequisites.py` | 1212 | 57 | [`STEP-1`](STEP-1-PREREQUISITES.md) |
-| 2 | `step2_deepstream_sdk.py` | 1312 | 68 | [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) |
-| 3 | `step3_amc_launcher.py` | 1309 | 71 | [`STEP-3`](STEP-3-AMC-LAUNCHER.md) |
-| 4 | `step4_calib_output_wiring.py` | 1135 | 56 | [`STEP-4`](STEP-4-CALIB-OUTPUT-WIRING.md) |
+| 1 | `step1_prerequisites.py` | 1536 | 76 | [`STEP-1`](STEP-1-PREREQUISITES.md) |
+| 2 | `step2_deepstream_sdk.py` | 1321 | 76 | [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) |
+| 3 | `step3_amc_launcher.py` | 1652 | 91 | [`STEP-3`](STEP-3-AMC-LAUNCHER.md) |
+| 4 | `step4_calib_output_wiring.py` | 963 | 43 | [`STEP-4`](STEP-4-CALIB-OUTPUT-WIRING.md) |
 | 5 | `step5_per_project_exes.py` | 1578 | 69 | [`STEP-5`](STEP-5-PER-PROJECT-EXES.md) |
 | 6 | `step6_remote_supervision.py` | 1217 | 57 | [`STEP-6`](STEP-6-REMOTE-SUPERVISION.md) |
 | 7 | `step7_webapp_integration.py` | 1632 | 79 | [`STEP-7`](STEP-7-WEBAPP-INTEGRATION.md) |
@@ -213,6 +213,31 @@ that is not obvious.
   in a full run and fails in isolation. If you add global state to `logs`,
   reset it there too.
 
+### 3.5 Steps 2 through 4 workstation path
+
+Release v0.4.0 hardens the path from an installed DeepStream SDK to a wired
+calibration result:
+
+- Step 2 uses deterministic looped input, a batch-one inference engine and
+  tracker configuration, and requires a positive numeric FPS value before
+  its DeepStream smoke test passes.
+- Step 3 installs Docker Engine, Compose v2 and the NVIDIA Container Toolkit
+  when needed, checks out the pinned AutoMagicCalib 3.2.1 commit, validates
+  container readiness, and persists the AMC location, project and API
+  identity needed by Step 4. The guided installer keeps AMC running after
+  the browser closes; the standalone `amc` command retains close-to-stop
+  behavior.
+- Step 4 polls the persisted AMC project through its API, reports calibration
+  errors, downloads the MV3DT result, rejects unsafe or malformed archives,
+  requires a root `transforms.yml`, and atomically replaces the installed
+  calibration. Timer-driven re-ingest uses the same API path.
+
+The remaining acceptance milestone is a live Ubuntu 24.04 workstation run
+through Steps 2, 3 and 4: observe positive DeepStream FPS, complete a real
+AMC calibration in the launched UI, and verify that Step 4 installs the
+exported `transforms.yml`. Unit tests and frozen-build CI cover the known
+failure branches, but do not replace that GPU and browser-backed run.
+
 ---
 
 ## 4. How to work in this repo
@@ -290,15 +315,16 @@ before it needs code.
 
 For the current state to be what this document claims:
 
-- [ ] `python3 -m pytest tests/ -q` from `installer/` gives 1252 passed and
-      exactly the 5 failures in [section 2.1](#21-test-suite).
+- [x] `python3 -m pytest tests/ -q` from `installer/` gives 1317 passed,
+      7 skipped and exactly the one environmental failure in
+      [section 2.1](#21-test-suite) on arm64 macOS.
 - [ ] `grep` for `follow_apt` and `follow_download` finds the Step 1 and
       Step 2 call sites routed through `progress_exec.py`.
 - [ ] Every step declares `phases` and calls exactly `phase(1)` through
       `phase(len(phases))` — pinned by
       `tests/test_steps_protocol.py::test_every_step_declares_phases_that_match_the_indices_it_uses`.
 - [ ] `__version__` equals the most recent `v*` tag.
-- [ ] `gh pr list --state open` is empty.
+- [x] `gh pr list --state open` is empty at the v0.4.0 release cut.
 
 ---
 
@@ -323,7 +349,7 @@ Settled exclusions, carried from [`08` §11](08-PROGRESS-AND-OBSERVABILITY.md#11
 ## References
 
 Facts in this document are drawn from the repository through release
-`v0.3.9` and from the workstation install runs of `mv3dt-installer`
+`v0.4.0` and from the workstation install runs of `mv3dt-installer`
 0.1.2 through 0.1.9, which are the source of the observed-failure inventory
 in [`08` §2](08-PROGRESS-AND-OBSERVABILITY.md#2-observed-failures-this-doc-exists-to-fix).
 Test counts and the arm64 failure list were produced by running the suite,
