@@ -1072,6 +1072,19 @@ def test_extract_ngc_cli_rejects_path_traversal(tmp_path):
     assert not (tmp_path / "escaped").exists()
 
 
+def test_extract_ngc_cli_accepts_official_top_level_md5(tmp_path):
+    archive = tmp_path / "ngc.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("ngc-cli/ngc", b"#!/bin/sh\n")
+        bundle.writestr("ngc-cli.md5", b"218ff2aaf30fa54129dadf65eba3b40d  -\n")
+
+    target = tmp_path / "tools" / "ngc-cli"
+    step2._extract_ngc_cli(archive, target)
+
+    assert (target / "ngc").is_file()
+    assert not (target / "ngc-cli.md5").exists()
+
+
 def test_ensure_peoplenet_downloads_and_places_model(tmp_path):
     runner_user = ScriptedRunner(default_returncode=0)
     runner_user.when(lambda a: a == ("which", "ngc"), returncode=0)
