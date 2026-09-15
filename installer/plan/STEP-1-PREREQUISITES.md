@@ -79,15 +79,28 @@ libnvonnxparsers10                   tensorrt-dev
 libnvinfer-headers-python-plugin-dev libnvinfer-win-builder-resource10
 ```
 
-The cuDNN transaction pins `cudnn9-cuda-13`, `cudnn9-cuda-13-2`, and the
-concrete `libcudnn9-cuda-13` runtime package to apt version `9.20.0.48-1`.
-Pinning both meta-package layers prevents their greater-than-or-equal
-dependency from resolving a newer cuDNN release. The concrete runtime package
-is the presence and version probe; the virtual `libcudnn9` name and shell
-globs are not valid install or verification targets on Ubuntu 24.04. The
-probe normalizes only the exact apt value `9.20.0.48-1` to the DeepStream
-component pin `9.20.0.48`; a different Debian revision remains unnormalized
-and fails verification. Dependency reporting uses the component pin.
+The cuDNN transaction pins the complete CUDA 13.2 package dependency chain to
+apt version `9.20.0.48-1`:
+
+| Package | Dependency role |
+|---------|-----------------|
+| `cudnn9-cuda-13` | CUDA 13 meta-package |
+| `cudnn9-cuda-13-2` | CUDA 13.2 meta-package |
+| `libcudnn9-static-cuda-13` | Static library package required by the CUDA 13.2 meta-package |
+| `libcudnn9-dev-cuda-13` | Development package required by the static library package |
+| `libcudnn9-headers-cuda-13` | Header package required by the development package |
+| `libcudnn9-cuda-13` | Concrete runtime package required by the development package |
+
+Pinning every package prevents the meta-packages' greater-than-or-equal
+dependency from resolving a newer cuDNN release. This transaction alone uses
+`apt-get install --allow-downgrades` so a partially installed newer CUDA 13
+cuDNN chain is reconciled to the DS 9.1 equality pin. TensorRT and general apt
+transactions do not permit downgrades. The concrete runtime package is the
+presence and version probe; the virtual `libcudnn9` name and shell globs are
+not valid install or verification targets on Ubuntu 24.04. The probe
+normalizes only the exact apt value `9.20.0.48-1` to the DeepStream component
+pin `9.20.0.48`; a different Debian revision remains unnormalized and fails
+verification. Dependency reporting uses the component pin.
 
 ### 2.2 Reporting each pin
 
