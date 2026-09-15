@@ -375,6 +375,15 @@ def _normalise_repo_url(value: str) -> str:
     return value.strip().removesuffix("/").removesuffix(".git")
 
 
+def _expected_amc_worktree_change(line: str) -> bool:
+    """Allow installer-managed config and untracked AMC runtime data only."""
+    status = line[:2]
+    path = line[3:].strip()
+    if path == "compose/.env":
+        return True
+    return status == "??" and path.startswith(("projects/", "models/"))
+
+
 def clone_amc(ctx: "Context", amc_root: pathlib.Path) -> bool:
     """Install or safely reconcile the standalone AMC checkout at its pin."""
     if not amc_root.exists():
@@ -416,13 +425,13 @@ def clone_amc(ctx: "Context", amc_root: pathlib.Path) -> bool:
     dirty_lines = _run_git(
         ctx, "-C", str(amc_root), "status", "--porcelain"
     ).stdout.splitlines()
-    unexpected = [
-        line for line in dirty_lines if line[3:].strip() != "compose/.env"
-    ]
+    unexpected = [line for line in dirty_lines if not _expected_amc_worktree_change(line)]
     if unexpected:
+        detail = ", ".join(line.strip() for line in unexpected[:5])
         raise AmcLaunchError(
             "AMC checkout has local changes outside the installer-managed "
-            "compose/.env; commit or move those changes before retrying"
+            f"config/runtime paths ({detail}); commit or move those changes "
+            "before retrying"
         )
     if head == AMC_COMMIT:
         return False
@@ -645,6 +654,20 @@ def compose_down(ctx: "Context", compose_dir: pathlib.Path) -> None:
     _run_compose(ctx, compose_dir, "down")
 
 
+def compose_stack_running(ctx: "Context", compose_dir: pathlib.Path) -> bool:
+    """Return whether both pinned AMC services are already running."""
+    result = ctx.run_as_user(
+        "docker", "compose", "ps", "--status", "running", "--services",
+        cwd=str(compose_dir), check=False, capture_output=True, text=True,
+        stream=False,
+    )
+    services = set((result.stdout or "").splitlines())
+    return result.returncode == 0 and {
+        "auto-magic-calib-ms",
+        "auto-magic-calib-ui",
+    }.issubset(services)
+
+
 # ---------------------------------------------------------------------------
 # section 4 step 9 -- readiness poll
 # ---------------------------------------------------------------------------
@@ -671,6 +694,7 @@ def wait_for_backend(
             check=False,
             capture_output=True,
             text=True,
+            stream=False,
         )
         if result.returncode == 0:
             try:
@@ -698,6 +722,7 @@ def wait_for_ui(ctx: "Context", url: str) -> bool:
         check=False,
         capture_output=True,
         text=True,
+        stream=False,
     )
     return result.returncode == 0 and (result.stdout or "").strip() == "200"
 
@@ -1285,12 +1310,10 @@ def launch_amc(
         cfg = resolve_config(
             ctx, project=project_name, host_ip_override=host_ip_override
         )
-        cfg = resolve_ports(ctx, cfg)
 
         guard = check_repo_isolation(cfg.amc_root)
         if guard is not None:
             raise AmcLaunchError(guard)
-        persist_config(ctx, cfg)
 
         cloned = clone_amc(ctx, cfg.amc_root)
         label = f"{AMC_VERSION}@{AMC_COMMIT[:12]}"
@@ -1307,6 +1330,15 @@ def launch_amc(
                 f"cannot locate compose/compose.yml inside {cfg.amc_root}; "
                 "the pinned AMC checkout is incomplete"
             )
+
+        stack_running = compose_stack_running(ctx, compose_dir)
+        if stack_running:
+            ctx.log.info(
+                "AMC containers are already running; reusing the configured ports"
+            )
+        else:
+            cfg = resolve_ports(ctx, cfg)
+        persist_config(ctx, cfg)
 
         for key in check_env_drift(compose_dir):
             ctx.log.warn(f"pinned AMC environment no longer defines {key!r}")
@@ -1337,13 +1369,18 @@ def launch_amc(
         # must not register an atexit hook that immediately undoes their work.
         teardown = _teardown if (keep_up or no_open) else _install_teardown_guards(_teardown)
 
-        if not skip_pull:
-            compose_pull(ctx, compose_dir)
         up_started = True
-        compose_up(ctx, compose_dir)
+        if not stack_running:
+            if not skip_pull:
+                compose_pull(ctx, compose_dir)
+            compose_up(ctx, compose_dir)
 
         api_url = f"http://localhost:{cfg.ms_port}/v1/ready"
         ui_url = f"http://localhost:{cfg.ui_port}"
+        ctx.log.info(
+            "Waiting for AMC startup; the first launch downloads models and "
+            "builds its parser before the API becomes ready."
+        )
         if not wait_for_backend(ctx, api_url):
             raise AmcLaunchError(
                 f"AMC microservice did not return code 0 within "
@@ -1377,7 +1414,12 @@ def launch_amc(
         execute_hold(ctx, strategy, ui_url, teardown=teardown, keep_up=keep_up)
 
         return StepResult(status=StepStatus.COMPLETE)
-    except AmcLaunchError as exc:
+    except (AmcLaunchError, KeyboardInterrupt) as exc:
+        message = (
+            str(exc)
+            if isinstance(exc, AmcLaunchError)
+            else "AMC launch cancelled by the operator"
+        )
         if up_started and compose_dir is not None:
             try:
                 if teardown is not None:
@@ -1387,9 +1429,9 @@ def launch_amc(
             except AmcLaunchError as cleanup:
                 return StepResult(
                     status=StepStatus.FAILED,
-                    message=f"{exc}\nAMC cleanup also failed: {cleanup}",
+                    message=f"{message}\nAMC cleanup also failed: {cleanup}",
                 )
-        return StepResult(status=StepStatus.FAILED, message=str(exc))
+        return StepResult(status=StepStatus.FAILED, message=message)
 
 
 def teardown_amc(

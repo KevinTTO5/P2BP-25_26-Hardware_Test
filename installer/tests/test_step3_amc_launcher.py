@@ -434,6 +434,47 @@ def test_clone_amc_skips_when_already_present(tmp_path):
     assert not any("fetch" in call for call in ctx.runner_user.calls)
 
 
+def test_clone_amc_allows_untracked_runtime_data(tmp_path):
+    amc_root = tmp_path / "home" / "op" / "auto-magic-calib"
+    (amc_root / ".git").mkdir(parents=True)
+    runner = ScriptedRunner()
+    runner.when(
+        lambda a: a[-3:] == ("remote", "get-url", "origin"),
+        stdout=step3.AMC_REPO_URL,
+    )
+    runner.when(
+        lambda a: a[-2:] == ("rev-parse", "HEAD"), stdout=step3.AMC_COMMIT
+    )
+    runner.when(
+        lambda a: a[-2:] == ("status", "--porcelain"),
+        stdout="?? projects/state.json\n?? projects/Gallery/output.json\n",
+    )
+
+    assert step3.clone_amc(
+        FakeContext(tmp_path, runner_user=runner), amc_root
+    ) is False
+
+
+def test_clone_amc_rejects_tracked_runtime_readme_change_with_path(tmp_path):
+    amc_root = tmp_path / "home" / "op" / "auto-magic-calib"
+    (amc_root / ".git").mkdir(parents=True)
+    runner = ScriptedRunner()
+    runner.when(
+        lambda a: a[-3:] == ("remote", "get-url", "origin"),
+        stdout=step3.AMC_REPO_URL,
+    )
+    runner.when(
+        lambda a: a[-2:] == ("rev-parse", "HEAD"), stdout=step3.AMC_COMMIT
+    )
+    runner.when(
+        lambda a: a[-2:] == ("status", "--porcelain"),
+        stdout=" M projects/README.md\n",
+    )
+
+    with pytest.raises(step3.AmcLaunchError, match="projects/README.md"):
+        step3.clone_amc(FakeContext(tmp_path, runner_user=runner), amc_root)
+
+
 # ---------------------------------------------------------------------------
 # ensure_projects_and_models() -- section 4 step 4
 # ---------------------------------------------------------------------------
@@ -1173,6 +1214,17 @@ def test_backend_requires_code_zero(tmp_path):
     )
 
 
+def test_compose_stack_running_requires_both_services(tmp_path):
+    runner = ScriptedRunner()
+    runner.when(
+        lambda a: a[:3] == ("docker", "compose", "ps"),
+        stdout="auto-magic-calib-ms\nauto-magic-calib-ui\n",
+    )
+    assert step3.compose_stack_running(
+        FakeContext(tmp_path, runner_user=runner), tmp_path
+    )
+
+
 def test_ui_requires_http_200(tmp_path):
     runner = ScriptedRunner(default_stdout="503")
     assert not step3.wait_for_ui(FakeContext(tmp_path, runner_root=runner), "http://localhost:5000")
@@ -1237,6 +1289,49 @@ def test_readiness_failure_is_fatal_and_tears_down_once(tmp_path, monkeypatch):
     result = step3.launch_amc(ctx, non_interactive=True)
     assert result.status is StepStatus.FAILED
     assert "status evidence" in result.message
+    assert len(downs) == 1
+
+
+def test_running_stack_reuses_configured_ports(tmp_path, monkeypatch):
+    runner = _passing_runner()
+    runner.when(
+        lambda a: a[:3] == ("docker", "compose", "ps"),
+        stdout="auto-magic-calib-ms\nauto-magic-calib-ui\n",
+    )
+    ctx = FakeContext(tmp_path, runner_user=runner)
+    _stub_amc_root_with_compose(ctx)
+    monkeypatch.setattr(step3, "ensure_container_prerequisites", lambda ctx: None)
+    monkeypatch.setattr(
+        step3,
+        "resolve_ports",
+        lambda ctx, cfg: pytest.fail("running AMC must retain its ports"),
+    )
+    monkeypatch.setattr(step3, "execute_hold", lambda *args, **kwargs: None)
+
+    result = step3.launch_amc(ctx, keep_up=True, non_interactive=True)
+
+    assert result.status is StepStatus.COMPLETE
+    assert not any(call[:3] == ("docker", "compose", "pull") for call in runner.calls)
+    assert not any(call[:3] == ("docker", "compose", "up") for call in runner.calls)
+
+
+def test_keyboard_interrupt_returns_failure_and_cleans_up(tmp_path, monkeypatch):
+    ctx = FakeContext(tmp_path, runner_user=_passing_runner())
+    _stub_amc_root_with_compose(ctx)
+    downs = []
+    monkeypatch.setattr(step3, "ensure_container_prerequisites", lambda ctx: None)
+    monkeypatch.setattr(
+        step3,
+        "wait_for_backend",
+        lambda ctx, url: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    monkeypatch.setattr(step3, "compose_down", lambda ctx, path: downs.append(path))
+    monkeypatch.setattr(step3, "_install_teardown_guards", lambda teardown: teardown)
+
+    result = step3.launch_amc(ctx, non_interactive=True)
+
+    assert result.status is StepStatus.FAILED
+    assert result.message == "AMC launch cancelled by the operator"
     assert len(downs) == 1
 
 

@@ -54,8 +54,11 @@ submodule.
 Every Git command checks its exit status and includes bounded stderr/stdout in
 the failure. An existing checkout is accepted only when its `origin` matches
 the pinned repository. A clean checkout at another revision is fetched and
-detached at the pin. A dirty checkout, unrelated directory, invalid origin, or
-partial clone fails without deleting or overwriting operator data.
+detached at the pin. Tracked source changes remain fatal, while untracked data
+created by AMC under `projects/` and `models/` and the installer-managed
+`compose/.env` are accepted on rerun. An unrelated directory, invalid origin,
+or partial clone fails without deleting or overwriting operator data; failures
+name the unexpected paths.
 
 `verify()` records the resolved commit. A launch must use the equality pin;
 tracking `main` is forbidden.
@@ -153,8 +156,12 @@ Bring-up runs in this exact order:
 
 1. **Validate configuration**: `docker compose config --quiet`.
 2. **Authenticate**: required NGC login.
-3. **Pull images**: `docker compose pull`, unless `--skip-pull` is explicit.
-4. **Start services**: `docker compose up -d`.
+3. **Reuse a live stack**: if both pinned Compose services are already running,
+   retain the configured ports and skip pull/start so an interrupted installer
+   can safely resume.
+4. **Pull images**: `docker compose pull`, unless `--skip-pull` is explicit or
+   the live stack is reused.
+5. **Start services**: `docker compose up -d` unless the stack is already live.
 
 Every command checks its return code. A failure is fatal and includes bounded
 command output. The installer never reports Step 3 complete after a failed
@@ -170,6 +177,10 @@ clone, login, Compose parse, image pull, or container start.
 `http://localhost:<MS_PORT>/v1/ready` for up to 120 seconds. A
 transport-success response is insufficient; parsed JSON must contain
 `"code": 0`. Then require HTTP `200` from `http://localhost:<UI_PORT>`.
+Expected connection failures during the container's first-run model downloads
+and parser build are retained in the transcript but hidden from the live
+terminal. Ctrl-C returns a clean cancellation failure and tears down a stack
+started by the interrupted attempt.
 
 Readiness failure is fatal. Capture bounded output from both:
 
@@ -275,8 +286,10 @@ created only after an actual launch.
 - [ ] NVIDIA repository, toolkit, runtime, and GPU-container checks pass.
 - [ ] Every Git, login, Compose, readiness, and project API failure is fatal.
 - [ ] The NGC key is absent from argv, logs, and error messages.
-- [ ] Dirty, unrelated, or partial AMC paths are preserved and diagnosed.
+- [ ] Tracked source edits are preserved and diagnosed; untracked AMC runtime
+      data under `projects/` and `models/` is rerun-safe.
 - [ ] UI/MS port collisions select and persist deterministic alternatives.
+- [ ] A live AMC stack retains its configured ports and skips pull/start.
 - [ ] Backend returns `code: 0`; UI returns HTTP `200`.
 - [ ] Browser process runs as the invoking user.
 - [ ] `LOCATION_ID`, `PROJECT_NAME`, and `AMC_PROJECT_ID` survive reruns.
