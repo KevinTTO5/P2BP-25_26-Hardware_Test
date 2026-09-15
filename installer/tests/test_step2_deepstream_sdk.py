@@ -1043,6 +1043,25 @@ def test_ensure_ngc_cli_rejects_bad_download_checksum(tmp_path):
     assert not archive.exists()
 
 
+def test_ensure_ngc_cli_preserves_checksum_failure_when_redownload_fails(tmp_path):
+    runner_user = ScriptedRunner(default_returncode=1)
+    ctx = FakeContext(tmp_path, runner_user=runner_user)
+    archive = (
+        ctx.install_dir
+        / step2.NGC_CLI_DOWNLOAD_RELATIVE_DIR
+        / step2.NGC_CLI_ARCHIVE
+    )
+    _write_ngc_cli_archive(archive)
+
+    ngc_path, failure = step2._ensure_ngc_cli(ctx)
+
+    assert ngc_path is None
+    assert failure is not None
+    assert failure.status is StepStatus.FAILED
+    assert "cached NGC CLI archive checksum mismatch" in failure.message
+    assert "replacement download also failed" in failure.message
+
+
 def test_extract_ngc_cli_rejects_path_traversal(tmp_path):
     archive = tmp_path / "ngc.zip"
     _write_ngc_cli_archive(archive, member="ngc-cli/../../escaped")

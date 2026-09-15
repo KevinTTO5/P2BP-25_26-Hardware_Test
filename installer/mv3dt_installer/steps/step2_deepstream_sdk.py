@@ -617,8 +617,12 @@ def _ensure_ngc_cli(ctx: "Context") -> tuple[Optional[str], Optional[StepResult]
     except OSError:
         pass
     archive = download_dir / NGC_CLI_ARCHIVE
-    if archive.is_file() and _sha256(archive) != NGC_CLI_SHA256:
-        archive.unlink()
+    cached_hash_mismatch = None
+    if archive.is_file():
+        cached_hash = _sha256(archive)
+        if cached_hash != NGC_CLI_SHA256:
+            cached_hash_mismatch = cached_hash
+            archive.unlink()
 
     if not archive.is_file():
         result = progress_exec.download(
@@ -638,6 +642,15 @@ def _ensure_ngc_cli(ctx: "Context") -> tuple[Optional[str], Optional[StepResult]
             task=NGC_CLI_ARCHIVE,
         )
         if result.returncode != 0 or not archive.is_file():
+            if cached_hash_mismatch is not None:
+                return None, StepResult(
+                    status=StepStatus.FAILED,
+                    message=(
+                        "cached NGC CLI archive checksum mismatch: expected "
+                        f"{NGC_CLI_SHA256}, got {cached_hash_mismatch}; "
+                        "automatic replacement download also failed"
+                    ),
+                )
             return None, StepResult(
                 status=StepStatus.USER_ACTION_REQUIRED,
                 message=f"could not download NVIDIA NGC CLI {NGC_CLI_VERSION}",
