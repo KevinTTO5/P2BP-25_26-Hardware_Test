@@ -858,10 +858,14 @@ def test_launch_b_pins_cudnn_version_at_apt_install(tmp_path):
         "libcudnn9-cuda-13",
     )
     assert s1.CUDNN_PACKAGES == expected_packages
-    assert all(f"{pkg}=9.20.0.48-1" in cudnn_call for pkg in expected_packages)
-    assert "--allow-downgrades" in cudnn_call
-    assert "--no-install-recommends" in cudnn_call
-    assert not any("*" in arg for arg in cudnn_call)
+    assert cudnn_call == (
+        "apt-get",
+        "install",
+        "-y",
+        "--no-install-recommends",
+        "--allow-downgrades",
+        *(f"{pkg}=9.20.0.48-1" for pkg in expected_packages),
+    )
     assert all((pkg, s1.CUDNN_VERSION) in ctx.installed for pkg in s1.CUDNN_PACKAGES)
 
     tensorrt_call = next(
