@@ -8,15 +8,12 @@ NGC key handoff section 10, install-location section 11) and the framework's
 subcommand dispatch extension it flags in its own section 6.2, built in
 `app.py` as `SUBCOMMAND_REGISTRY`/`register_subcommand`.
 
-Scope: bring up NVIDIA's AutoMagicCalib (AMC) stack via `docker compose`
-(cloned as a sparse checkout of the `NVIDIA/DeepStream` monorepo, per
-section 4 step 3's open decision -- the standalone
-`NVIDIA-AI-IOT/auto-magic-calib` repo predates the monorepo move this port
-targets), open the localhost UI, and hold the service up until the operator
-closes the dedicated AMC browser window (section 5) or signals done. `run()`
-always drops the durable `<install_dir>/bin/amc` wrapper + writes config
-(section 2's "deliverable vs. action" split) and only *offers* an immediate
-launch; declining is not a failure.
+Scope: provision Docker and the NVIDIA runtime, bring up the equality-pinned
+standalone NVIDIA AutoMagicCalib (AMC) 3.2.1 stack, establish its durable
+project identity, open the localhost UI as the invoking user, and hold the
+service up until the operator closes the dedicated AMC browser window or
+signals done. `run()` always drops the durable `<install_dir>/bin/amc` wrapper
+and only offers an immediate launch; declining is not a failure.
 
 `launch_amc(...)` is the one routine `run()`'s optional immediate launch,
 the registered `amc` subcommand handler, and (in a later, out-of-scope unit)
@@ -61,11 +58,13 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import json
 import os
 import pathlib
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -76,8 +75,9 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from mv3dt_installer import app as app_mod
 from mv3dt_installer import config as config_mod
+from mv3dt_installer import progress_exec
 from mv3dt_installer.steps import step2_deepstream_sdk as step2_mod
-from mv3dt_installer.steps import StepResult, StepStatus, UserAction, register
+from mv3dt_installer.steps import StepResult, StepStatus, register
 
 if TYPE_CHECKING:  # pragma: no cover -- import-time only, never at runtime.
     from mv3dt_installer.app import Context
@@ -103,17 +103,18 @@ __all__ = [
 ]
 
 # ---------------------------------------------------------------------------
-# STEP-3 section 1 / references -- AMC lives inside the NVIDIA/DeepStream
-# monorepo, sparse-checked-out to its own subdirectory (section 4 step 3).
+# STEP-3 section 2 -- standalone AMC 3.2.1 equality pin.
 # ---------------------------------------------------------------------------
 
-AMC_REPO_URL = "https://github.com/NVIDIA/DeepStream.git"
-AMC_SPARSE_PATH = "tools/auto-magic-calib"
+AMC_REPO_URL = "https://github.com/NVIDIA-AI-IOT/auto-magic-calib.git"
+AMC_COMMIT = "0cfd2b790fd77598b0543340a65c2a0e1d192327"
+AMC_VERSION = "3.2.1"
 
 DEFAULT_UI_PORT = "5000"
 DEFAULT_MS_PORT = "8000"
 DEFAULT_PROJECT_NAME = "default"
-DEFAULT_NVIDIA_VISIBLE_DEVICES = "all"
+MIN_COMPOSE_VERSION = (2, 20, 3)
+GPU_TEST_IMAGE = "ubuntu:24.04"
 
 # installer.conf keys (section 4.1's table), mirrored so a "run later" via
 # the `amc` exe resolves the same config the installer itself would.
@@ -123,7 +124,8 @@ CONF_UI_PORT_KEY = "AUTO_MAGIC_CALIB_UI_PORT"
 CONF_MS_PORT_KEY = "AUTO_MAGIC_CALIB_MS_PORT"
 CONF_MS_API_URL_KEY = "AUTO_MAGIC_CALIB_MS_API_URL"
 CONF_PROJECT_NAME_KEY = "PROJECT_NAME"
-CONF_NVIDIA_VISIBLE_DEVICES_KEY = "NVIDIA_VISIBLE_DEVICES"
+CONF_LOCATION_ID_KEY = "LOCATION_ID"
+CONF_AMC_PROJECT_ID_KEY = "AMC_PROJECT_ID"
 
 _STEP3_CONF_KEYS: tuple[str, ...] = (
     CONF_AMC_ROOT_KEY,
@@ -131,7 +133,7 @@ _STEP3_CONF_KEYS: tuple[str, ...] = (
     CONF_UI_PORT_KEY,
     CONF_MS_PORT_KEY,
     CONF_PROJECT_NAME_KEY,
-    CONF_NVIDIA_VISIBLE_DEVICES_KEY,
+    CONF_LOCATION_ID_KEY,
 )
 
 # section 4.2/4.3 -- the compose/.env key set, verbatim (not the same
@@ -143,14 +145,19 @@ ENV_KEYS: tuple[str, ...] = (
     "AUTO_MAGIC_CALIB_UI_PORT",
     "PROJECT_DIR",
     "MODEL_DIR",
-    "NVIDIA_VISIBLE_DEVICES",
 )
 
 AMC_WRAPPER_NAME = "amc"
 INSTALLER_BIN_NAME = "mv3dt-installer"
 
-_UI_WAIT_TIMEOUT_S = 30.0
+_SERVICE_WAIT_TIMEOUT_S = 120.0
 _UI_WAIT_POLL_S = 1.0
+
+_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,49}$")
+
+
+class AmcLaunchError(RuntimeError):
+    """Expected provisioning failure with safe, operator-facing evidence."""
 
 # section 5.1 -- browser candidates, in the order the doc lists them.
 _CHROMIUM_FAMILY: tuple[str, ...] = (
@@ -174,7 +181,6 @@ class AmcConfig:
     ms_port: str
     ms_api_url: str
     project_name: str
-    nvidia_visible_devices: str = DEFAULT_NVIDIA_VISIBLE_DEVICES
 
 
 _HOST_IP_RE = re.compile(r"\bsrc\s+(\d{1,3}(?:\.\d{1,3}){3})\b")
@@ -227,9 +233,6 @@ def resolve_config(
         ms_port=conf.get(CONF_MS_PORT_KEY) or DEFAULT_MS_PORT,
         ms_api_url=conf.get(CONF_MS_API_URL_KEY) or "",
         project_name=project or conf.get(CONF_PROJECT_NAME_KEY) or DEFAULT_PROJECT_NAME,
-        nvidia_visible_devices=(
-            conf.get(CONF_NVIDIA_VISIBLE_DEVICES_KEY) or DEFAULT_NVIDIA_VISIBLE_DEVICES
-        ),
     )
 
 
@@ -244,12 +247,65 @@ def persist_config(ctx: "Context", cfg: AmcConfig) -> None:
         CONF_UI_PORT_KEY: cfg.ui_port,
         CONF_MS_PORT_KEY: cfg.ms_port,
         CONF_PROJECT_NAME_KEY: cfg.project_name,
-        CONF_NVIDIA_VISIBLE_DEVICES_KEY: cfg.nvidia_visible_devices,
     }
     for key, value in values.items():
         if key not in ctx.conf:
             config_mod.persist_value(ctx.install_dir, key, value)
             ctx.conf[key] = value
+
+
+def _persist(ctx: "Context", key: str, value: str) -> None:
+    """Persist one resolved Step 3 value and keep the in-memory view current."""
+    if ctx.conf.get(key) == value:
+        return
+    config_mod.persist_value(ctx.install_dir, key, value)
+    ctx.conf[key] = value
+
+
+def _validated_identity(value: str, label: str) -> str:
+    value = value.strip()
+    if not _IDENTITY_RE.fullmatch(value):
+        raise AmcLaunchError(
+            f"{label} must be 3-50 characters using letters, numbers, '.', '_', "
+            "or '-', and must start with a letter or number"
+        )
+    return value
+
+
+def resolve_project_identity(
+    ctx: "Context",
+    *,
+    project: Optional[str] = None,
+    location_id: Optional[str] = None,
+) -> tuple[str, str]:
+    """Resolve and persist the site identity before AMC is launched.
+
+    Interactive installs ask only for missing values. Automation must provide
+    both values through persisted configuration or explicit subcommand flags.
+    PROJECT_NAME defaults to LOCATION_ID so the names cannot silently drift.
+    """
+    location = location_id or ctx.conf.get(CONF_LOCATION_ID_KEY)
+    if not location:
+        if ctx.non_interactive:
+            raise AmcLaunchError(
+                "LOCATION_ID is required in installer.conf or via --location-id "
+                "for a non-interactive AMC launch"
+            )
+        location = _INPUT("Location ID (3-50 letters, numbers, ._-): ")
+    location = _validated_identity(location, CONF_LOCATION_ID_KEY)
+
+    project_name = project or ctx.conf.get(CONF_PROJECT_NAME_KEY)
+    if not project_name:
+        if ctx.non_interactive:
+            project_name = location
+        else:
+            answer = _INPUT(f"AMC project name [{location}]: ").strip()
+            project_name = answer or location
+    project_name = _validated_identity(project_name, CONF_PROJECT_NAME_KEY)
+
+    _persist(ctx, CONF_LOCATION_ID_KEY, location)
+    _persist(ctx, CONF_PROJECT_NAME_KEY, project_name)
+    return location, project_name
 
 
 # ---------------------------------------------------------------------------
@@ -294,56 +350,94 @@ def check_repo_isolation(amc_root: pathlib.Path) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# section 4 step 3 -- sparse-checkout clone
+# section 2 -- pinned standalone checkout
 # ---------------------------------------------------------------------------
 
 
-def clone_amc(ctx: "Context", amc_root: pathlib.Path) -> bool:
-    """Sparse-checkout clone of `tools/auto-magic-calib` out of the
-    `NVIDIA/DeepStream` monorepo (section 4 step 3), as the invoking user.
-    Returns `True` when a clone was actually performed, `False` when
-    `amc_root` already existed (section 4 step 3: "log 'AMC repo already
-    present'").
-    """
-    if amc_root.is_dir():
-        return False
+def _result_detail(result: subprocess.CompletedProcess, limit: int = 1600) -> str:
+    detail = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()
+    return detail[-limit:] or "no command output"
 
-    amc_root.parent.mkdir(parents=True, exist_ok=True)
-    ctx.run_as_user(
-        "git",
-        "clone",
-        "--filter=blob:none",
-        "--no-checkout",
-        AMC_REPO_URL,
-        str(amc_root),
-        check=False,
-        capture_output=True,
-        text=True,
+
+def _run_git(ctx: "Context", *args: str) -> subprocess.CompletedProcess:
+    result = ctx.run_as_user(
+        "git", *args, check=False, capture_output=True, text=True
     )
-    ctx.run_as_user(
-        "git",
-        "-C",
-        str(amc_root),
-        "sparse-checkout",
-        "set",
-        AMC_SPARSE_PATH,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    ctx.run_as_user(
-        "git", "-C", str(amc_root), "checkout", check=False, capture_output=True, text=True
-    )
-    return True
+    if result.returncode != 0:
+        raise AmcLaunchError(
+            f"git {' '.join(args)} failed (exit {result.returncode}): "
+            f"{_result_detail(result)}"
+        )
+    return result
+
+
+def _normalise_repo_url(value: str) -> str:
+    return value.strip().removesuffix("/").removesuffix(".git")
+
+
+def clone_amc(ctx: "Context", amc_root: pathlib.Path) -> bool:
+    """Install or safely reconcile the standalone AMC checkout at its pin."""
+    if not amc_root.exists():
+        result = ctx.run_as_user(
+            "git",
+            "clone",
+            "--progress",
+            AMC_REPO_URL,
+            str(amc_root),
+            check=False,
+            capture_output=True,
+            text=True,
+            stream=True,
+        )
+        if result.returncode != 0:
+            raise AmcLaunchError(
+                f"AMC clone failed (exit {result.returncode}); any partial path "
+                f"was preserved at {amc_root}: {_result_detail(result)}"
+            )
+        _run_git(ctx, "-C", str(amc_root), "checkout", "--detach", AMC_COMMIT)
+        return True
+
+    if not amc_root.is_dir() or not (amc_root / ".git").exists():
+        raise AmcLaunchError(
+            f"AMC_ROOT exists but is not an AMC git checkout: {amc_root}. "
+            "Move it aside or choose a different AMC_ROOT; no files were deleted."
+        )
+
+    remote = _run_git(
+        ctx, "-C", str(amc_root), "remote", "get-url", "origin"
+    ).stdout.strip()
+    if _normalise_repo_url(remote) != _normalise_repo_url(AMC_REPO_URL):
+        raise AmcLaunchError(
+            f"AMC_ROOT origin is {remote!r}, expected {AMC_REPO_URL!r}; "
+            "the installer will not overwrite this checkout"
+        )
+
+    head = resolved_amc_commit(ctx, amc_root)
+    dirty_lines = _run_git(
+        ctx, "-C", str(amc_root), "status", "--porcelain"
+    ).stdout.splitlines()
+    unexpected = [
+        line for line in dirty_lines if line[3:].strip() != "compose/.env"
+    ]
+    if unexpected:
+        raise AmcLaunchError(
+            "AMC checkout has local changes outside the installer-managed "
+            "compose/.env; commit or move those changes before retrying"
+        )
+    if head == AMC_COMMIT:
+        return False
+    _run_git(ctx, "-C", str(amc_root), "fetch", "origin", AMC_COMMIT)
+    _run_git(ctx, "-C", str(amc_root), "checkout", "--detach", AMC_COMMIT)
+    if resolved_amc_commit(ctx, amc_root) != AMC_COMMIT:
+        raise AmcLaunchError("AMC checkout did not resolve to the required commit")
+    return False
 
 
 def resolved_amc_commit(ctx: "Context", amc_root: pathlib.Path) -> Optional[str]:
-    """`git rev-parse HEAD` inside the AMC clone (section 7.3: "no pinned
-    upstream AMC version -- AMC tracks the tools/auto-magic-calib path in
-    NVIDIA/DeepStream main; verify() records the resolved commit for the
-    transcript rather than equality-pinning it"). Returns `None` when the
-    clone doesn't exist or the command fails -- never raises, since this is
-    informational only and must not itself fail `verify()`.
+    """Return the AMC checkout's resolved commit, or ``None`` on failure.
+
+    ``verify()`` compares a returned value with ``AMC_COMMIT``. A missing
+    checkout remains valid before the operator accepts the optional launch.
     """
     result = ctx.run_as_user(
         "git",
@@ -393,24 +487,18 @@ def ensure_projects_and_models(
 
 
 # ---------------------------------------------------------------------------
-# section 4 step 5 -- optional `docker login nvcr.io`
+# section 5 -- required `docker login nvcr.io`
 # ---------------------------------------------------------------------------
 
 
-def docker_login(ctx: "Context") -> bool:
-    """`docker login nvcr.io` using the onboarding-stored NGC key (section
-    4 step 5), mirroring `step2_deepstream_sdk._docker_login`'s pattern:
-    the key is sourced from `secrets/ngc.env` inside the child shell, never
-    interpolated into this module's source or passed as a bare CLI
-    argument. Best-effort: a failure only warns (AMC images may be
-    public) and never fails the step.
-    """
+def docker_login(ctx: "Context") -> None:
+    """Authenticate to NGC without placing the API key in argv or logs."""
     secrets_path = ctx.install_dir / "secrets" / "ngc.env"
     if not secrets_path.is_file():
-        ctx.log.warn(
-            "NGC_API_KEY not found; assuming 'docker login nvcr.io' was already run"
+        raise AmcLaunchError(
+            f"NGC credentials are missing at {secrets_path}; AMC images require "
+            "an authenticated nvcr.io login"
         )
-        return False
 
     script = (
         'set -a; . "$NGC_ENV_FILE"; set +a; '
@@ -428,12 +516,10 @@ def docker_login(ctx: "Context") -> bool:
         text=True,
     )
     if result.returncode != 0:
-        ctx.log.warn(
-            "'docker login nvcr.io' failed; if AMC images are public you can "
-            "ignore this"
+        raise AmcLaunchError(
+            f"docker login nvcr.io failed (exit {result.returncode}); child "
+            "output omitted because the process handled NGC_API_KEY"
         )
-        return False
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -442,23 +528,9 @@ def docker_login(ctx: "Context") -> bool:
 
 
 def locate_compose_dir(amc_root: pathlib.Path) -> Optional[pathlib.Path]:
-    """Port of `30_start_amc.sh`'s compose-dir search order (section 4 step
-    6): the monorepo layout first, then a standalone-repo checkout's own
-    `compose/`, then the repo root itself if a compose file sits there
-    directly. `None` means "upstream AMC layout changed".
-    """
-    monorepo = amc_root / "tools" / "auto-magic-calib" / "compose"
-    if monorepo.is_dir():
-        return monorepo
-
-    fallback = amc_root / "compose"
-    if fallback.is_dir():
-        return fallback
-
-    if (amc_root / "compose.yaml").is_file() or (amc_root / "docker-compose.yml").is_file():
-        return amc_root
-
-    return None
+    """Return the pinned standalone checkout's compose directory."""
+    compose = amc_root / "compose"
+    return compose if (compose / "compose.yml").is_file() else None
 
 
 # ---------------------------------------------------------------------------
@@ -472,10 +544,14 @@ def check_env_drift(compose_dir: pathlib.Path) -> list[str]:
     (including when `.env.example` itself is absent -- nothing to diff
     against) means no drift detected.
     """
-    example = compose_dir / ".env.example"
-    try:
-        text = example.read_text(encoding="utf-8")
-    except OSError:
+    text = None
+    for name in (".env.example", ".env"):
+        try:
+            text = (compose_dir / name).read_text(encoding="utf-8")
+            break
+        except OSError:
+            pass
+    if text is None:
         return []
     missing = []
     for key in ENV_KEYS:
@@ -500,8 +576,6 @@ def render_env(cfg: AmcConfig) -> str:
         f"AUTO_MAGIC_CALIB_UI_PORT={cfg.ui_port}",
         f"PROJECT_DIR={cfg.amc_root / 'projects'}",
         f"MODEL_DIR={cfg.amc_root / 'models'}",
-        f"NVIDIA_VISIBLE_DEVICES={cfg.nvidia_visible_devices}",
-        f"PROJECT_NAME={cfg.project_name}",
     ]
     if cfg.ms_api_url:
         lines.append(f"AUTO_MAGIC_CALIB_MS_API_URL={cfg.ms_api_url}")
@@ -533,41 +607,42 @@ def write_env_atomic(compose_dir: pathlib.Path, content: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def compose_pull(ctx: "Context", compose_dir: pathlib.Path) -> None:
-    ctx.run_as_user(
+def _run_compose(ctx: "Context", compose_dir: pathlib.Path, *args: str):
+    kwargs: dict[str, Any] = {}
+    if args and args[0] in ("pull", "up"):
+        kwargs["stream"] = True
+    result = ctx.run_as_user(
         "docker",
         "compose",
-        "pull",
+        *args,
         cwd=str(compose_dir),
         check=False,
         capture_output=True,
         text=True,
+        **kwargs,
     )
+    if result.returncode != 0:
+        raise AmcLaunchError(
+            f"docker compose {' '.join(args)} failed (exit {result.returncode}): "
+            f"{_result_detail(result)}"
+        )
+    return result
+
+
+def compose_validate(ctx: "Context", compose_dir: pathlib.Path) -> None:
+    _run_compose(ctx, compose_dir, "config", "--quiet")
+
+
+def compose_pull(ctx: "Context", compose_dir: pathlib.Path) -> None:
+    _run_compose(ctx, compose_dir, "pull")
 
 
 def compose_up(ctx: "Context", compose_dir: pathlib.Path) -> None:
-    ctx.run_as_user(
-        "docker",
-        "compose",
-        "up",
-        "-d",
-        cwd=str(compose_dir),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    _run_compose(ctx, compose_dir, "up", "-d")
 
 
 def compose_down(ctx: "Context", compose_dir: pathlib.Path) -> None:
-    ctx.run_as_user(
-        "docker",
-        "compose",
-        "down",
-        cwd=str(compose_dir),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    _run_compose(ctx, compose_dir, "down")
 
 
 # ---------------------------------------------------------------------------
@@ -575,36 +650,68 @@ def compose_down(ctx: "Context", compose_dir: pathlib.Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def wait_for_ui(
+def wait_for_backend(
     ctx: "Context",
     url: str,
     *,
-    timeout_s: float = _UI_WAIT_TIMEOUT_S,
+    timeout_s: float = _SERVICE_WAIT_TIMEOUT_S,
     poll_s: float = _UI_WAIT_POLL_S,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> bool:
-    """Port of `30_start_amc.sh`'s `_wait_amc_ui()` (section 4 step 9):
-    `curl -sf` the UI URL for up to `timeout_s`. Non-fatal either way --
-    the caller logs a `docker compose logs` hint on timeout.
-    """
+    """Wait until the AMC microservice returns JSON with ``code: 0``."""
     started = clock()
     while True:
         result = ctx.run_root(
             "curl",
-            "-sf",
+            "-fsS",
             "--max-time",
-            "1",
+            "5",
             url,
             check=False,
             capture_output=True,
             text=True,
         )
         if result.returncode == 0:
-            return True
+            try:
+                if json.loads(result.stdout or "{}").get("code") == 0:
+                    return True
+            except (json.JSONDecodeError, AttributeError):
+                pass
         if clock() - started >= timeout_s:
             return False
         sleep(poll_s)
+
+
+def wait_for_ui(ctx: "Context", url: str) -> bool:
+    """Require an exact HTTP 200 response from the UI."""
+    result = ctx.run_root(
+        "curl",
+        "-sS",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "--max-time",
+        "5",
+        url,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and (result.stdout or "").strip() == "200"
+
+
+def compose_diagnostics(ctx: "Context", compose_dir: pathlib.Path) -> str:
+    """Capture bounded status and logs for a fatal readiness failure."""
+    chunks = []
+    for args in (("ps",), ("logs", "--tail", "80")):
+        result = ctx.run_as_user(
+            "docker", "compose", *args, cwd=str(compose_dir), check=False,
+            capture_output=True, text=True,
+        )
+        chunks.append(f"docker compose {' '.join(args)}:\n{_result_detail(result, 3000)}")
+    return "\n".join(chunks)
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +783,7 @@ def _browser_argv(browser: str, url: str, profile_dir: str) -> list[str]:
 
 
 def open_dedicated_window(
+    ctx: "Context",
     url: str,
     *,
     popen: Optional[Callable[..., Any]] = None,
@@ -694,14 +802,29 @@ def open_dedicated_window(
     if browser is None:
         return None
     profile_dir = mkdtemp(prefix="mv3dt-amc-browser-")
+    ownership = ctx.run_root(
+        "chown", f"{ctx.user.uid}:{ctx.user.gid}", profile_dir,
+        check=False, capture_output=True, text=True,
+    )
+    if ownership.returncode != 0:
+        raise AmcLaunchError(
+            f"could not hand browser profile to {ctx.user.name}: "
+            f"{_result_detail(ownership)}"
+        )
     argv = _browser_argv(browser, url, profile_dir)
-    return popen(argv)
+    env_args = []
+    for key in ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS"):
+        if os.environ.get(key):
+            env_args.append(f"{key}={os.environ[key]}")
+    return popen(["sudo", "-u", ctx.user.name, "-H", "env", *env_args, *argv])
 
 
-def _xdg_open(url: str, *, popen: Optional[Callable[..., Any]] = None) -> None:
+def _xdg_open(
+    ctx: "Context", url: str, *, popen: Optional[Callable[..., Any]] = None
+) -> None:
     popen = popen or subprocess.Popen
     try:
-        popen(["xdg-open", url])
+        popen(["sudo", "-u", ctx.user.name, "-H", "xdg-open", url])
     except OSError:
         pass
 
@@ -759,19 +882,18 @@ def execute_hold(
     arriving during `proc.wait()`/the prompt and a normal fall-through both
     routed through the exact same run-once state.
     """
-    if keep_up:
-        ctx.log.info(f"--keep-up set: leaving AMC running at {url}")
-        return
-
     if strategy is HoldStrategy.DEDICATED_WINDOW:
-        proc = open_dedicated_window(url, popen=popen, which=which)
+        proc = open_dedicated_window(ctx, url, popen=popen, which=which)
         if proc is not None:
             ctx.log.info(
                 f"AutoMagicCalib is running at {url} -- close the AMC browser "
                 "window when you're done; the service stays up until you do."
             )
             proc.wait()
-            teardown()
+            if keep_up:
+                ctx.log.info(f"--keep-up set: leaving AMC running at {url}")
+            else:
+                teardown()
             return
         # No browser after all (race between decide_hold_strategy's check
         # and here, or a caller passed the strategy in directly) -- fall
@@ -779,12 +901,13 @@ def execute_hold(
         strategy = HoldStrategy.PRINT_URL_AND_PROMPT
 
     if strategy is HoldStrategy.XDG_OPEN_AND_PROMPT:
-        _xdg_open(url, popen=popen)
+        _xdg_open(ctx, url, popen=popen)
         try:
             prompt("Press Enter (or Ctrl-C) when you have closed AMC to shut it down.")
         except KeyboardInterrupt:
             pass
-        teardown()
+        if not keep_up:
+            teardown()
         return
 
     if strategy is HoldStrategy.PRINT_URL_AND_PROMPT:
@@ -793,7 +916,8 @@ def execute_hold(
             prompt("Press Enter (or Ctrl-C) when you have closed AMC to shut it down.")
         except KeyboardInterrupt:
             pass
-        teardown()
+        if not keep_up:
+            teardown()
         return
 
     # PRINT_URL_AND_LEAVE_UP -- non-interactive with nothing to monitor and
@@ -893,16 +1017,20 @@ def _docker_usable(ctx: "Context") -> bool:
     return info.returncode == 0
 
 
-def _compose_available(ctx: "Context") -> bool:
+def _compose_version(ctx: "Context") -> Optional[tuple[int, int, int]]:
     result = ctx.run_as_user(
-        "docker", "compose", "version", check=False, capture_output=True, text=True
+        "docker", "compose", "version", "--short", check=False,
+        capture_output=True, text=True,
     )
-    if result.returncode == 0:
-        return True
-    legacy = ctx.run_as_user(
-        "docker-compose", "version", check=False, capture_output=True, text=True
-    )
-    return legacy.returncode == 0
+    if result.returncode != 0:
+        return None
+    match = re.search(r"(?:v)?(\d+)\.(\d+)\.(\d+)", result.stdout or "")
+    return tuple(map(int, match.groups())) if match else None
+
+
+def _compose_available(ctx: "Context") -> bool:
+    version = _compose_version(ctx)
+    return version is not None and version >= MIN_COMPOSE_VERSION
 
 
 def _nvidia_runtime_registered(ctx: "Context") -> bool:
@@ -910,32 +1038,219 @@ def _nvidia_runtime_registered(ctx: "Context") -> bool:
     return "nvidia" in (info.stdout or "").lower()
 
 
-def _git_present(ctx: "Context") -> bool:
-    result = ctx.run_root("which", "git", check=False, capture_output=True, text=True)
-    return result.returncode == 0
+def _port_is_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
 
 
-def _docker_install_actions(ctx: "Context") -> list[UserAction]:
-    """The section 3 remediation block, verbatim commands."""
-    return [
-        UserAction(
-            text="Install Docker Engine + the compose plugin.",
-            command="sudo apt-get install -y docker.io docker-compose-plugin",
-        ),
-        UserAction(
-            text="Install the NVIDIA Container Toolkit.",
-            command="sudo apt-get install -y nvidia-container-toolkit",
-        ),
-        UserAction(
-            text="Wire the toolkit into the Docker daemon.",
-            command="sudo nvidia-ctk runtime configure --runtime=docker",
-        ),
-        UserAction(text="Restart Docker.", command="sudo systemctl restart docker"),
-        UserAction(
-            text="Let the invoking user run docker without sudo.",
-            command=f"sudo usermod -aG docker {ctx.user.name}",
-        ),
-    ]
+def _select_free_port(preferred: str, *, reserved: set[int]) -> str:
+    try:
+        start = int(preferred)
+    except ValueError as exc:
+        raise AmcLaunchError(f"invalid TCP port: {preferred!r}") from exc
+    if not 1 <= start <= 65535:
+        raise AmcLaunchError(f"invalid TCP port: {preferred!r}")
+    for port in range(start, min(start + 100, 65536)):
+        if port not in reserved and _port_is_free(port):
+            reserved.add(port)
+            return str(port)
+    raise AmcLaunchError(f"no free TCP port found in {start}-{min(start + 99, 65535)}")
+
+
+def resolve_ports(ctx: "Context", cfg: AmcConfig) -> AmcConfig:
+    """Select and persist deterministic free ports, starting at configured values."""
+    reserved: set[int] = set()
+    ui_port = _select_free_port(cfg.ui_port, reserved=reserved)
+    ms_port = _select_free_port(cfg.ms_port, reserved=reserved)
+    if ui_port != cfg.ui_port:
+        ctx.log.warn(f"AMC UI port {cfg.ui_port} is occupied; using {ui_port}")
+    if ms_port != cfg.ms_port:
+        ctx.log.warn(f"AMC microservice port {cfg.ms_port} is occupied; using {ms_port}")
+    _persist(ctx, CONF_UI_PORT_KEY, ui_port)
+    _persist(ctx, CONF_MS_PORT_KEY, ms_port)
+    return AmcConfig(
+        amc_root=cfg.amc_root, host_ip=cfg.host_ip, ui_port=ui_port,
+        ms_port=ms_port, ms_api_url=cfg.ms_api_url,
+        project_name=cfg.project_name,
+    )
+
+
+def _json_object(result: subprocess.CompletedProcess, label: str) -> dict[str, Any]:
+    if result.returncode != 0:
+        raise AmcLaunchError(
+            f"{label} failed (exit {result.returncode}): {_result_detail(result)}"
+        )
+    try:
+        payload = json.loads(result.stdout or "")
+    except json.JSONDecodeError as exc:
+        raise AmcLaunchError(f"{label} returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise AmcLaunchError(f"{label} returned an unexpected JSON value")
+    if "code" in payload and payload.get("code") != 0:
+        message = payload.get("message") or payload.get("detail") or payload
+        raise AmcLaunchError(f"{label} returned an error: {message}")
+    return payload
+
+
+def ensure_amc_project(ctx: "Context", cfg: AmcConfig) -> str:
+    """Select the persisted AMC project or create it exactly once."""
+    api = f"http://localhost:{cfg.ms_port}/v1"
+    existing = (ctx.conf.get(CONF_AMC_PROJECT_ID_KEY) or "").strip()
+    if existing:
+        result = ctx.run_root(
+            "curl", "-fsS", "--max-time", "10",
+            f"{api}/get_project_info/{existing}", check=False,
+            capture_output=True, text=True,
+        )
+        payload = _json_object(result, f"AMC project {existing} lookup")
+        info = payload.get("project_info") or payload
+        actual_name = info.get("project_name") if isinstance(info, dict) else None
+        if actual_name and actual_name != cfg.project_name:
+            raise AmcLaunchError(
+                f"persisted AMC_PROJECT_ID {existing} belongs to {actual_name!r}, "
+                f"not configured PROJECT_NAME {cfg.project_name!r}"
+            )
+        return existing
+
+    result = ctx.run_root(
+        "curl", "-fsS", "--max-time", "15", "-X", "POST",
+        "--data-urlencode", f"project_name={cfg.project_name}",
+        f"{api}/create_project", check=False, capture_output=True, text=True,
+    )
+    payload = _json_object(result, f"AMC project {cfg.project_name!r} creation")
+    project_id = str(payload.get("project_id") or "").strip()
+    if not project_id:
+        raise AmcLaunchError(
+            "AMC create_project response did not include project_id; the installer "
+            "will not guess among existing projects"
+        )
+    _persist(ctx, CONF_AMC_PROJECT_ID_KEY, project_id)
+    return project_id
+
+
+def _run_required(ctx: "Context", label: str, *args: str):
+    result = ctx.run_root(*args, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise AmcLaunchError(
+            f"{label} failed (exit {result.returncode}): {_result_detail(result)}"
+        )
+    return result
+
+
+def _package_installed(ctx: "Context", package: str) -> bool:
+    result = ctx.run_root(
+        "dpkg-query", "-W", "-f=${Status}", package,
+        check=False, capture_output=True, text=True,
+    )
+    return result.returncode == 0 and "install ok installed" in (result.stdout or "")
+
+
+def _apt_install(ctx: "Context", *packages: str) -> None:
+    result = progress_exec.apt(
+        ctx, "install", "-y", "--no-install-recommends", *packages,
+        check=False, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise AmcLaunchError(
+            f"apt-get install {' '.join(packages)} failed (exit "
+            f"{result.returncode}): {_result_detail(result)}"
+        )
+
+
+def ensure_container_prerequisites(ctx: "Context") -> None:
+    """Idempotently provision Docker, Compose v2 and NVIDIA runtime."""
+    ctx.progress.task("Docker and NVIDIA container prerequisites")
+    base_packages = ("docker.io", "docker-compose-v2", "git", "curl", "ca-certificates", "gnupg")
+    missing = tuple(pkg for pkg in base_packages if not _package_installed(ctx, pkg))
+    if missing:
+        ctx.progress.task("installing Docker and Compose prerequisites")
+        update = progress_exec.apt(
+            ctx, "update", check=False, capture_output=True, text=True
+        )
+        if update.returncode != 0:
+            raise AmcLaunchError(
+                f"apt-get update failed (exit {update.returncode}): "
+                f"{_result_detail(update)}"
+            )
+        _apt_install(ctx, *missing)
+
+    if not _package_installed(ctx, "nvidia-container-toolkit"):
+        ctx.progress.task("installing NVIDIA Container Toolkit")
+        key_fd, key_path = tempfile.mkstemp(prefix="mv3dt-nvidia-key-", dir="/tmp")
+        os.close(key_fd)
+        try:
+            _run_required(
+                ctx, "NVIDIA toolkit key download", "curl", "-fsSL",
+                "-o", key_path, "https://nvidia.github.io/libnvidia-container/gpgkey",
+            )
+            _run_required(
+                ctx, "NVIDIA toolkit key install", "gpg", "--dearmor", "--yes",
+                "--output", "/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
+                key_path,
+            )
+        finally:
+            try:
+                os.unlink(key_path)
+            except OSError:
+                pass
+        repo_script = (
+            "set -o pipefail; curl -fsSL "
+            "https://nvidia.github.io/libnvidia-container/stable/deb/"
+            "nvidia-container-toolkit.list | sed "
+            "'s#deb https://#deb [signed-by=/usr/share/keyrings/"
+            "nvidia-container-toolkit-keyring.gpg] https://#g' > "
+            "/etc/apt/sources.list.d/nvidia-container-toolkit.list"
+        )
+        _run_required(ctx, "NVIDIA toolkit repository setup", "bash", "-c", repo_script)
+        update = progress_exec.apt(
+            ctx, "update", check=False, capture_output=True, text=True
+        )
+        if update.returncode != 0:
+            raise AmcLaunchError(
+                f"apt-get update for NVIDIA toolkit failed (exit "
+                f"{update.returncode}): {_result_detail(update)}"
+            )
+        _apt_install(ctx, "nvidia-container-toolkit")
+
+    _run_required(ctx, "Docker service enable", "systemctl", "enable", "--now", "docker")
+    if not _nvidia_runtime_registered(ctx):
+        _run_required(
+            ctx, "NVIDIA Docker runtime configuration", "nvidia-ctk",
+            "runtime", "configure", "--runtime=docker",
+        )
+        _run_required(ctx, "Docker restart", "systemctl", "restart", "docker")
+
+    _run_required(ctx, "docker group membership", "usermod", "-aG", "docker", ctx.user.name)
+
+    if not _docker_usable(ctx):
+        raise AmcLaunchError(
+            f"Docker is installed but unavailable to {ctx.user.name}; log out and "
+            "back in if group membership was just changed"
+        )
+    version = _compose_version(ctx)
+    if version is None or version < MIN_COMPOSE_VERSION:
+        found = ".".join(map(str, version)) if version else "unavailable"
+        raise AmcLaunchError(
+            f"Docker Compose >=2.20.3 is required for AMC include support; found {found}"
+        )
+    if not _nvidia_runtime_registered(ctx):
+        raise AmcLaunchError("the nvidia runtime was not registered after configuration")
+
+    ctx.progress.task("validating GPU container access")
+    gpu = ctx.run_as_user(
+        "docker", "run", "--rm", "--gpus", "all", GPU_TEST_IMAGE,
+        "nvidia-smi", "-L", check=False, capture_output=True, text=True,
+        stream=True,
+    )
+    if gpu.returncode != 0 or "GPU" not in (gpu.stdout or ""):
+        raise AmcLaunchError(
+            f"NVIDIA GPU container validation failed (exit {gpu.returncode}): "
+            f"{_result_detail(gpu)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -947,110 +1262,134 @@ def launch_amc(
     ctx: "Context",
     *,
     project: Optional[str] = None,
+    location_id: Optional[str] = None,
     skip_pull: bool = False,
     keep_up: bool = False,
     host_ip_override: Optional[str] = None,
     no_open: bool = False,
     non_interactive: bool = False,
+    _prereqs_ready: bool = False,
 ) -> StepResult:
     """The shared AMC bring-up + hold-until-close routine (sections 4-5).
     Called by `run()`'s optional immediate launch, the registered `amc`
     subcommand, and (a later unit) Step 5's re-run entry point."""
-    cfg = resolve_config(ctx, project=project, host_ip_override=host_ip_override)
+    compose_dir: Optional[pathlib.Path] = None
+    up_started = False
+    teardown: Optional[Callable[[], None]] = None
+    try:
+        _, project_name = resolve_project_identity(
+            ctx, project=project, location_id=location_id
+        )
+        if not _prereqs_ready:
+            ensure_container_prerequisites(ctx)
+        cfg = resolve_config(
+            ctx, project=project_name, host_ip_override=host_ip_override
+        )
+        cfg = resolve_ports(ctx, cfg)
 
-    guard = check_repo_isolation(cfg.amc_root)
-    if guard is not None:
-        return StepResult(status=StepStatus.FAILED, message=guard)
+        guard = check_repo_isolation(cfg.amc_root)
+        if guard is not None:
+            raise AmcLaunchError(guard)
+        persist_config(ctx, cfg)
 
-    persist_config(ctx, cfg)
+        cloned = clone_amc(ctx, cfg.amc_root)
+        label = f"{AMC_VERSION}@{AMC_COMMIT[:12]}"
+        if cloned:
+            ctx.report_installed("auto-magic-calib", label)
+        else:
+            ctx.report_already_installed("auto-magic-calib", label)
 
-    cloned = clone_amc(ctx, cfg.amc_root)
-    if cloned:
-        ctx.report_installed("auto-magic-calib", f"{AMC_SPARSE_PATH}@main")
-    else:
-        ctx.report_already_installed("auto-magic-calib", f"{AMC_SPARSE_PATH}@main")
+        ensure_projects_and_models(ctx, cfg.amc_root)
 
-    ensure_projects_and_models(ctx, cfg.amc_root)
-    docker_login(ctx)
+        compose_dir = locate_compose_dir(cfg.amc_root)
+        if compose_dir is None:
+            raise AmcLaunchError(
+                f"cannot locate compose/compose.yml inside {cfg.amc_root}; "
+                "the pinned AMC checkout is incomplete"
+            )
 
-    compose_dir = locate_compose_dir(cfg.amc_root)
-    if compose_dir is None:
-        return StepResult(
-            status=StepStatus.FAILED,
-            message=(
-                f"cannot locate compose dir inside {cfg.amc_root}; upstream AMC "
-                "layout changed -- re-check the tools/auto-magic-calib README "
-                "in NVIDIA/DeepStream"
-            ),
+        for key in check_env_drift(compose_dir):
+            ctx.log.warn(f"pinned AMC environment no longer defines {key!r}")
+
+        env_changed = write_env_atomic(compose_dir, render_env(cfg))
+        ownership = ctx.run_root(
+            "chown", f"{ctx.user.uid}:{ctx.user.gid}", str(compose_dir / ".env"),
+            check=False, capture_output=True, text=True,
+        )
+        if ownership.returncode != 0:
+            raise AmcLaunchError(
+                f"could not hand AMC .env to {ctx.user.name}: "
+                f"{_result_detail(ownership)}"
+            )
+        if env_changed:
+            ctx.report_installed("AMC compose/.env", cfg.project_name)
+        else:
+            ctx.report_already_installed("AMC compose/.env", cfg.project_name)
+
+        compose_validate(ctx, compose_dir)
+        docker_login(ctx)
+
+        def _teardown() -> None:
+            assert compose_dir is not None
+            compose_down(ctx, compose_dir)
+
+        # Arm cleanup before pull/up/readiness. The two explicit leave-up modes
+        # must not register an atexit hook that immediately undoes their work.
+        teardown = _teardown if (keep_up or no_open) else _install_teardown_guards(_teardown)
+
+        if not skip_pull:
+            compose_pull(ctx, compose_dir)
+        up_started = True
+        compose_up(ctx, compose_dir)
+
+        api_url = f"http://localhost:{cfg.ms_port}/v1/ready"
+        ui_url = f"http://localhost:{cfg.ui_port}"
+        if not wait_for_backend(ctx, api_url):
+            raise AmcLaunchError(
+                f"AMC microservice did not return code 0 within "
+                f"{int(_SERVICE_WAIT_TIMEOUT_S)}s at {api_url}\n"
+                f"{compose_diagnostics(ctx, compose_dir)}"
+            )
+        if not wait_for_ui(ctx, ui_url):
+            raise AmcLaunchError(
+                f"AMC UI did not return HTTP 200 at {ui_url}\n"
+                f"{compose_diagnostics(ctx, compose_dir)}"
+            )
+
+        project_id = ensure_amc_project(ctx, cfg)
+        ctx.log.info(
+            f"AMC project ready: {cfg.project_name} ({project_id}); "
+            f"LOCATION_ID={ctx.conf[CONF_LOCATION_ID_KEY]}"
         )
 
-    for key in check_env_drift(compose_dir):
-        ctx.log.warn(
-            f"upstream AMC .env.example no longer defines '{key}'; re-check the "
-            "tools/auto-magic-calib README in NVIDIA/DeepStream"
+        if no_open:
+            return StepResult(status=StepStatus.COMPLETE)
+
+        has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        browser_available = find_browser() is not None
+        strategy = decide_hold_strategy(
+            has_display=has_display,
+            browser_available=browser_available,
+            non_interactive=non_interactive,
         )
 
-    env_changed = write_env_atomic(compose_dir, render_env(cfg))
-    (cfg.amc_root / "projects" / cfg.project_name).mkdir(parents=True, exist_ok=True)
-    if env_changed:
-        ctx.report_installed("AMC compose/.env", cfg.project_name)
-    else:
-        ctx.report_already_installed("AMC compose/.env", cfg.project_name)
+        assert teardown is not None
+        execute_hold(ctx, strategy, ui_url, teardown=teardown, keep_up=keep_up)
 
-    def _teardown() -> None:
-        compose_down(ctx, compose_dir)
-
-    # section 5.1 step 3 (REQUIRED, not merely a nicety around the browser
-    # hold below): "Install SIGINT/SIGTERM handlers and an atexit hook
-    # before up -d so AMC is always torn down even if the launcher is
-    # interrupted." `compose_pull`/`compose_up`/`wait_for_ui` below can run
-    # for tens of seconds (the readiness poll alone is up to
-    # `_UI_WAIT_TIMEOUT_S`), so the guard has to be armed *before* any of
-    # that runs, not merely before the hold-until-close step -- otherwise a
-    # Ctrl-C during pull/up/the readiness poll leaves AMC containers running
-    # with no fail-safe teardown.
-    #
-    # Two cases skip the guard entirely rather than installing it and never
-    # (synchronously) calling it:
-    #   - `--keep-up` means "never tear down" -- installing the guard would
-    #     be harmless in isolation (`execute_hold` returns before calling
-    #     `teardown` anyway), but skipping it is the clearer statement of
-    #     intent.
-    #   - `no_open=True` returns COMPLETE right after bring-up, without ever
-    #     reaching `execute_hold`. `atexit.register` fires on *any* normal
-    #     process exit, not just a signal -- installing the guard here and
-    #     then simply returning would silently tear AMC back down the
-    #     moment this process exits, defeating `--no-open`'s documented
-    #     purpose ("bring up without opening/holding -- for scripting").
-    #     There is nothing later in this call that will ever invoke the
-    #     guard on purpose, so it must not be armed at all.
-    teardown = _teardown if (keep_up or no_open) else _install_teardown_guards(_teardown)
-
-    if not skip_pull:
-        compose_pull(ctx, compose_dir)
-    compose_up(ctx, compose_dir)
-
-    ui_url = f"http://localhost:{cfg.ui_port}"
-    if not wait_for_ui(ctx, ui_url):
-        ctx.log.warn(
-            f"AMC UI did not respond within {int(_UI_WAIT_TIMEOUT_S)}s. Check: "
-            f"cd {compose_dir} && docker compose logs"
-        )
-
-    if no_open:
         return StepResult(status=StepStatus.COMPLETE)
-
-    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    browser_available = find_browser() is not None
-    strategy = decide_hold_strategy(
-        has_display=has_display,
-        browser_available=browser_available,
-        non_interactive=non_interactive,
-    )
-
-    execute_hold(ctx, strategy, ui_url, teardown=teardown, keep_up=keep_up)
-
-    return StepResult(status=StepStatus.COMPLETE)
+    except AmcLaunchError as exc:
+        if up_started and compose_dir is not None:
+            try:
+                if teardown is not None:
+                    teardown()
+                else:  # pragma: no cover - defensive before guard assignment.
+                    compose_down(ctx, compose_dir)
+            except AmcLaunchError as cleanup:
+                return StepResult(
+                    status=StepStatus.FAILED,
+                    message=f"{exc}\nAMC cleanup also failed: {cleanup}",
+                )
+        return StepResult(status=StepStatus.FAILED, message=str(exc))
 
 
 def teardown_amc(
@@ -1067,7 +1406,10 @@ def teardown_amc(
             status=StepStatus.FAILED,
             message=f"AMC not found at {cfg.amc_root}; nothing to tear down",
         )
-    compose_down(ctx, compose_dir)
+    try:
+        compose_down(ctx, compose_dir)
+    except AmcLaunchError as exc:
+        return StepResult(status=StepStatus.FAILED, message=str(exc))
     return StepResult(status=StepStatus.COMPLETE)
 
 
@@ -1079,6 +1421,7 @@ def teardown_amc(
 def _build_amc_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mv3dt-installer amc", add_help=True)
     parser.add_argument("--project", default=None)
+    parser.add_argument("--location-id", default=None)
     parser.add_argument("--skip-pull", action="store_true")
     parser.add_argument("--keep-up", action="store_true")
     parser.add_argument("--down", action="store_true")
@@ -1110,6 +1453,7 @@ def handle_amc_subcommand(argv: list, ctx: "Context") -> int:
         result = launch_amc(
             ctx,
             project=args.project,
+            location_id=args.location_id,
             skip_pull=args.skip_pull,
             keep_up=args.keep_up,
             host_ip_override=args.host_ip,
@@ -1180,29 +1524,6 @@ class Step3AmcLauncher:
                 message="DeepStream SDK not installed; run Step 2 first",
             )
 
-        if not _git_present(ctx):
-            return StepResult(
-                status=StepStatus.USER_ACTION_REQUIRED,
-                message="git is required to clone AutoMagicCalib",
-                user_actions=[
-                    UserAction(text="Install git.", command="sudo apt-get install -y git")
-                ],
-            )
-
-        if (
-            not _docker_usable(ctx)
-            or not _compose_available(ctx)
-            or not _nvidia_runtime_registered(ctx)
-        ):
-            return StepResult(
-                status=StepStatus.USER_ACTION_REQUIRED,
-                message=(
-                    "Docker Engine, the compose plugin, or the NVIDIA Container "
-                    "Toolkit runtime is not ready"
-                ),
-                user_actions=_docker_install_actions(ctx),
-            )
-
         return StepResult(status=StepStatus.COMPLETE)
 
     # -- run (section 7.2) ---------------------------------------------------
@@ -1210,11 +1531,20 @@ class Step3AmcLauncher:
     def run(self, ctx: "Context") -> StepResult:
         ctx.progress.phase(1)
         ctx.progress.task("resolving AutoMagicCalib configuration")
-        cfg = resolve_config(ctx)
+        try:
+            _, project_name = resolve_project_identity(ctx)
+        except AmcLaunchError as exc:
+            return StepResult(status=StepStatus.FAILED, message=str(exc))
+        cfg = resolve_config(ctx, project=project_name)
 
         guard = check_repo_isolation(cfg.amc_root)
         if guard is not None:
             return StepResult(status=StepStatus.FAILED, message=guard)
+
+        try:
+            ensure_container_prerequisites(ctx)
+        except AmcLaunchError as exc:
+            return StepResult(status=StepStatus.FAILED, message=str(exc))
 
         persist_config(ctx, cfg)
 
@@ -1232,7 +1562,12 @@ class Step3AmcLauncher:
 
         ctx.progress.phase(3)
         ctx.progress.task("launching AutoMagicCalib")
-        result = launch_amc(ctx, non_interactive=ctx.non_interactive)
+        result = launch_amc(
+            ctx,
+            keep_up=True,
+            non_interactive=ctx.non_interactive,
+            _prereqs_ready=True,
+        )
         if result.status is not StepStatus.COMPLETE:
             return result
 
@@ -1255,7 +1590,8 @@ class Step3AmcLauncher:
             )
         if not _compose_available(ctx):
             return StepResult(
-                status=StepStatus.FAILED, message="docker compose is not available"
+                status=StepStatus.FAILED,
+                message="docker compose >=2.20.3 is not available",
             )
         if not _nvidia_runtime_registered(ctx):
             return StepResult(
@@ -1269,14 +1605,19 @@ class Step3AmcLauncher:
                     message=f"{key} missing from installer.conf",
                 )
 
-        # section 7.3: "no pinned upstream AMC version ... verify() records
-        # the resolved commit for the transcript rather than equality-
-        # pinning it." Informational only -- an unresolvable commit (clone
-        # missing, git failure) is logged, not a verify failure.
+        # The checkout is lazy, but once present it must match the equality pin.
         cfg = resolve_config(ctx)
         commit = resolved_amc_commit(ctx, cfg.amc_root)
         if commit:
             ctx.log.info(f"AMC resolved commit ({cfg.amc_root}): {commit}")
+            if commit != AMC_COMMIT:
+                return StepResult(
+                    status=StepStatus.FAILED,
+                    message=(
+                        f"AMC checkout is at {commit}, expected equality pin "
+                        f"{AMC_COMMIT}"
+                    ),
+                )
         else:
             ctx.log.info(
                 f"AMC resolved commit: unknown (could not resolve HEAD at "
@@ -1295,6 +1636,8 @@ class Step3AmcLauncher:
             f"  Run it any time:   {wrapper}\n"
             f"  Web UI:            http://localhost:{cfg.ui_port}\n"
             f"  Microservice API:  http://localhost:{cfg.ms_port}\n"
+            f"  AMC project ID:    {ctx.conf.get(CONF_AMC_PROJECT_ID_KEY, 'created on launch')}\n"
+            f"  Location ID:       {ctx.conf.get(CONF_LOCATION_ID_KEY, 'not set')}\n"
             f"  AMC clone:         {cfg.amc_root}\n"
             f"  Stop AMC:          {wrapper} --down   (or close the AMC window)\n"
             "\n"
