@@ -15,8 +15,8 @@ connected across the step modules.** A reader who finds `report.py` can
 reasonably conclude the diagnostic work is done. It is not.
 [Section 5](#5-what-remains) is the honest list.
 
-Current release: **v0.3.6**. Current version string:
-`installer/mv3dt_installer/__init__.py` `__version__ = "0.3.6"`.
+Current release: **v0.3.7**. Current version string:
+`installer/mv3dt_installer/__init__.py` `__version__ = "0.3.7"`.
 
 ---
 
@@ -71,12 +71,12 @@ python3 -m pytest tests/ -q
 Current result on an **arm64 macOS** development machine:
 
 ```
-1 failed, 1293 passed, 7 skipped
+1 failed, 1294 passed, 7 skipped
 ```
 
 **The single failure is environmental, not a regression (REQUIRED to know
 before you start).** The same suite passes fully in CI on x86_64 — the
-`installer-tests` checks for PR #70 are green. The failure is:
+`installer-tests` checks for PR #71 are green. The failure is:
 
 | Test | Why it fails on this host |
 |---|---|
@@ -97,7 +97,7 @@ and register into `STEP_REGISTRY` at import.
 | Step | Module | Lines | Tests | Spec |
 |---|---|---|---|---|
 | 1 | `step1_prerequisites.py` | 1212 | 57 | [`STEP-1`](STEP-1-PREREQUISITES.md) |
-| 2 | `step2_deepstream_sdk.py` | 1430 | 61 | [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) |
+| 2 | `step2_deepstream_sdk.py` | 1433 | 62 | [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) |
 | 3 | `step3_amc_launcher.py` | 1309 | 71 | [`STEP-3`](STEP-3-AMC-LAUNCHER.md) |
 | 4 | `step4_calib_output_wiring.py` | 1135 | 56 | [`STEP-4`](STEP-4-CALIB-OUTPUT-WIRING.md) |
 | 5 | `step5_per_project_exes.py` | 1578 | 69 | [`STEP-5`](STEP-5-PER-PROJECT-EXES.md) |
@@ -323,7 +323,7 @@ Settled exclusions, carried from [`08` §11](08-PROGRESS-AND-OBSERVABILITY.md#11
 ## References
 
 Facts in this document are drawn from the repository through release
-`v0.3.6` and from the workstation install runs of `mv3dt-installer`
+`v0.3.7` and from the workstation install runs of `mv3dt-installer`
 0.1.2 through 0.1.9, which are the source of the observed-failure inventory
 in [`08` §2](08-PROGRESS-AND-OBSERVABILITY.md#2-observed-failures-this-doc-exists-to-fix).
 Test counts and the arm64 failure list were produced by running the suite,
