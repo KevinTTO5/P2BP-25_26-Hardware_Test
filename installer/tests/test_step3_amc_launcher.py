@@ -141,6 +141,7 @@ class FakeContext:
             task=lambda name: None,
             bytes=lambda done, total: None,
             line=lambda text: None,
+            tick=lambda: None,
         )
 
     def run_root(self, *args, **kwargs):
@@ -1225,6 +1226,20 @@ def test_compose_stack_running_requires_both_services(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    "binding,expected",
+    [("0.0.0.0:8001\n", "8001"), ("[::]:5001\n", "5001")],
+)
+def test_compose_published_port_parses_ipv4_and_ipv6(tmp_path, binding, expected):
+    runner = ScriptedRunner(default_stdout=binding)
+    assert step3.compose_published_port(
+        FakeContext(tmp_path, runner_user=runner),
+        tmp_path,
+        "auto-magic-calib-ms",
+        8000,
+    ) == expected
+
+
 def test_ui_requires_http_200(tmp_path):
     runner = ScriptedRunner(default_stdout="503")
     assert not step3.wait_for_ui(FakeContext(tmp_path, runner_root=runner), "http://localhost:5000")
@@ -1298,6 +1313,14 @@ def test_running_stack_reuses_configured_ports(tmp_path, monkeypatch):
         lambda a: a[:3] == ("docker", "compose", "ps"),
         stdout="auto-magic-calib-ms\nauto-magic-calib-ui\n",
     )
+    runner.when(
+        lambda a: a[:4] == ("docker", "compose", "port", "auto-magic-calib-ui"),
+        stdout="0.0.0.0:5001\n",
+    )
+    runner.when(
+        lambda a: a[:4] == ("docker", "compose", "port", "auto-magic-calib-ms"),
+        stdout="0.0.0.0:8001\n",
+    )
     ctx = FakeContext(tmp_path, runner_user=runner)
     _stub_amc_root_with_compose(ctx)
     monkeypatch.setattr(step3, "ensure_container_prerequisites", lambda ctx: None)
@@ -1311,6 +1334,8 @@ def test_running_stack_reuses_configured_ports(tmp_path, monkeypatch):
     result = step3.launch_amc(ctx, keep_up=True, non_interactive=True)
 
     assert result.status is StepStatus.COMPLETE
+    assert ctx.conf[step3.CONF_UI_PORT_KEY] == "5001"
+    assert ctx.conf[step3.CONF_MS_PORT_KEY] == "8001"
     assert not any(call[:3] == ("docker", "compose", "pull") for call in runner.calls)
     assert not any(call[:3] == ("docker", "compose", "up") for call in runner.calls)
 
