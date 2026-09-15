@@ -15,7 +15,13 @@ import pytest
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
-from mv3dt_installer import onboarding, ngc, privilege, webapp  # noqa: E402
+from mv3dt_installer import (  # noqa: E402
+    camera_credentials,
+    ngc,
+    onboarding,
+    privilege,
+    webapp,
+)
 
 _FAKE_NGC_KEY = "nvapi-fake-key-do-not-use-1234567890"
 
@@ -137,6 +143,66 @@ def test_ensure_ngc_key_environment_variable_never_reaches_a_log_call(
 
 
 # ---------------------------------------------------------------------------
+# ensure_camera_credentials
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_camera_credentials_captures_and_stores(tmp_path, monkeypatch):
+    install_dir = tmp_path / "install"
+    monkeypatch.setattr(
+        camera_credentials.privilege, "resolve", lambda: _fake_user(tmp_path / "home")
+    )
+    monkeypatch.setattr(camera_credentials.os, "chown", lambda *args: None)
+    monkeypatch.delenv("CAM_USER", raising=False)
+    monkeypatch.delenv("CAM_PASSWORD", raising=False)
+    expected = camera_credentials.Credentials("admin", "secret")
+    monkeypatch.setattr(
+        onboarding.camera_credentials,
+        "capture_credentials",
+        lambda non_interactive: expected,
+    )
+
+    onboarding.ensure_camera_credentials(install_dir, non_interactive=False)
+
+    assert camera_credentials.load_credentials(install_dir) == expected
+
+
+def test_ensure_camera_credentials_migrates_installer_config(tmp_path, monkeypatch):
+    install_dir = tmp_path / "install"
+    monkeypatch.setattr(
+        camera_credentials.privilege, "resolve", lambda: _fake_user(tmp_path / "home")
+    )
+    monkeypatch.setattr(camera_credentials.os, "chown", lambda *args: None)
+
+    onboarding.ensure_camera_credentials(
+        install_dir,
+        non_interactive=True,
+        configured_user="admin",
+        configured_password="legacy-secret",
+    )
+
+    assert camera_credentials.load_credentials(install_dir) == (
+        camera_credentials.Credentials("admin", "legacy-secret")
+    )
+
+
+def test_ensure_camera_credentials_honors_environment(tmp_path, monkeypatch):
+    install_dir = tmp_path / "install"
+    monkeypatch.setattr(
+        camera_credentials.privilege, "resolve", lambda: _fake_user(tmp_path / "home")
+    )
+    monkeypatch.setattr(camera_credentials.os, "chown", lambda *args: None)
+    monkeypatch.setenv("CAM_USER", "admin")
+    monkeypatch.setenv("CAM_PASSWORD", "env-secret")
+
+    onboarding.ensure_camera_credentials(install_dir, non_interactive=True)
+
+    assert camera_credentials.load_credentials(install_dir) == (
+        camera_credentials.Credentials("admin", "env-secret")
+    )
+
+
+# ---------------------------------------------------------------------------
 # ensure_webapp_credentials
 # ---------------------------------------------------------------------------
 
@@ -214,8 +280,15 @@ def test_ensure_webapp_credentials_incomplete_answer_stores_nothing_and_warns(
 # ---------------------------------------------------------------------------
 
 
-def test_onboard_runs_both_ngc_and_webapp_flows(tmp_path, monkeypatch):
+def test_onboard_runs_all_credential_flows(tmp_path, monkeypatch):
     calls = []
+    monkeypatch.setattr(
+        onboarding,
+        "ensure_camera_credentials",
+        lambda install_dir, **kwargs: calls.append(
+            ("camera", install_dir, kwargs["non_interactive"])
+        ),
+    )
     monkeypatch.setattr(
         onboarding,
         "ensure_ngc_key",
@@ -233,5 +306,6 @@ def test_onboard_runs_both_ngc_and_webapp_flows(tmp_path, monkeypatch):
 
     assert calls == [
         ("ngc", tmp_path / "install", True),
+        ("camera", tmp_path / "install", True),
         ("webapp", tmp_path / "install", "on", True),
     ]

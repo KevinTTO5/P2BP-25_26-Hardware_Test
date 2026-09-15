@@ -274,6 +274,62 @@ def test_missing_inputs_and_inventory_are_one_action_result(tmp_path, templates)
     assert "AMC_PROJECT_ID" not in result.user_actions[1].text
 
 
+def test_preflight_automatically_runs_first_camera_scan(
+    tmp_path, templates, monkeypatch
+):
+    conf = _conf(tmp_path)
+    pathlib.Path(conf.pop(config_mod.CAMERAS_FILE_KEY)).unlink()
+    ctx = _ctx(tmp_path, templates, conf=conf)
+    discovered = step4.cameras_mod.Camera(
+        id="c1",
+        mac="d0:3b:f4:00:00:01",
+        ip="169.254.1.10",
+        position="top-left",
+        stream_ok=True,
+    )
+
+    def refresh(install_dir, **kwargs):
+        assert kwargs["cam_user"] == "admin"
+        assert kwargs["cam_password"] == "secret"
+        (pathlib.Path(install_dir) / "cameras.yml").write_text(
+            step4.cameras_mod.render_inventory([discovered], header=""),
+            encoding="utf-8",
+        )
+        return step4.cameras_mod.ScanResult(
+            cameras=[discovered], unmatched=[], tool="arp-scan", interfaces=["eth0"]
+        )
+
+    monkeypatch.setattr(step4.cameras_mod, "refresh", refresh)
+    monkeypatch.setattr(step4.config_mod, "persist_value", lambda *args: None)
+    _complete_wait(monkeypatch)
+
+    result = step4.Step4CalibOutputWiring().preflight(ctx)
+
+    assert result.status is StepStatus.COMPLETE
+    assert pathlib.Path(ctx.conf[config_mod.CAMERAS_FILE_KEY]).is_file()
+
+
+def test_preflight_zero_camera_scan_requests_connection_and_rerun(
+    tmp_path, templates, monkeypatch
+):
+    conf = _conf(tmp_path)
+    pathlib.Path(conf.pop(config_mod.CAMERAS_FILE_KEY)).unlink()
+    ctx = _ctx(tmp_path, templates, conf=conf)
+    monkeypatch.setattr(
+        step4.cameras_mod,
+        "refresh",
+        lambda *args, **kwargs: step4.cameras_mod.ScanResult(
+            cameras=[], unmatched=[], tool="arp-scan", interfaces=["eth0"]
+        ),
+    )
+
+    result = step4.Step4CalibOutputWiring().preflight(ctx)
+
+    assert result.status is StepStatus.USER_ACTION_REQUIRED
+    assert "camera inventory" in result.message
+    assert "Connect and activate" in result.user_actions[0].text
+
+
 def test_preflight_polls_running_then_completed(tmp_path, templates, monkeypatch):
     runner = Runner(states=["RUNNING", "COMPLETED"])
     ctx = _ctx(tmp_path, templates, runner=runner)

@@ -154,7 +154,7 @@ have.
 | `--version` | — | Print the version and exit | shipped; the stamped form carrying tag, commit, and build timestamp is **planned**, arriving with the release job |
 | `--remote-supervision` | `off`, `local`, `remote` | Set the Step 6 gate ([`00` §3.4](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#34-opt-in-step-gates)) without being prompted; overrides an already-persisted value and logs the change | shipped |
 | `--webapp-integration` | `off`, `on` | Set the Step 7 gate the same way | shipped |
-| `--scan-cameras` | — | Discover the camera fleet, probe RTSP, run the one-time position binding, write the inventory, print the table, and exit; needs `sudo` for raw sockets | shipped |
+| `--scan-cameras` | — | Refresh the camera fleet after initial automatic Step 4 discovery, probe RTSP, bind new positions, write the inventory, print the table, and exit; needs `sudo` for raw sockets | shipped |
 | `--camera-scan-cidr` | `CIDR` | Override the discovery sweep range (default `169.254.0.0/16`); persisted as `CAMERA_SCAN_CIDR` | shipped |
 | `--camera-scan-iface` | `IFACE` | Restrict discovery to one interface; persisted as `CAMERA_SCAN_IFACE` | shipped |
 
@@ -204,11 +204,17 @@ second launch is a bug, not the design.
    ([`00` §10.2](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#102-capture--handoff-api-ngcpy)).
    `onboarding.py` runs this on every launch; once `secrets/ngc.env` exists,
    it is a silent no-op.
-5. **Web-app credential.** Endpoint plus API key, and **only** if you set
+5. **Camera credentials.** The shared RTSP username and a no-echo password.
+   Both are required and stored once in `secrets/camera.env`; the operator is
+   never asked to put the password in `installer.conf`. On reaching Step 4,
+   a missing camera inventory triggers discovery, RTSP validation, and the
+   one-time position-binding prompts automatically. `--scan-cameras` remains
+   the explicit refresh command for later fleet changes.
+6. **Web-app credential.** Endpoint plus API key, and **only** if you set
    the web-app gate to `on` in prompt 3. A blank endpoint writes nothing and
    warns; Step 7 then surfaces its own USER-ACTION block on first run
    ([`00` §14.3](plan/00-FRAMEWORK-AND-BOOTSTRAP.md#143-capture--handoff-api-webapppy)).
-   Same "already asked" rule as prompt 4: once `secrets/webapp.env` exists,
+   Same capture-once rule: once `secrets/webapp.env` exists,
    `onboarding.py` never re-prompts.
 
 Under `--non-interactive` nothing is prompted. A gate already recorded in

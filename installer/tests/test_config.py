@@ -745,3 +745,18 @@ def test_persist_value_preserves_existing_keys_and_overwrites_its_own(tmp_path):
     assert "CAMERA_SCAN_CIDR=new" in text
     assert "old" not in text
     assert f"INSTALL_DIR={tmp_path}" in text
+
+
+def test_remove_values_drops_only_named_keys(tmp_path):
+    conf_path = tmp_path / config.CONF_FILENAME
+    conf_path.write_text(
+        "CAM_USER=admin\nCAM_PASSWORD=secret\nCAMERA_SCAN_CIDR=10.0.0.0/24\n",
+        encoding="utf-8",
+    )
+
+    config.remove_values(tmp_path, "CAM_USER", "CAM_PASSWORD")
+
+    text = conf_path.read_text(encoding="utf-8")
+    assert "CAM_USER" not in text
+    assert "CAM_PASSWORD" not in text
+    assert "CAMERA_SCAN_CIDR=10.0.0.0/24" in text

@@ -4,8 +4,9 @@ mv3dt-installer (doc 00 §3.2, §5.2).
 Everything installer/bootstrap/bootstrap.sh used to do before handing off to
 a locally built binary now happens here, inside the exe: platform /
 invoking-user preflight (delegating to preflight.py), NGC API key capture
-(ngc.py), and -- only when its gate is "on" -- web-app credential capture
-(webapp.py). This module owns none of the underlying storage/prompt logic
+(ngc.py), camera credential capture (camera_credentials.py), and -- only
+when its gate is "on" -- web-app credential capture (webapp.py). This module
+owns none of the underlying storage/prompt logic
 itself; it only decides WHEN each of those modules' capture functions
 should run, per doc 00 §5.2's rule: "have we already asked?" is the
 existence of the secret file, not the result of parsing its contents.
@@ -26,8 +27,8 @@ Public API:
     ensure_webapp_credentials(install_dir, gate_value, *, non_interactive) -> None
         -- captures and stores the web-app credential on first run only,
         and only when gate_value == "on".
-    onboard(install_dir, webapp_gate, *, non_interactive) -> None
-        -- runs both of the above (doc 00 §3.2 step 9).
+    onboard(install_dir, webapp_gate, *, non_interactive, ...) -> None
+        -- runs all credential flows (doc 00 §3.2 step 9).
 
 Onboarding must run after `logs.open_transcript()` (doc 00 §3.2 step 8, this
 module's step 9), so every prompt and its redacted outcome is part of the
@@ -40,12 +41,13 @@ import os
 import pathlib
 from typing import Union
 
-from . import ngc, preflight, privilege, webapp
+from . import camera_credentials, ngc, preflight, privilege, webapp
 from .logs import log
 
 __all__ = [
     "run_platform_preflight",
     "ensure_ngc_key",
+    "ensure_camera_credentials",
     "ensure_webapp_credentials",
     "onboard",
 ]
@@ -57,6 +59,7 @@ StrPath = Union[str, "os.PathLike[str]"]
 _NGC_ENV_VAR = "NGC_API_KEY"
 
 _NGC_SECRET_RELATIVE_PATH = pathlib.Path("secrets") / "ngc.env"
+_CAMERA_SECRET_RELATIVE_PATH = pathlib.Path("secrets") / "camera.env"
 _WEBAPP_SECRET_RELATIVE_PATH = pathlib.Path("secrets") / "webapp.env"
 
 # The only §3.4 gate value that turns webapp credential capture on.
@@ -130,9 +133,48 @@ def ensure_webapp_credentials(
         )
 
 
-def onboard(install_dir: StrPath, webapp_gate: str, *, non_interactive: bool) -> None:
-    """doc 00 §3.2 step 9: run both capture flows against an already
+def ensure_camera_credentials(
+    install_dir: StrPath,
+    *,
+    non_interactive: bool,
+    configured_user: str = "",
+    configured_password: str = "",
+) -> None:
+    """Capture camera RTSP credentials once, migrating legacy config values."""
+    secrets_path = pathlib.Path(install_dir) / _CAMERA_SECRET_RELATIVE_PATH
+    if secrets_path.is_file():
+        return
+
+    username = configured_user or os.environ.get("CAM_USER", "")
+    password = configured_password or os.environ.get("CAM_PASSWORD", "")
+    if username and password:
+        log.info("Using configured camera credentials (CAM_PASSWORD=<redacted>).")
+        camera_credentials.store_credentials(
+            camera_credentials.Credentials(username=username, password=password),
+            install_dir,
+        )
+        return
+
+    creds = camera_credentials.capture_credentials(non_interactive)
+    camera_credentials.store_credentials(creds, install_dir)
+
+
+def onboard(
+    install_dir: StrPath,
+    webapp_gate: str,
+    *,
+    non_interactive: bool,
+    configured_camera_user: str = "",
+    configured_camera_password: str = "",
+) -> None:
+    """doc 00 §3.2 step 9: run all capture flows against an already
     resolved `install_dir` and web-app gate value. Silent on every launch
     after the first (doc 00 §5.2's closing paragraph)."""
     ensure_ngc_key(install_dir, non_interactive=non_interactive)
+    ensure_camera_credentials(
+        install_dir,
+        non_interactive=non_interactive,
+        configured_user=configured_camera_user,
+        configured_password=configured_camera_password,
+    )
     ensure_webapp_credentials(install_dir, webapp_gate, non_interactive=non_interactive)

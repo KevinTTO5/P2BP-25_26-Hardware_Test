@@ -67,6 +67,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from mv3dt_installer import __version__, build_stamp
+from mv3dt_installer import camera_credentials
 from mv3dt_installer import cameras as cameras_mod
 from mv3dt_installer import config as config_mod
 from mv3dt_installer import ngc as ngc_mod
@@ -1291,6 +1292,15 @@ def _run_scan_cameras(cfg: config_mod.Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_camera_credentials(cfg: config_mod.Config) -> None:
+    """Make stored credentials available to existing step consumers in memory."""
+    creds = camera_credentials.load_credentials(cfg.install_dir)
+    if creds is not None:
+        cfg.values["CAM_USER"] = creds.username
+        cfg.values["CAM_PASSWORD"] = creds.password
+        config_mod.remove_values(cfg.install_dir, "CAM_USER", "CAM_PASSWORD")
+
+
 # ---------------------------------------------------------------------------
 # doc 00 §3.2 -- entrypoint
 # ---------------------------------------------------------------------------
@@ -1385,14 +1395,26 @@ def main(
     open_transcript(log_dir)
 
     if args.scan_cameras:
+        onboarding.ensure_camera_credentials(
+            cfg.install_dir,
+            non_interactive=args.non_interactive,
+            configured_user=cfg.values.get("CAM_USER", ""),
+            configured_password=cfg.values.get("CAM_PASSWORD", ""),
+        )
+        _load_camera_credentials(cfg)
         return _run_scan_cameras(cfg, args)
 
     # doc 00 §3.2 step 9: after the transcript opens, so every prompt and
     # its redacted outcome is part of the auditable record. No-op on every
     # launch after the first (doc 00 §5.2).
     onboarding.onboard(
-        cfg.install_dir, cfg.webapp_integration, non_interactive=args.non_interactive
+        cfg.install_dir,
+        cfg.webapp_integration,
+        non_interactive=args.non_interactive,
+        configured_camera_user=cfg.values.get("CAM_USER", ""),
+        configured_camera_password=cfg.values.get("CAM_PASSWORD", ""),
     )
+    _load_camera_credentials(cfg)
 
     reconcile_result = reboot_mod.reconcile(sm)
     if reconcile_result is reboot_mod.ReconcileResult.STILL_PENDING:

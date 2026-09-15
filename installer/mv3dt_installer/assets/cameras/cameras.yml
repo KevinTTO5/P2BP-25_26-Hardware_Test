@@ -8,7 +8,7 @@
 #   - laptop/scripts/40_export_watcher.sh: one [sourceN] uri per enabled row.
 #   - laptop/scripts/50_start_pipeline.sh: ping-sweep before deepstream-app.
 #
-# Credentials: CAM_USER / CAM_PASSWORD in laptop/config/laptop.env (not here).
+# Credentials: captured by the installer in secrets/camera.env (not here).
 #
 # ---------------------------------------------------------------------------
 # Fleet hardware facts (harvested from the P2BP camera-node tree before it was
