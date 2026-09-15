@@ -157,8 +157,9 @@ Bring-up runs in this exact order:
 1. **Validate configuration**: `docker compose config --quiet`.
 2. **Authenticate**: required NGC login.
 3. **Reuse a live stack**: if both pinned Compose services are already running,
-   retain the configured ports and skip pull/start so an interrupted installer
-   can safely resume.
+   read their actual host ports with `docker compose port`, repair any stale
+   persisted values, and skip pull/start so an interrupted installer can
+   safely resume.
 4. **Pull images**: `docker compose pull`, unless `--skip-pull` is explicit or
    the live stack is reused.
 5. **Start services**: `docker compose up -d` unless the stack is already live.
@@ -179,8 +180,9 @@ transport-success response is insufficient; parsed JSON must contain
 `"code": 0`. Then require HTTP `200` from `http://localhost:<UI_PORT>`.
 Expected connection failures during the container's first-run model downloads
 and parser build are retained in the transcript but hidden from the live
-terminal. Ctrl-C returns a clean cancellation failure and tears down a stack
-started by the interrupted attempt.
+terminal. The spinner is ticked during silent retries so elapsed time remains
+live. Ctrl-C returns a clean cancellation failure and tears down a stack started
+by the interrupted attempt.
 
 Readiness failure is fatal. Capture bounded output from both:
 
@@ -289,7 +291,8 @@ created only after an actual launch.
 - [ ] Tracked source edits are preserved and diagnosed; untracked AMC runtime
       data under `projects/` and `models/` is rerun-safe.
 - [ ] UI/MS port collisions select and persist deterministic alternatives.
-- [ ] A live AMC stack retains its configured ports and skips pull/start.
+- [ ] A live AMC stack recovers its Docker-published ports, repairs stale
+      configuration, and skips pull/start.
 - [ ] Backend returns `code: 0`; UI returns HTTP `200`.
 - [ ] Browser process runs as the invoking user.
 - [ ] `LOCATION_ID`, `PROJECT_NAME`, and `AMC_PROJECT_ID` survive reruns.

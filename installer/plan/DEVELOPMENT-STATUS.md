@@ -71,7 +71,7 @@ python3 -m pytest tests/ -q
 Current result on an **arm64 macOS** development machine:
 
 ```
-1 failed, 1310 passed, 7 skipped
+1 failed, 1312 passed, 7 skipped
 ```
 
 **The single failure is environmental, not a regression (REQUIRED to know
@@ -98,7 +98,7 @@ and register into `STEP_REGISTRY` at import.
 |---|---|---|---|---|
 | 1 | `step1_prerequisites.py` | 1536 | 76 | [`STEP-1`](STEP-1-PREREQUISITES.md) |
 | 2 | `step2_deepstream_sdk.py` | 1259 | 63 | [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) |
-| 3 | `step3_amc_launcher.py` | 1694 | 96 | [`STEP-3`](STEP-3-AMC-LAUNCHER.md) |
+| 3 | `step3_amc_launcher.py` | 1739 | 98 | [`STEP-3`](STEP-3-AMC-LAUNCHER.md) |
 | 4 | `step4_calib_output_wiring.py` | 963 | 43 | [`STEP-4`](STEP-4-CALIB-OUTPUT-WIRING.md) |
 | 5 | `step5_per_project_exes.py` | 1578 | 69 | [`STEP-5`](STEP-5-PER-PROJECT-EXES.md) |
 | 6 | `step6_remote_supervision.py` | 1217 | 57 | [`STEP-6`](STEP-6-REMOTE-SUPERVISION.md) |
@@ -232,9 +232,10 @@ calibration result:
   container readiness, and persists the AMC location, project and API
   identity needed by Step 4. Reruns accept AMC-generated untracked data under
   `projects/` and `models/` while still rejecting tracked source edits, and
-  reuse an already-running stack without shifting its ports. Expected cold-
-  start readiness failures stay out of the live terminal, and cancellation is
-  clean. The guided installer keeps AMC running after the browser closes; the
+  reuse an already-running stack by recovering its actual Docker-published
+  ports and repairing stale configuration. Expected cold-start readiness
+  failures stay out of the live terminal while the spinner remains active,
+  and cancellation is clean. The guided installer keeps AMC running after the browser closes; the
   standalone `amc` command retains close-to-stop behavior.
 - Step 4 polls the persisted AMC project through its API, reports calibration
   errors, downloads the MV3DT result, rejects unsafe or malformed archives,
@@ -324,7 +325,7 @@ before it needs code.
 
 For the current state to be what this document claims:
 
-- [x] `python3 -m pytest tests/ -q` from `installer/` gives 1310 passed,
+- [x] `python3 -m pytest tests/ -q` from `installer/` gives 1312 passed,
       7 skipped and exactly the one environmental failure in
       [section 2.1](#21-test-suite) on arm64 macOS.
 - [ ] `grep` for `follow_apt` and `follow_download` finds the Step 1 and

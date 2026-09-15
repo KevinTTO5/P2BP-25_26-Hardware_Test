@@ -668,6 +668,24 @@ def compose_stack_running(ctx: "Context", compose_dir: pathlib.Path) -> bool:
     }.issubset(services)
 
 
+def compose_published_port(
+    ctx: "Context", compose_dir: pathlib.Path, service: str, container_port: int
+) -> Optional[str]:
+    """Resolve a running service's host port from Docker Compose."""
+    result = ctx.run_as_user(
+        "docker", "compose", "port", service, str(container_port),
+        cwd=str(compose_dir), check=False, capture_output=True, text=True,
+        stream=False,
+    )
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        match = re.search(r":(\d+)\s*$", line)
+        if match:
+            return match.group(1)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # section 4 step 9 -- readiness poll
 # ---------------------------------------------------------------------------
@@ -704,6 +722,7 @@ def wait_for_backend(
                 pass
         if clock() - started >= timeout_s:
             return False
+        ctx.progress.tick()
         sleep(poll_s)
 
 
@@ -1333,6 +1352,32 @@ def launch_amc(
 
         stack_running = compose_stack_running(ctx, compose_dir)
         if stack_running:
+            ui_port = compose_published_port(
+                ctx, compose_dir, "auto-magic-calib-ui", 5000
+            )
+            ms_port = compose_published_port(
+                ctx, compose_dir, "auto-magic-calib-ms", 8000
+            )
+            if ui_port is None or ms_port is None:
+                raise AmcLaunchError(
+                    "AMC containers are running, but Docker Compose did not "
+                    "report their published UI/API ports"
+                )
+            if (ui_port, ms_port) != (cfg.ui_port, cfg.ms_port):
+                ctx.log.warn(
+                    "Recovered AMC published ports from Docker Compose: "
+                    f"UI {ui_port}, API {ms_port}"
+                )
+            cfg = AmcConfig(
+                amc_root=cfg.amc_root,
+                host_ip=cfg.host_ip,
+                ui_port=ui_port,
+                ms_port=ms_port,
+                ms_api_url=cfg.ms_api_url,
+                project_name=cfg.project_name,
+            )
+            _persist(ctx, CONF_UI_PORT_KEY, ui_port)
+            _persist(ctx, CONF_MS_PORT_KEY, ms_port)
             ctx.log.info(
                 "AMC containers are already running; reusing the configured ports"
             )
