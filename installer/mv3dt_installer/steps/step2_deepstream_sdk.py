@@ -115,7 +115,13 @@ _SMOKE_TEST_TIMEOUT_S = 30
 _SMOKE_CONFIG_ASSET = ("deepstream", "smoke_app_config.txt")
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+)")
-_ERROR_DIAGNOSTIC_RE = re.compile(r"(?im)^\s*(?:\*\*\s*)?ERROR(?:\s*:|\s+FROM\b)")
+_ERROR_DIAGNOSTIC_RE = re.compile(
+    r"(?im)^(?:"
+    r"\s*(?:\*\*\s*)?ERROR(?:\s*:|\s+FROM\b)"
+    r"|\s*\[ERROR\](?:\s|:)"
+    r"|\s*\d+:\d{2}:\d{2}\.\d+\s+\d+\s+\S+\s+ERROR\s+\S+"
+    r")"
+)
 
 
 class Method(str, Enum):
