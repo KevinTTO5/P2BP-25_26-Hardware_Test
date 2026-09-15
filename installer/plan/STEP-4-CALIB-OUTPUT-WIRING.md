@@ -64,8 +64,10 @@ The following values are **REQUIRED** before polling begins:
 | `AMC_EXPORT_WAIT_S` | optional, default `3600` | bounded interactive wait |
 
 Missing required configuration and a missing camera inventory are reported in
-one consolidated `USER_ACTION_REQUIRED` result. The inventory action points to
-the installer camera-discovery mode:
+one consolidated `USER_ACTION_REQUIRED` result. Missing Step 3-owned values
+direct the operator back through the automated Step 3 flow; they must never be
+invented by editing `AMC_PROJECT_ID` or an API port manually. The inventory
+action points to the installer camera-discovery mode:
 
 ```bash
 sudo mv3dt-installer --scan-cameras
@@ -87,9 +89,10 @@ Step 4 polls:
 GET http://localhost:<AUTO_MAGIC_CALIB_MS_PORT>/v1/get_project_info/<AMC_PROJECT_ID>
 ```
 
-The response must be HTTP-successful JSON and contain `project_state` in the
-`project_info` object. State comparisons are case-insensitive after
-normalization to uppercase.
+The response must be HTTP-successful JSON and contain exactly the documented
+`project_info.project_state` shape. A top-level `project_state`, an alternate
+`state` field, or a non-object `project_info` is invalid. State comparisons are
+case-insensitive after normalization to uppercase.
 
 | State | Behavior |
 |---|---|
@@ -147,7 +150,8 @@ directory. HTTP failures, timeouts, missing output, and empty output are
 
 The archive is rejected when it contains any of the following:
 
-- an absolute path, parent traversal, Windows drive prefix, or duplicate path;
+- an absolute path, parent traversal, backslash, colon, Windows drive prefix,
+  or duplicate path;
 - a symbolic link, unsupported file type, or encrypted member;
 - more than `4096` members or more than `1 GiB` expanded content;
 - no root-level `transforms.yml`.
@@ -256,6 +260,10 @@ The service command is:
 This preserves automatic later re-ingest without watching a directory AMC
 3.2.1 does not create.
 
+On upgrade, Step 4 disables and removes only the matching legacy
+`mv3dt-ingest-<slug>.path` unit before enabling the timer. A failure to disable
+that unit is fatal, and unrelated projects' units are never removed.
+
 ---
 
 ## 8. Verification and failure surfaces
@@ -267,7 +275,8 @@ This preserves automatic later re-ingest without watching a directory AMC
 - the rendered app config contains no placeholder and references the tracker;
 - every enabled camera source has a concrete `rtsp://` URI;
 - the referenced PeopleNet and message-converter configs exist;
-- both re-ingest units exist and the timer is enabled.
+- both re-ingest units exist, the timer alone is enabled, and the obsolete
+  matching `.path` unit is neither installed nor enabled.
 
 | Failure | Result |
 |---|---|
@@ -296,6 +305,7 @@ TensorRT, DeepStream, or the PeopleNet model.
 - [ ] Repeat ingest of the same archive is a no-change.
 - [ ] Rendering and pinned tracker checks pass.
 - [ ] The timer exists; no obsolete export-directory path unit is installed.
+- [ ] An upgrade disables and removes only its matching legacy path unit.
 
 ---
 

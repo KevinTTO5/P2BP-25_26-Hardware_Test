@@ -140,11 +140,33 @@ def _configuration_action(
 ) -> StepResult:
     parts: list[str] = []
     actions: list[UserAction] = []
+    step3_keys = {
+        CONF_LOCATION_ID_KEY,
+        CONF_PROJECT_NAME_KEY,
+        CONF_AMC_PROJECT_ID_KEY,
+        CONF_MS_PORT_KEY,
+    }
+    missing_step3 = [key for key in missing if key in step3_keys]
+    missing_operator = [key for key in missing if key not in step3_keys]
     if missing:
         parts.append(f"missing installer configuration: {', '.join(missing)}")
+    if missing_step3:
         actions.append(
             UserAction(
-                text=f"Set {', '.join(missing)} in installer.conf.",
+                text=(
+                    "Re-run the automated Step 3 AMC launcher and project setup; "
+                    f"it owns {', '.join(missing_step3)}."
+                ),
+                command=(
+                    f"sudo {ctx.install_dir / 'bin' / step3_mod.INSTALLER_BIN_NAME} "
+                    "--reset-step 3"
+                ),
+            )
+        )
+    if missing_operator:
+        actions.append(
+            UserAction(
+                text=f"Set {', '.join(missing_operator)} in installer.conf.",
                 path=str(ctx.install_dir / config_mod.CONF_FILENAME),
             )
         )
@@ -210,10 +232,10 @@ def _project_state(ctx: "Context", inputs: ProjectInputs) -> str:
         text=True,
     )
     payload = _json_object(result, f"AMC project {inputs.project_id} status")
-    info = payload.get("project_info") or payload
+    info = payload.get("project_info")
     if not isinstance(info, dict):
         raise AmcApiError("AMC project status response has no project_info object")
-    state_value = info.get("project_state") or info.get("state")
+    state_value = info.get("project_state")
     if not isinstance(state_value, str) or not state_value.strip():
         raise AmcApiError("AMC project status response has no project_state")
     state_name = state_value.strip().upper()
@@ -294,14 +316,19 @@ def _safe_members(zf: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
     seen: set[str] = set()
     transforms = False
     for member in members:
-        name = member.filename.replace("\\", "/")
+        if "\\" in member.filename:
+            raise AmcApiError(
+                f"AMC result ZIP contains an unsafe path: {member.filename!r}"
+            )
+        name = member.filename
         path = pathlib.PurePosixPath(name)
         if (
             not name
             or name.startswith("/")
             or path.is_absolute()
             or ".." in path.parts
-            or (path.parts and re.fullmatch(r"[A-Za-z]:", path.parts[0]))
+            or re.match(r"^[A-Za-z]:", name)
+            or any(":" in part for part in path.parts)
         ):
             raise AmcApiError(
                 f"AMC result ZIP contains unsafe path: {member.filename!r}"
@@ -640,7 +667,27 @@ def _systemd_runner(ctx: "Context"):
 
 def _install_reingest_units(ctx: "Context", *, inputs: ProjectInputs) -> None:
     runner = _systemd_runner(ctx)
+    slug = _slugify(inputs.project_name, location_id=inputs.location_id)
+    legacy_name = f"mv3dt-ingest-{slug}.path"
+    legacy_path = systemd.UNIT_DIR / legacy_name
     changed_any = False
+    if legacy_path.exists():
+        result = ctx.run_root(
+            "systemctl",
+            "disable",
+            "--now",
+            legacy_name,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if getattr(result, "returncode", 1) != 0:
+            raise AmcApiError(
+                f"could not disable obsolete {legacy_name}: {_result_detail(result)}"
+            )
+        legacy_path.unlink()
+        changed_any = True
+        ctx.log.info(f"removed obsolete re-ingest unit {legacy_name}")
     for name, content in _render_reingest_units(ctx, inputs=inputs).items():
         changed = systemd.install_unit(
             name, content, unit_dir=systemd.UNIT_DIR, runner=runner
@@ -651,7 +698,6 @@ def _install_reingest_units(ctx: "Context", *, inputs: ProjectInputs) -> None:
         )
     if changed_any:
         systemd.daemon_reload(runner=runner)
-    slug = _slugify(inputs.project_name, location_id=inputs.location_id)
     systemd.enable_now(f"mv3dt-ingest-{slug}.timer", runner=runner)
 
 
@@ -745,7 +791,10 @@ class Step4CalibOutputWiring:
             return result
         ctx.progress.phase(3)
         ctx.progress.task("installing automatic AMC result polling")
-        _install_reingest_units(ctx, inputs=inputs)
+        try:
+            _install_reingest_units(ctx, inputs=inputs)
+        except (AmcApiError, OSError, ValueError) as exc:
+            return StepResult(status=StepStatus.FAILED, message=str(exc))
         return result
 
     def verify(self, ctx: "Context") -> StepResult:
@@ -834,6 +883,18 @@ class Step4CalibOutputWiring:
         if not systemd.is_enabled(timer, runner=_systemd_runner(ctx)):
             return StepResult(
                 status=StepStatus.FAILED, message=f"{timer} is not enabled"
+            )
+        if systemd.is_enabled(service, runner=_systemd_runner(ctx)):
+            return StepResult(
+                status=StepStatus.FAILED, message=f"{service} must not be enabled"
+            )
+        legacy_path = f"mv3dt-ingest-{slug}.path"
+        if (systemd.UNIT_DIR / legacy_path).exists() or systemd.is_enabled(
+            legacy_path, runner=_systemd_runner(ctx)
+        ):
+            return StepResult(
+                status=StepStatus.FAILED,
+                message=f"obsolete {legacy_path} is still installed or enabled",
             )
         return StepResult(status=StepStatus.COMPLETE)
 

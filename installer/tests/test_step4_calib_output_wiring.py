@@ -67,6 +67,17 @@ def _zip_bytes(files=None, *, symlink=None) -> bytes:
     return stream.getvalue()
 
 
+def _special_member_zip(name: str, mode: int) -> bytes:
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w") as archive:
+        archive.writestr("transforms.yml", "transforms: []\n")
+        info = zipfile.ZipInfo(name)
+        info.create_system = 3
+        info.external_attr = mode << 16
+        archive.writestr(info, "special")
+    return stream.getvalue()
+
+
 class Runner:
     def __init__(
         self,
@@ -76,12 +87,20 @@ class Runner:
         status_rc=0,
         download_rc=0,
         log="solver failed",
+        log_rc=0,
+        status_payload=None,
+        disable_rc=0,
+        enabled_units=None,
     ):
         self.states = list(states or ["COMPLETED"])
         self.archive = archive if archive is not None else _zip_bytes()
         self.status_rc = status_rc
         self.download_rc = download_rc
         self.log = log
+        self.log_rc = log_rc
+        self.status_payload = status_payload
+        self.disable_rc = disable_rc
+        self.enabled_units = enabled_units
         self.calls = []
 
     def __call__(self, *args, **kwargs):
@@ -93,6 +112,8 @@ class Runner:
                     return subprocess.CompletedProcess(
                         args, self.status_rc, "", "status unavailable"
                     )
+                if self.status_payload is not None:
+                    return subprocess.CompletedProcess(args, 0, self.status_payload, "")
                 state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
                 return subprocess.CompletedProcess(
                     args,
@@ -101,7 +122,12 @@ class Runner:
                     "",
                 )
             if "/amc/calibrate/" in url:
-                return subprocess.CompletedProcess(args, 0, self.log, "")
+                return subprocess.CompletedProcess(
+                    args,
+                    self.log_rc,
+                    self.log if not self.log_rc else "",
+                    "log unavailable" if self.log_rc else "",
+                )
             if "/mv3dt_result?result_type=amc" in url:
                 if self.download_rc:
                     return subprocess.CompletedProcess(
@@ -110,7 +136,19 @@ class Runner:
                 pathlib.Path(args[args.index("-o") + 1]).write_bytes(self.archive)
                 return subprocess.CompletedProcess(args, 0, "", "")
         if args[:3] == ("systemctl", "is-enabled", "--quiet"):
-            return subprocess.CompletedProcess(args, 0, "", "")
+            enabled = (
+                args[3].endswith(".timer")
+                if self.enabled_units is None
+                else args[3] in self.enabled_units
+            )
+            return subprocess.CompletedProcess(args, 0 if enabled else 1, "", "")
+        if args[:3] == ("systemctl", "disable", "--now"):
+            return subprocess.CompletedProcess(
+                args,
+                self.disable_rc,
+                "",
+                "disable failed" if self.disable_rc else "",
+            )
         return subprocess.CompletedProcess(args, 0, "", "")
 
 
@@ -231,7 +269,9 @@ def test_missing_inputs_and_inventory_are_one_action_result(tmp_path, templates)
     assert result.status is StepStatus.USER_ACTION_REQUIRED
     assert "AMC_PROJECT_ID" in result.message and "CAM_PASSWORD" in result.message
     assert "camera inventory" in result.message
-    assert len(result.user_actions) == 2
+    assert len(result.user_actions) == 3
+    assert "Step 3" in result.user_actions[0].text
+    assert "AMC_PROJECT_ID" not in result.user_actions[1].text
 
 
 def test_preflight_polls_running_then_completed(tmp_path, templates, monkeypatch):
@@ -269,6 +309,33 @@ def test_preflight_status_http_error_is_fatal(tmp_path, templates, monkeypatch):
     result = step4.Step4CalibOutputWiring().preflight(ctx)
     assert result.status is StepStatus.FAILED
     assert "status unavailable" in result.message
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"project_state":"COMPLETED"}',
+        '{"project_info":{"state":"COMPLETED"}}',
+        '{"project_info":[]}',
+    ],
+)
+def test_preflight_rejects_undocumented_status_shapes(
+    tmp_path, templates, monkeypatch, payload
+):
+    ctx = _ctx(tmp_path, templates, runner=Runner(status_payload=payload))
+    _complete_wait(monkeypatch)
+    result = step4.Step4CalibOutputWiring().preflight(ctx)
+    assert result.status is StepStatus.FAILED
+    assert "project_info" in result.message or "project_state" in result.message
+
+
+def test_preflight_error_reports_failed_log_fetch(tmp_path, templates, monkeypatch):
+    ctx = _ctx(tmp_path, templates, runner=Runner(states=["ERROR"], log_rc=22))
+    _complete_wait(monkeypatch)
+    result = step4.Step4CalibOutputWiring().preflight(ctx)
+    assert result.status is StepStatus.FAILED
+    assert "log fetch failed" in result.message
+    assert "log unavailable" in result.message
 
 
 @pytest.mark.parametrize(
@@ -328,6 +395,9 @@ def test_download_http_error_preserves_existing_tree(tmp_path, templates):
         (_zip_bytes({"../escape": "bad", "transforms.yml": "ok"}), "unsafe path"),
         (_zip_bytes({"camera.json": "{}"}), "missing required transforms.yml"),
         (_zip_bytes({"/absolute": "bad", "transforms.yml": "ok"}), "unsafe path"),
+        (_zip_bytes({"C:escape.txt": "bad", "transforms.yml": "ok"}), "unsafe path"),
+        (_zip_bytes({"C:\\escape.txt": "bad", "transforms.yml": "ok"}), "unsafe path"),
+        (_zip_bytes({"safe:stream": "bad", "transforms.yml": "ok"}), "unsafe path"),
     ],
 )
 def test_invalid_archives_are_rejected_without_partial_success(
@@ -351,6 +421,112 @@ def test_symlink_member_is_rejected(tmp_path, templates):
             inputs=inputs,
             dest=step4.default_calibration_dir(ctx, inputs.location_id),
         )
+
+
+def test_duplicate_member_is_rejected(tmp_path, templates):
+    stream = io.BytesIO()
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        with zipfile.ZipFile(stream, "w") as archive:
+            archive.writestr("transforms.yml", "first")
+            archive.writestr("transforms.yml", "second")
+    ctx = _ctx(tmp_path, templates, runner=Runner(archive=stream.getvalue()))
+    inputs, _ = step4.resolve_project_inputs(ctx)
+    with pytest.raises(step4.AmcApiError, match="duplicate path"):
+        step4.download_and_ingest(
+            ctx,
+            inputs=inputs,
+            dest=step4.default_calibration_dir(ctx, inputs.location_id),
+        )
+
+
+def test_unsupported_member_is_rejected(tmp_path, templates):
+    archive = _special_member_zip("pipe", stat.S_IFIFO | 0o600)
+    ctx = _ctx(tmp_path, templates, runner=Runner(archive=archive))
+    inputs, _ = step4.resolve_project_inputs(ctx)
+    with pytest.raises(step4.AmcApiError, match="unsupported member"):
+        step4.download_and_ingest(
+            ctx,
+            inputs=inputs,
+            dest=step4.default_calibration_dir(ctx, inputs.location_id),
+        )
+
+
+def test_expanded_size_limit_is_enforced(tmp_path, templates, monkeypatch):
+    monkeypatch.setattr(step4, "_MAX_UNCOMPRESSED_BYTES", 1)
+    ctx = _ctx(tmp_path, templates)
+    inputs, _ = step4.resolve_project_inputs(ctx)
+    with pytest.raises(step4.AmcApiError, match="1 GiB safety limit"):
+        step4.download_and_ingest(
+            ctx,
+            inputs=inputs,
+            dest=step4.default_calibration_dir(ctx, inputs.location_id),
+        )
+
+
+def test_encrypted_member_is_rejected(tmp_path, templates, monkeypatch):
+    ctx = _ctx(tmp_path, templates)
+    original = step4.zipfile.ZipFile
+
+    class EncryptedZip:
+        def __init__(self, *args, **kwargs):
+            self.inner = original(*args, **kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.inner.close()
+
+        def infolist(self):
+            members = self.inner.infolist()
+            members[0].flag_bits |= 0x1
+            return members
+
+        def open(self, member):
+            return self.inner.open(member)
+
+    monkeypatch.setattr(step4.zipfile, "ZipFile", EncryptedZip)
+    inputs, _ = step4.resolve_project_inputs(ctx)
+    with pytest.raises(step4.AmcApiError, match="encrypted member"):
+        step4.download_and_ingest(
+            ctx,
+            inputs=inputs,
+            dest=step4.default_calibration_dir(ctx, inputs.location_id),
+        )
+
+
+def test_empty_result_download_is_rejected(tmp_path, templates):
+    ctx = _ctx(tmp_path, templates, runner=Runner(archive=b""))
+    inputs, _ = step4.resolve_project_inputs(ctx)
+    with pytest.raises(step4.AmcApiError, match="empty file"):
+        step4.download_and_ingest(
+            ctx,
+            inputs=inputs,
+            dest=step4.default_calibration_dir(ctx, inputs.location_id),
+        )
+
+
+def test_final_rename_failure_restores_previous_calibration(
+    tmp_path, templates, monkeypatch
+):
+    ctx = _ctx(tmp_path, templates)
+    inputs, _ = step4.resolve_project_inputs(ctx)
+    dest = step4.default_calibration_dir(ctx, inputs.location_id)
+    dest.mkdir(parents=True)
+    (dest / "transforms.yml").write_text("previous\n", encoding="utf-8")
+    real_replace = step4.os.replace
+    calls = {"count": 0}
+
+    def fail_final(source, target):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OSError("final rename failed")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(step4.os, "replace", fail_final)
+    with pytest.raises(OSError, match="final rename failed"):
+        step4.download_and_ingest(ctx, inputs=inputs, dest=dest)
+    assert (dest / "transforms.yml").read_text(encoding="utf-8") == "previous\n"
 
 
 def test_reingest_is_idempotent_for_same_archive(tmp_path, templates):
@@ -379,6 +555,44 @@ def test_run_ingests_renders_and_installs_timer(tmp_path, templates):
         encoding="utf-8"
     )
     assert "OnUnitActiveSec=60s" in timer_text
+    enabled_calls = [
+        call[0][3]
+        for call in ctx.runner.calls
+        if call[0][:3] == ("systemctl", "enable", "--now")
+    ]
+    assert enabled_calls == ["mv3dt-ingest-site-42.timer"]
+
+
+def test_run_removes_only_obsolete_legacy_path_unit(tmp_path, templates):
+    ctx = _ctx(tmp_path, templates, non_interactive=True)
+    systemd.UNIT_DIR.mkdir(parents=True)
+    legacy = systemd.UNIT_DIR / "mv3dt-ingest-site-42.path"
+    unrelated = systemd.UNIT_DIR / "mv3dt-ingest-other.path"
+    legacy.write_text("old", encoding="utf-8")
+    unrelated.write_text("keep", encoding="utf-8")
+    assert step4.Step4CalibOutputWiring().run(ctx).status is StepStatus.COMPLETE
+    assert not legacy.exists()
+    assert unrelated.read_text(encoding="utf-8") == "keep"
+    assert any(
+        call[0][:4] == ("systemctl", "disable", "--now", "mv3dt-ingest-site-42.path")
+        for call in ctx.runner.calls
+    )
+
+
+def test_run_preserves_legacy_path_when_disable_fails(tmp_path, templates):
+    ctx = _ctx(
+        tmp_path,
+        templates,
+        runner=Runner(disable_rc=1),
+        non_interactive=True,
+    )
+    systemd.UNIT_DIR.mkdir(parents=True)
+    legacy = systemd.UNIT_DIR / "mv3dt-ingest-site-42.path"
+    legacy.write_text("old", encoding="utf-8")
+    result = step4.Step4CalibOutputWiring().run(ctx)
+    assert result.status is StepStatus.FAILED
+    assert "disable failed" in result.message
+    assert legacy.is_file()
 
 
 def test_run_uses_interactive_alternate_destination(tmp_path, templates, monkeypatch):
@@ -407,6 +621,21 @@ def test_verify_complete_after_run(tmp_path, templates):
     assert step.verify(ctx).status is StepStatus.COMPLETE
 
 
+def test_verify_rejects_enabled_oneshot_service(tmp_path, templates):
+    runner = Runner(
+        enabled_units={
+            "mv3dt-ingest-site-42.timer",
+            "mv3dt-ingest-site-42.service",
+        }
+    )
+    ctx = _ctx(tmp_path, templates, runner=runner, non_interactive=True)
+    step = step4.Step4CalibOutputWiring()
+    assert step.run(ctx).status is StepStatus.COMPLETE
+    result = step.verify(ctx)
+    assert result.status is StepStatus.FAILED
+    assert "service must not be enabled" in result.message
+
+
 def test_verify_requires_transforms_yml(tmp_path, templates):
     ctx = _ctx(tmp_path, templates, non_interactive=True)
     step = step4.Step4CalibOutputWiring()
@@ -428,6 +657,16 @@ def test_ingest_subcommand_completed_downloads_and_renders(tmp_path, templates):
     ctx = _ctx(tmp_path, templates, non_interactive=True)
     assert step4.handle_ingest_subcommand(["--project", "site-42"], ctx) == 0
     assert (step4.default_calibration_dir(ctx, "site-42") / "transforms.yml").is_file()
+
+
+def test_ingest_subcommand_reuses_persisted_custom_destination(tmp_path, templates):
+    conf = _conf(tmp_path)
+    custom = tmp_path / "persisted calibration"
+    conf[step4.CONF_CALIBRATION_DIR_KEY] = str(custom)
+    ctx = _ctx(tmp_path, templates, conf=conf, non_interactive=True)
+    assert step4.handle_ingest_subcommand(["--project", "site-42"], ctx) == 0
+    assert (custom / "transforms.yml").is_file()
+    assert not step4.default_calibration_dir(ctx, "site-42").exists()
 
 
 def test_ingest_subcommand_error_log_returns_nonzero(tmp_path, templates):
