@@ -537,6 +537,7 @@ def test_execute_hold_dedicated_window_waits_then_tears_down(tmp_path):
 def test_execute_hold_keep_up_never_tears_down(tmp_path):
     ctx = FakeContext(tmp_path)
     torn_down = {"count": 0}
+    fake_proc = _FakePopen(["chromium"])
 
     step3.execute_hold(
         ctx,
@@ -544,11 +545,12 @@ def test_execute_hold_keep_up_never_tears_down(tmp_path):
         "http://localhost:5000",
         teardown=lambda: torn_down.__setitem__("count", torn_down["count"] + 1),
         keep_up=True,
-        popen=lambda argv: _FakePopen(argv),
+        popen=lambda argv: fake_proc,
         which=lambda name: "/usr/bin/chromium",
     )
 
     assert torn_down["count"] == 0
+    assert fake_proc.waited is True
 
 
 def test_execute_hold_print_url_and_leave_up_never_tears_down(tmp_path):
@@ -1131,9 +1133,10 @@ def test_docker_login_is_required_and_key_is_not_in_argv(tmp_path):
 
 
 def test_docker_login_failure_is_fatal_with_evidence(tmp_path):
-    runner = ScriptedRunner(default_returncode=1, default_stderr="denied")
-    with pytest.raises(step3.AmcLaunchError, match="denied"):
+    runner = ScriptedRunner(default_returncode=1, default_stderr="a-fake-ngc-key")
+    with pytest.raises(step3.AmcLaunchError, match="exit 1") as caught:
         step3.docker_login(FakeContext(tmp_path, runner_user=runner))
+    assert "a-fake-ngc-key" not in str(caught.value)
 
 
 @pytest.mark.parametrize("command", [("config", "--quiet"), ("pull",), ("up", "-d")])
@@ -1216,6 +1219,24 @@ def test_readiness_failure_is_fatal_and_tears_down_once(tmp_path, monkeypatch):
     result = step3.launch_amc(ctx, non_interactive=True)
     assert result.status is StepStatus.FAILED
     assert "status evidence" in result.message
+    assert len(downs) == 1
+
+
+def test_partial_compose_up_failure_attempts_cleanup(tmp_path, monkeypatch):
+    ctx = FakeContext(tmp_path, runner_user=_passing_runner())
+    _stub_amc_root_with_compose(ctx)
+    downs = []
+    monkeypatch.setattr(step3, "ensure_container_prerequisites", lambda ctx: None)
+    monkeypatch.setattr(step3, "resolve_ports", lambda ctx, cfg: cfg)
+    monkeypatch.setattr(
+        step3, "compose_up",
+        lambda ctx, path: (_ for _ in ()).throw(step3.AmcLaunchError("partial up")),
+    )
+    monkeypatch.setattr(step3, "compose_down", lambda ctx, path: downs.append(path))
+    monkeypatch.setattr(step3.atexit, "register", lambda fn: None)
+    result = step3.launch_amc(ctx, non_interactive=True)
+    assert result.status is StepStatus.FAILED
+    assert result.message == "partial up"
     assert len(downs) == 1
 
 

@@ -517,8 +517,8 @@ def docker_login(ctx: "Context") -> None:
     )
     if result.returncode != 0:
         raise AmcLaunchError(
-            f"docker login nvcr.io failed (exit {result.returncode}): "
-            f"{_result_detail(result)}"
+            f"docker login nvcr.io failed (exit {result.returncode}); child "
+            "output omitted because the process handled NGC_API_KEY"
         )
 
 
@@ -882,10 +882,6 @@ def execute_hold(
     arriving during `proc.wait()`/the prompt and a normal fall-through both
     routed through the exact same run-once state.
     """
-    if keep_up:
-        ctx.log.info(f"--keep-up set: leaving AMC running at {url}")
-        return
-
     if strategy is HoldStrategy.DEDICATED_WINDOW:
         proc = open_dedicated_window(ctx, url, popen=popen, which=which)
         if proc is not None:
@@ -894,7 +890,10 @@ def execute_hold(
                 "window when you're done; the service stays up until you do."
             )
             proc.wait()
-            teardown()
+            if keep_up:
+                ctx.log.info(f"--keep-up set: leaving AMC running at {url}")
+            else:
+                teardown()
             return
         # No browser after all (race between decide_hold_strategy's check
         # and here, or a caller passed the strategy in directly) -- fall
@@ -907,7 +906,8 @@ def execute_hold(
             prompt("Press Enter (or Ctrl-C) when you have closed AMC to shut it down.")
         except KeyboardInterrupt:
             pass
-        teardown()
+        if not keep_up:
+            teardown()
         return
 
     if strategy is HoldStrategy.PRINT_URL_AND_PROMPT:
@@ -916,7 +916,8 @@ def execute_hold(
             prompt("Press Enter (or Ctrl-C) when you have closed AMC to shut it down.")
         except KeyboardInterrupt:
             pass
-        teardown()
+        if not keep_up:
+            teardown()
         return
 
     # PRINT_URL_AND_LEAVE_UP -- non-interactive with nothing to monitor and
@@ -1179,16 +1180,23 @@ def ensure_container_prerequisites(ctx: "Context") -> None:
 
     if not _package_installed(ctx, "nvidia-container-toolkit"):
         ctx.progress.task("installing NVIDIA Container Toolkit")
-        _run_required(
-            ctx, "NVIDIA toolkit key download", "curl", "-fsSL",
-            "-o", "/tmp/mv3dt-nvidia-container-toolkit.gpg",
-            "https://nvidia.github.io/libnvidia-container/gpgkey",
-        )
-        _run_required(
-            ctx, "NVIDIA toolkit key install", "gpg", "--dearmor", "--yes",
-            "--output", "/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
-            "/tmp/mv3dt-nvidia-container-toolkit.gpg",
-        )
+        key_fd, key_path = tempfile.mkstemp(prefix="mv3dt-nvidia-key-", dir="/tmp")
+        os.close(key_fd)
+        try:
+            _run_required(
+                ctx, "NVIDIA toolkit key download", "curl", "-fsSL",
+                "-o", key_path, "https://nvidia.github.io/libnvidia-container/gpgkey",
+            )
+            _run_required(
+                ctx, "NVIDIA toolkit key install", "gpg", "--dearmor", "--yes",
+                "--output", "/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
+                key_path,
+            )
+        finally:
+            try:
+                os.unlink(key_path)
+            except OSError:
+                pass
         repo_script = (
             "set -o pipefail; curl -fsSL "
             "https://nvidia.github.io/libnvidia-container/stable/deb/"
@@ -1331,8 +1339,8 @@ def launch_amc(
 
         if not skip_pull:
             compose_pull(ctx, compose_dir)
-        compose_up(ctx, compose_dir)
         up_started = True
+        compose_up(ctx, compose_dir)
 
         api_url = f"http://localhost:{cfg.ms_port}/v1/ready"
         ui_url = f"http://localhost:{cfg.ui_port}"
