@@ -71,7 +71,7 @@ python3 -m pytest tests/ -q
 Current result on an **arm64 macOS** development machine:
 
 ```
-1 failed, 1321 passed, 7 skipped
+1 failed, 1324 passed, 7 skipped
 ```
 
 **The single failure is environmental, not a regression (REQUIRED to know
@@ -97,7 +97,7 @@ and register into `STEP_REGISTRY` at import.
 | Step | Module | Lines | Tests | Spec |
 |---|---|---|---|---|
 | 1 | `step1_prerequisites.py` | 1536 | 76 | [`STEP-1`](STEP-1-PREREQUISITES.md) |
-| 2 | `step2_deepstream_sdk.py` | 1424 | 79 | [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) |
+| 2 | `step2_deepstream_sdk.py` | 1451 | 82 | [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) |
 | 3 | `step3_amc_launcher.py` | 1652 | 91 | [`STEP-3`](STEP-3-AMC-LAUNCHER.md) |
 | 4 | `step4_calib_output_wiring.py` | 963 | 43 | [`STEP-4`](STEP-4-CALIB-OUTPUT-WIRING.md) |
 | 5 | `step5_per_project_exes.py` | 1578 | 69 | [`STEP-5`](STEP-5-PER-PROJECT-EXES.md) |
@@ -228,7 +228,10 @@ calibration result:
   byte, rate and ETA progress
   when NVIDIA declares the archive size. If the bundled sample produces no
   frame evidence after the model and tracker initialize without errors, the
-  result is reported as inconclusive and does not block AMC.
+  result is reported as inconclusive and does not block AMC. A successful or
+  safely inconclusive attempt writes a durable marker so this first-install
+  test is not repeated, even after an explicit Step 2 reset; an existing AMC
+  project identity also suppresses it on upgraded workstations.
 - Step 3 installs Docker Engine, Compose v2 and the NVIDIA Container Toolkit
   when needed, checks out the pinned AutoMagicCalib 3.2.1 commit, validates
   container readiness, and persists the AMC location, project and API
@@ -323,7 +326,7 @@ before it needs code.
 
 For the current state to be what this document claims:
 
-- [x] `python3 -m pytest tests/ -q` from `installer/` gives 1321 passed,
+- [x] `python3 -m pytest tests/ -q` from `installer/` gives 1324 passed,
       7 skipped and exactly the one environmental failure in
       [section 2.1](#21-test-suite) on arm64 macOS.
 - [ ] `grep` for `follow_apt` and `follow_download` finds the Step 1 and

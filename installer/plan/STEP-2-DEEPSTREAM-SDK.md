@@ -441,7 +441,15 @@ the stock Quickstart assets. Sample configs live under
   inconclusive and does not block Step 3. This test uses NVIDIA's packaged
   video rather than a physical camera, and AMC does not depend on its frame
   evidence. Missing startup evidence, explicit errors, and unexpected process
-  exits remain blocking failures.
+  exits remain blocking failures. If the initialized process requires GNU
+  `timeout` to escalate to `SIGKILL` after the grace period, exit 137 is also
+  inconclusive only when the same startup evidence is present and no error was
+  emitted.
+- **Run once:** a passing or safely inconclusive first-install test writes
+  `<install_dir>/deepstream/installation-test-complete`. Later installer runs
+  and explicit Step 2 resets skip the test. A persisted `AMC_PROJECT_ID` also
+  skips it for upgraded workstations that already progressed beyond initial
+  setup before the marker existed. Failed tests do not write the marker.
 - **Diagnostic gate:** reject GStreamer's prefixed `ERROR` severity field and
   DeepStream's `ERROR:`, `ERROR from`, and `[ERROR]` forms even if positive
   FPS was observed. Warning prose containing the word `error` — for example,

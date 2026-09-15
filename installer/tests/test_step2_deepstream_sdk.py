@@ -712,7 +712,7 @@ def test_initialized_sample_without_frame_evidence_does_not_block_amc(
     )
     runner.when(
         lambda a: a[:1] == ("timeout",),
-        returncode=124,
+        returncode=137,
         stdout=fixture.read_text(encoding="utf-8"),
     )
     ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
@@ -724,7 +724,51 @@ def test_initialized_sample_without_frame_evidence_does_not_block_amc(
     assert result.status is StepStatus.COMPLETE
     assert step._smoke_ran is True
     assert step._smoke_passed is None
+    assert step2._installation_test_marker(ctx).is_file()
     assert "installation test inconclusive" in capsys.readouterr().err
+
+
+def test_completed_installation_test_is_not_repeated_after_step_reset(
+    tmp_path, _sdk_paths
+):
+    sdk_dir, symlink, profile = _sdk_paths
+    runner = _host_ready_runner()
+    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
+    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
+    step2._record_installation_test(ctx)
+
+    result = step2.Step2DeepStreamSdk().verify(ctx)
+
+    assert result.status is StepStatus.COMPLETE
+    assert not any(call[:1] == ("timeout",) for call in runner.calls)
+
+
+def test_existing_amc_project_skips_legacy_workstation_installation_test(
+    tmp_path, _sdk_paths
+):
+    sdk_dir, symlink, profile = _sdk_paths
+    runner = _host_ready_runner()
+    ctx = FakeContext(
+        tmp_path,
+        conf={"ds_install_method": "deb", "AMC_PROJECT_ID": "project-123"},
+        runner_root=runner,
+    )
+    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
+
+    result = step2.Step2DeepStreamSdk().verify(ctx)
+
+    assert result.status is StepStatus.COMPLETE
+    assert not any(call[:1] == ("timeout",) for call in runner.calls)
+
+
+def test_forced_timeout_shutdown_without_startup_evidence_is_a_failure(tmp_path):
+    runner = ScriptedRunner()
+    runner.when(lambda a: a[:1] == ("timeout",), returncode=137)
+    ctx = FakeContext(tmp_path, runner_root=runner)
+
+    passed, _ = step2._run_smoke_test(ctx, docker=False)
+
+    assert passed is False
 
 
 def test_smoke_accepts_timeout_only_with_positive_fps(tmp_path):
