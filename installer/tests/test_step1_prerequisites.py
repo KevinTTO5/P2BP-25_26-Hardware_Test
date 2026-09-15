@@ -199,6 +199,8 @@ class FakeRunner:
                 return _rc(args, 100)
             if args[1] == "install":
                 for tok in args[4:]:
+                    if tok.startswith("-"):
+                        continue
                     pkg = tok.split("=")[0]
                     if pkg in s1.CUDNN_PACKAGES and self.cudnn_install_result:
                         version = self.cudnn_install_result
@@ -830,7 +832,7 @@ def test_launch_a_nvidia_purge_failure_is_failed(tmp_path):
 
 
 def test_launch_b_pins_cudnn_version_at_apt_install(tmp_path):
-    """CUDA 13 cuDNN uses concrete packages at the exact apt version."""
+    """CUDA 13 cuDNN pins its full dependency chain and permits reconciliation."""
     ctx, runner = _make_ctx(
         tmp_path,
         driver_version=s1.DRIVER_VERSION,
@@ -847,11 +849,41 @@ def test_launch_b_pins_cudnn_version_at_apt_install(tmp_path):
     cudnn_call = next(
         call for call in install_calls if s1.CUDNN_QUERY_PACKAGE in " ".join(call)
     )
-    assert all(
-        f"{pkg}={s1.CUDNN_APT_VERSION}" in cudnn_call for pkg in s1.CUDNN_PACKAGES
+    expected_packages = (
+        "cudnn9-cuda-13",
+        "cudnn9-cuda-13-2",
+        "libcudnn9-static-cuda-13",
+        "libcudnn9-dev-cuda-13",
+        "libcudnn9-headers-cuda-13",
+        "libcudnn9-cuda-13",
     )
-    assert not any("*" in arg for arg in cudnn_call)
+    assert s1.CUDNN_PACKAGES == expected_packages
+    assert cudnn_call == (
+        "apt-get",
+        "install",
+        "-y",
+        "--no-install-recommends",
+        "--allow-downgrades",
+        *(f"{pkg}=9.20.0.48-1" for pkg in expected_packages),
+    )
     assert all((pkg, s1.CUDNN_VERSION) in ctx.installed for pkg in s1.CUDNN_PACKAGES)
+
+    tensorrt_call = next(
+        call for call in install_calls if s1.TENSORRT_PACKAGES[0] in " ".join(call)
+    )
+    assert "--allow-downgrades" not in tensorrt_call
+
+
+def test_general_apt_install_does_not_allow_downgrades_by_default(tmp_path):
+    ctx, runner = _make_ctx(tmp_path)
+
+    result = s1._apt_install_reported(ctx, ("curl",))
+
+    assert result is None
+    install_call = next(
+        call for call in runner.calls if call[:2] == ("apt-get", "install")
+    )
+    assert "--allow-downgrades" not in install_call
 
 
 def test_launch_b_recovers_missing_cuda_and_writes_profile(tmp_path):

@@ -106,12 +106,15 @@ TENSORRT_PACKAGES: tuple[str, ...] = (
     "libnvinfer-win-builder-resource10",
 )
 
-# CUDA 13 uses concrete, versioned cuDNN packages on Ubuntu 24.04. Pin both
-# meta-package layers so their >= dependency cannot resolve a newer cuDNN,
+# CUDA 13 uses concrete, versioned cuDNN packages on Ubuntu 24.04. Pin the
+# complete meta-package dependency chain so apt cannot resolve a newer cuDNN,
 # and pin/query the concrete runtime package used by DeepStream.
 CUDNN_PACKAGES: tuple[str, ...] = (
     "cudnn9-cuda-13",
     "cudnn9-cuda-13-2",
+    "libcudnn9-static-cuda-13",
+    "libcudnn9-dev-cuda-13",
+    "libcudnn9-headers-cuda-13",
     "libcudnn9-cuda-13",
 )
 CUDNN_QUERY_PACKAGE = "libcudnn9-cuda-13"
@@ -816,6 +819,7 @@ def _apt_install_reported(
     *,
     apt_args: Sequence[str] | None = None,
     reported_version: str | None = None,
+    allow_downgrades: bool = False,
 ) -> StepResult | None:
     """Install `query_packages` (or `apt_args`, if the apt invocation needs
     version-pinned `pkg=version` arguments) in one apt transaction, then
@@ -829,11 +833,13 @@ def _apt_install_reported(
         if "=" in arg
         for package, version in [arg.split("=", 1)]
     }
+    install_options = ["-y", "--no-install-recommends"]
+    if allow_downgrades:
+        install_options.append("--allow-downgrades")
     result = progress_exec.apt(
         ctx,
         "install",
-        "-y",
-        "--no-install-recommends",
+        *install_options,
         *argv,
         check=False,
         capture_output=True,
@@ -1412,6 +1418,7 @@ class Step1Prerequisites:
             CUDNN_PACKAGES,
             apt_args=cudnn_args,
             reported_version=CUDNN_VERSION,
+            allow_downgrades=True,
         )
         if failure is not None:
             return failure
