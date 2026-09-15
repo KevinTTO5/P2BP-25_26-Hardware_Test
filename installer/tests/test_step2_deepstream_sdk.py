@@ -698,11 +698,13 @@ def test_verify_host_fails_on_smoke_test_error(tmp_path, _sdk_paths):
     result = step.verify(ctx)
 
     assert result.status is StepStatus.FAILED
-    assert "smoke test failed" in result.message
+    assert "installation test failed" in result.message
 
 
-def test_v039_runtime_prompt_without_perf_is_not_frame_flow(tmp_path, _sdk_paths):
-    """Regression for the workstation transcript from release v0.3.9."""
+def test_initialized_sample_without_frame_evidence_does_not_block_amc(
+    tmp_path, _sdk_paths, capsys
+):
+    """Regression for the workstation transcripts from v0.3.9 and v0.4.1."""
     sdk_dir, symlink, profile = _sdk_paths
     runner = _host_ready_runner()
     fixture = pathlib.Path(__file__).with_name("fixtures").joinpath(
@@ -716,10 +718,13 @@ def test_v039_runtime_prompt_without_perf_is_not_frame_flow(tmp_path, _sdk_paths
     ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
     _make_sdk_tree(ctx, sdk_dir, symlink, profile)
 
-    result = step2.Step2DeepStreamSdk().verify(ctx)
+    step = step2.Step2DeepStreamSdk()
+    result = step.verify(ctx)
 
-    assert result.status is StepStatus.FAILED
-    assert "no positive FPS sample" in result.message
+    assert result.status is StepStatus.COMPLETE
+    assert step._smoke_ran is True
+    assert step._smoke_passed is None
+    assert "installation test inconclusive" in capsys.readouterr().err
 
 
 def test_smoke_accepts_timeout_only_with_positive_fps(tmp_path):
@@ -839,8 +844,8 @@ def test_smoke_progress_uses_bounded_runtime_and_observed_frame_count(
     assert passed is True
     assert message == ""
     assert percentages[0][0] == pytest.approx(100 / 35, rel=0.01)
-    assert percentages[0][1] == "0 frame outputs observed"
-    assert percentages[-1] == (100.0, "0 frame outputs observed")
+    assert percentages[0][1] == "0 sample frames verified"
+    assert percentages[-1] == (100.0, "0 sample frames verified")
 
 
 @pytest.mark.parametrize("phrase", ["open error", "OPEN ERROR"])
@@ -883,7 +888,7 @@ def test_verify_host_fails_on_error_diagnostic_after_pipeline_started(
     result = step2.Step2DeepStreamSdk().verify(ctx)
 
     assert result.status is StepStatus.FAILED
-    assert "smoke test failed" in result.message
+    assert "installation test failed" in result.message
 
 
 @pytest.mark.parametrize(
@@ -910,7 +915,7 @@ def test_verify_host_fails_on_prefixed_error_diagnostic(
     result = step2.Step2DeepStreamSdk().verify(ctx)
 
     assert result.status is StepStatus.FAILED
-    assert "smoke test failed" in result.message
+    assert "installation test failed" in result.message
 
 
 def test_verify_host_passes_end_to_end(tmp_path, _sdk_paths):

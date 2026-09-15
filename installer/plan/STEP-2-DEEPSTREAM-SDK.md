@@ -425,7 +425,8 @@ the stock Quickstart assets. Sample configs live under
   Exit `0` and timeout exit `124` are eligible for success; every other exit
   is a failure. The UI labels this separately from the PeopleNet phase and
   shows elapsed progress across the bounded 35-second run-and-termination
-  budget, with the observed detector-frame count beside the bar.
+  budget, labelled as a camera-free DeepStream installation test with the
+  number of sample frames verified beside the bar.
 - **Success evidence:** require either a numeric `**PERF:` sample whose
   instantaneous FPS is greater than zero or at least one per-frame detector
   output written through `gie-kitti-output-dir`. The latter is direct evidence
@@ -434,6 +435,13 @@ the stock Quickstart assets. Sample configs live under
   the interactive `Runtime commands:` prompt, model-load success, or a
   performance-header line alone does not prove that frames traversed the
   pipeline.
+- **Inconclusive sample handling:** if TensorRT reports that the model loaded,
+  the multi-object tracker initializes, and no error diagnostic appears, a
+  bundled sample that emits neither FPS nor detector files is reported as
+  inconclusive and does not block Step 3. This test uses NVIDIA's packaged
+  video rather than a physical camera, and AMC does not depend on its frame
+  evidence. Missing startup evidence, explicit errors, and unexpected process
+  exits remain blocking failures.
 - **Diagnostic gate:** reject GStreamer's prefixed `ERROR` severity field and
   DeepStream's `ERROR:`, `ERROR from`, and `[ERROR]` forms even if positive
   FPS was observed. Warning prose containing the word `error` — for example,

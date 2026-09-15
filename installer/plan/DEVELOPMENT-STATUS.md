@@ -221,11 +221,14 @@ calibration result:
 - Step 2 uses deterministic looped input, a batch-one inference engine and
   tracker configuration, and requires a positive numeric FPS value before
   its DeepStream smoke test passes. Release v0.4.1 separates that smoke test
-  from the PeopleNet phase, displays its bounded runtime as a progress bar
-  with observed detector-frame counts, and accepts per-frame inference output
-  as direct frame-flow evidence when DeepStream omits console FPS text. An
-  actual PeopleNet download uses authenticated byte, rate and ETA progress
-  when NVIDIA declares the archive size.
+  from the PeopleNet phase, displays its bounded runtime as a camera-free
+  DeepStream installation test with verified sample-frame counts, and accepts
+  per-frame inference output as direct frame-flow evidence when DeepStream
+  omits console FPS text. An actual PeopleNet download uses authenticated
+  byte, rate and ETA progress
+  when NVIDIA declares the archive size. If the bundled sample produces no
+  frame evidence after the model and tracker initialize without errors, the
+  result is reported as inconclusive and does not block AMC.
 - Step 3 installs Docker Engine, Compose v2 and the NVIDIA Container Toolkit
   when needed, checks out the pinned AutoMagicCalib 3.2.1 commit, validates
   container readiness, and persists the AMC location, project and API
