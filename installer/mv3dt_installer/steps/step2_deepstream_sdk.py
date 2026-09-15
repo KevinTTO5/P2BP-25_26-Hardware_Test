@@ -575,11 +575,14 @@ def _extract_ngc_cli(archive: pathlib.Path, target: pathlib.Path) -> None:
             for member in bundle.infolist():
                 path = pathlib.PurePosixPath(member.filename)
                 mode = member.external_attr >> 16
+                allowed_root = path.parts and (
+                    path.parts[0] == "ngc-cli" or path == pathlib.PurePosixPath("ngc-cli.md5")
+                )
                 if (
                     path.is_absolute()
                     or ".." in path.parts
                     or not path.parts
-                    or path.parts[0] != "ngc-cli"
+                    or not allowed_root
                     or stat.S_ISLNK(mode)
                 ):
                     raise ValueError(f"unsafe NGC CLI archive member: {member.filename}")
