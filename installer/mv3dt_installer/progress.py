@@ -1182,6 +1182,15 @@ _APT_KINDS = _APT_BAR_KINDS | _APT_NOTE_KINDS
 # (`libnvinfer10:amd64`), so the percentage is not reliably field 2.
 _APT_MAX_ITEM_FIELDS = 3
 
+# apt appends a volatile ETA to download descriptions while an archive is
+# in flight. The percentage already carries that movement, so treating each
+# countdown tick as a new output line floods verbose terminals without adding
+# a new event. Keep the file transition and discard only this exact dlstatus
+# suffix; package status/error parentheses remain operator evidence.
+_APT_RETRIEVAL_ETA = re.compile(
+    r"^(Retrieving file \d+ of \d+)\s+\([^()]+ remaining\)$"
+)
+
 
 @dataclass(frozen=True)
 class AptStatus:
@@ -1359,6 +1368,20 @@ def _apt_note(status: AptStatus) -> str | None:
     return item
 
 
+def _apt_display_description(status: AptStatus) -> str:
+    """Stable description for apt's live window and periodic record.
+
+    Only `dlstatus` retrieval ETAs are volatile. The parser retains apt's
+    original text, while the follower collapses per-second countdown records
+    to the file transition the operator can act on.
+    """
+    description = status.description
+    if status.kind != "dlstatus":
+        return description
+    match = _APT_RETRIEVAL_ETA.fullmatch(description)
+    return match.group(1) if match else description
+
+
 def render_apt_log_line(
     name: str, percent: int | None, description: str | None, elapsed: float
 ) -> str:
@@ -1469,10 +1492,11 @@ def follow_apt(
         if status is not None:
             parsed += 1
 
-            if status.description and status.description != description:
-                description = status.description
+            display_description = _apt_display_description(status)
+            if display_description and display_description != description:
+                description = display_description
                 if renderer is not None:
-                    renderer.line(status.description)
+                    renderer.line(display_description)
 
             if status.drives_bar:
                 if not committed:

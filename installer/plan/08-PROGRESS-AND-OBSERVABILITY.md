@@ -221,6 +221,12 @@ Streaming apt verbatim is thousands of lines. Two controls, both in §8:
   volume.
 - `--verbose` streams everything verbatim.
 
+The apt status adapter is the narrow exception to verbatim derived output:
+it removes the changing `(<duration> remaining)` suffix from `dlstatus`
+`Retrieving file N of M` descriptions. The percentage bar already reports
+that movement, while each file transition remains a distinct line. Apt's
+human `Get:` output, package-status descriptions, and errors are unchanged.
+
 ---
 
 ## 5. Percentages, honestly
@@ -259,6 +265,11 @@ Lines are `pmstatus:<package>:<percent>:<description>`. That percent is
 apt's own, covering unpack and configure as well as download, and is the
 correct denominator for event 3 in §2 — the failure that caused an
 interrupted transaction.
+
+`dlstatus` descriptions may append an ETA that changes once per second. The
+adapter records the stable `Retrieving file N of M` event once and uses the
+reported percentage for subsequent movement; it does not alter `pmstatus`
+or `pmerror` descriptions.
 
 ### 5.3 No fabricated progress (REQUIRED)
 
