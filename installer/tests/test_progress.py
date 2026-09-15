@@ -2216,6 +2216,84 @@ def test_follow_apt_surfaces_each_description_once():
     assert _window_rows(out) == [first, second]
 
 
+def test_follow_apt_collapses_retrieval_countdown_but_keeps_file_transitions():
+    """The percentage bar tracks download movement; a volatile ETA is not
+    a distinct verbose output event, while moving to another file is."""
+    out, clock = FakeTty(), FakeClock()
+    bar = _tty_progress(clock, out, verbose=True)
+    bar.begin_step(1, "Prerequisites", _PHASES)
+    bar.phase(3)
+
+    progress.follow_apt(
+        _apt_stream(
+            [
+                "dlstatus:1:10.0:Retrieving file 2 of 6 (15s remaining)",
+                "dlstatus:1:12.0:Retrieving file 2 of 6 (14s remaining)",
+                "dlstatus:2:20.0:Retrieving file 3 of 6 (8s remaining)",
+            ],
+            clock,
+        ),
+        renderer=bar,
+        clock=clock,
+    )
+
+    rendered = _ANSI.sub("", out.getvalue())
+    assert rendered.count("Retrieving file 2 of 6\n") == 1
+    assert rendered.count("Retrieving file 3 of 6\n") == 1
+    assert "remaining)" not in rendered
+
+
+@pytest.mark.parametrize(
+    "duration",
+    ["15s", "2min 15s", "1h 2min 15s", "1d 1h 2min 15s"],
+)
+def test_follow_apt_collapses_apt_duration_variants(duration):
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+
+    outcome = progress.follow_apt(
+        _apt_stream(
+            [f"dlstatus:1:10.0:Retrieving file 2 of 6 ({duration} remaining)"],
+            clock,
+        ),
+        renderer=bar,
+        clock=clock,
+    )
+
+    assert _window_rows(out) == ["Retrieving file 2 of 6"]
+    assert outcome.description == "Retrieving file 2 of 6"
+
+
+def test_follow_apt_retains_non_duration_retrieval_parentheses():
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+    description = "Retrieving file 2 of 6 (checksum verification remaining)"
+
+    outcome = progress.follow_apt(
+        _apt_stream([f"dlstatus:1:10.0:{description}"], clock),
+        renderer=bar,
+        clock=clock,
+    )
+
+    assert _window_rows(out) == [description]
+    assert outcome.description == description
+
+
+def test_follow_apt_does_not_normalise_pmstatus_parentheses():
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+    description = "Setting up libcudnn9 (9.20.0.48-1 remaining)"
+
+    outcome = progress.follow_apt(
+        _apt_stream([f"pmstatus:libcudnn9:50.0:{description}"], clock),
+        renderer=bar,
+        clock=clock,
+    )
+
+    assert _window_rows(out) == [description]
+    assert outcome.description == description
+
+
 def test_follow_apt_names_the_task_on_the_renderer():
     out, clock = FakeTty(), FakeClock()
     bar = _apt_progress(clock, out)
@@ -2405,6 +2483,33 @@ def test_follow_apt_on_a_tty_records_the_line_instead_of_printing_it(
     assert "[info ] installing TensorRT: finished in 2m20s" in transcript
     assert "\033" not in transcript
     assert "after" not in capsys.readouterr().err
+
+
+def test_follow_apt_records_stable_retrieval_description_in_transcript(
+    tmp_path,
+):
+    run_file = logs.open_transcript(log_dir=tmp_path / "logs")
+    out, clock = FakeTty(), FakeClock()
+    bar = _apt_progress(clock, out)
+
+    progress.follow_apt(
+        _apt_stream(
+            [
+                "dlstatus:1:10.0:Retrieving file 2 of 6 (15s remaining)",
+                "dlstatus:1:12.0:Retrieving file 2 of 6 (14s remaining)",
+            ],
+            clock,
+            seconds_per_line=30.0,
+        ),
+        renderer=bar,
+        task="installing cuDNN",
+        log_interval_s=30.0,
+        clock=clock,
+    )
+
+    transcript = run_file.read_text(encoding="utf-8")
+    assert "Retrieving file 2 of 6" in transcript
+    assert "remaining)" not in transcript
 
 
 def test_follow_apt_with_no_renderer_still_reaches_the_transcript(capsys):
