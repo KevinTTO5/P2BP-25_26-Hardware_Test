@@ -122,6 +122,9 @@ _ERROR_DIAGNOSTIC_RE = re.compile(
     r"|\s*\d+:\d{2}:\d{2}\.\d+\s+\d+\s+\S+\s+ERROR\s+\S+"
     r")"
 )
+_PERF_SAMPLE_RE = re.compile(
+    r"(?im)^\s*\*{0,2}PERF:\s*(\d+(?:\.\d+)?)\s*\("
+)
 
 
 class Method(str, Enum):
@@ -832,9 +835,9 @@ def _deepstream_app_version(ctx: "Context", *, docker: bool) -> Optional[str]:
 
 def _run_smoke_test(ctx: "Context", *, docker: bool) -> tuple[bool, str]:
     """Run the bundled fakesink smoke config for a bounded number of
-    seconds, and assert the app reached PLAYING with no error (doc section
-    7.3). Returns `(passed, message)`; `message` is a captured stderr/
-    stdout tail on failure, empty on success.
+    seconds, and require a positive numeric DeepStream FPS sample with no
+    error-severity diagnostic (doc section 7.3). Returns `(passed, message)`;
+    `message` is a captured output tail on failure, empty on success.
     """
     stage_root = shellout.stage_assets("deepstream")
     try:
@@ -848,14 +851,19 @@ def _run_smoke_test(ctx: "Context", *, docker: bool) -> tuple[bool, str]:
                 ctx,
                 "docker", "run", "--rm", "--gpus", "all",
                 "-v", f"{config_path.parent}:/tmp/mv3dt-smoke:ro",
+                "-w", "/tmp/mv3dt-smoke",
                 DOCKER_IMAGE,
-                "timeout", str(_SMOKE_TEST_TIMEOUT_S),
+                "timeout", "--signal=INT", "--kill-after=5s",
+                f"{_SMOKE_TEST_TIMEOUT_S}s",
+                "stdbuf", "-oL", "-eL",
                 "deepstream-app", "-c", container_config,
             )
         else:
             result = _run_root(
                 ctx,
-                "timeout", str(_SMOKE_TEST_TIMEOUT_S),
+                "timeout", "--signal=INT", "--kill-after=5s",
+                f"{_SMOKE_TEST_TIMEOUT_S}s",
+                "stdbuf", "-oL", "-eL",
                 "deepstream-app", "-c", str(config_path),
                 cwd=str(config_path.parent),
             )
@@ -863,7 +871,7 @@ def _run_smoke_test(ctx: "Context", *, docker: bool) -> tuple[bool, str]:
         stdout = result.stdout or ""
         stderr = result.stderr or ""
         combined = f"{stdout}\n{stderr}"
-        tail = (stderr.strip() or stdout.strip())[-2000:]
+        tail = combined.strip()[-2000:]
 
         # exit 124 is `timeout`'s own "still running when the clock ran
         # out" code -- expected for a pipeline we deliberately bound by
@@ -872,8 +880,9 @@ def _run_smoke_test(ctx: "Context", *, docker: bool) -> tuple[bool, str]:
             return False, tail
         if _ERROR_DIAGNOSTIC_RE.search(combined):
             return False, tail
-        if "PLAYING" not in combined.upper() and "PERF" not in combined.upper():
-            return False, "no PLAYING/perf output observed within the bounded run"
+        samples = [float(value) for value in _PERF_SAMPLE_RE.findall(combined)]
+        if not any(value > 0 for value in samples):
+            return False, "no positive FPS sample observed within the bounded run"
 
         return True, ""
     finally:

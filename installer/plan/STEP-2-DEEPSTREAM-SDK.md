@@ -389,8 +389,8 @@ method-aware.
 
 ### 7.3 Smoke test (DS 9.1 Quickstart)
 
-Prove the SDK actually runs a pipeline using a stock sample config, per the
-Quickstart. Sample configs live under
+**REQUIRED.** Prove the SDK actually moves frames through a pipeline based on
+the stock Quickstart assets. Sample configs live under
 `/opt/nvidia/deepstream/deepstream-9.1/samples/configs/deepstream-app/`.
 
 - Reference command (Quickstart):
@@ -400,21 +400,37 @@ Quickstart. Sample configs live under
   deepstream-app -c source30_1080p_dec_infer-resnet_tiled_display.txt
   ```
 
-- Headless/TTY constraint (the installer runs before a desktop session):
-  Step 2 uses a **fake-sink / EGL-less** smoke variant — render a copy of a
-  minimal sample config with the display `[sink0]` set to `type=1`
-  (fakesink) / `enable-perf-measurement=1`, run for a bounded number of
-  frames, and assert the app reaches PLAYING and emits perf/FPS output
-  without a DeepStream or GStreamer error-severity diagnostic, then exits 0
-  or the bounded run's timeout code. This includes GStreamer's prefixed
-  `ERROR` severity field and DeepStream's `ERROR:`, `ERROR from`, and
-  `[ERROR]` forms. Warning prose that contains the word `error` (for example,
-  TensorRT reporting an engine-cache open miss before rebuilding it) is not
-  itself a failure. This avoids requiring X/Wayland while still exercising
-  decode + nvinfer (TensorRT) + tracker on the real GPU.
+- **Sustained headless input:** the bundled **fakesink / EGL-less** variant
+  sets `[sink0] type=1`, `[tests] file-loop=1`,
+  `enable-perf-measurement=1`, and `perf-measurement-interval-sec=1`. The
+  NVIDIA sample video therefore remains active long enough to emit measurable
+  frame-flow evidence without requiring X/Wayland.
+- **Batch-one inference:** the bundled primary-GIE config pins both
+  `batch-size=1` and the SDK sample model's
+  `resnet18_trafficcamnet_pruned.onnx_b1_gpu0_fp16.engine` cache path. It must
+  not reference the stock 30-stream `b30` engine and then rebuild `b1` on
+  every smoke run.
+- **Configured tracker:** `[tracker]` points `ll-config-file` at the SDK's
+  supplied `config_tracker_IOU.yml`. An empty low-level tracker config and its
+  default-value warning are not an acceptable verification setup.
+- **Bounded, captured execution:** run `deepstream-app` under
+  `timeout --signal=INT --kill-after=5s 30s` and
+  `stdbuf -oL -eL`. The line buffering is inside the container for Method C.
+  Exit `0` and timeout exit `124` are eligible for success; every other exit
+  is a failure.
+- **Success evidence:** require at least one numeric `**PERF:` sample whose
+  instantaneous FPS is greater than zero. A `PLAYING` string, the interactive
+  `Runtime commands:` prompt, model-load success, or a performance-header line
+  alone does not prove that frames traversed the pipeline.
+- **Diagnostic gate:** reject GStreamer's prefixed `ERROR` severity field and
+  DeepStream's `ERROR:`, `ERROR from`, and `[ERROR]` forms even if positive
+  FPS was observed. Warning prose containing the word `error` — for example,
+  a TensorRT engine-cache open miss before a successful rebuild — is not
+  itself a failure.
 - Docker: the same smoke config is run inside the container with
   `--gpus all` and a fakesink; success criteria identical.
-- The smoke config is a bundled asset (doc 00 §4.2, `ctx.asset_path(...)`),
+- The smoke config is a bundled asset
+  ([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-and-staging-bundled-assets-at-runtime)),
   copied out to a run-scoped temp dir before execution.
 
 A failing smoke test → `FAILED` with the captured `deepstream-app` stderr tail
@@ -433,7 +449,8 @@ Step 1).
 - [ ] `update_rtpmanager.sh` executed; `ldconfig` run.
 - [ ] `/etc/profile.d/deepstream.sh` present (host installs) exporting
       `DEEPSTREAM_DIR` + DS `bin`/`lib` on `PATH`/`LD_LIBRARY_PATH`.
-- [ ] Smoke test reached PLAYING and exited 0.
+- [ ] Smoke test emitted a positive numeric FPS sample, contained no
+      error-severity diagnostic, and exited `0` or bounded-timeout `124`.
 
 ---
 
@@ -603,6 +620,12 @@ DeepStream **9.1** official documentation. DS 9.1 only.
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_docker_containers.html>
 - DS 9.1 `deepstream-app` reference (`--version` / `--version-all`):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_ref_app_deepstream.html>
+- DS 9.1 sample configurations — bundled TrafficCamNet model/config and
+  `config_tracker_IOU.yml` availability:
+  <https://docs.nvidia.com/metropolis/deepstream/9.1/text/DS_sample_configs_streams.html>
+- DS 9.1 performance guide — `enable-perf-measurement`, interval control, and
+  tracker configuration examples:
+  <https://docs.nvidia.com/metropolis/deepstream/9.1/text/DS_Performance.html>
 - DS 9.1 Release Notes (pins / breaking changes):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Release_notes.html>
 - NVIDIA/DeepStream GitHub Releases (deb/tar distribution, v9.1.0):
