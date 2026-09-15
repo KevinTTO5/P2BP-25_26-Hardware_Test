@@ -164,6 +164,7 @@ class FakeContext:
             phase=lambda number: None,
             task=lambda name: None,
             bytes=lambda done, total: None,
+            percent=lambda value, note=None: None,
             line=lambda text: None,
         )
 
@@ -781,13 +782,65 @@ def test_smoke_assets_pin_loop_perf_tracker_and_batch_one_engine():
     infer_config = (assets / "smoke_infer_config.txt").read_text(encoding="utf-8")
 
     assert "perf-measurement-interval-sec=1" in app_config
+    assert "gie-kitti-output-dir=smoke-output" in app_config
     assert "file-loop=1" in app_config
     assert "ll-config-file=" in app_config
     assert "config_tracker_IOU.yml" in app_config
+    assert "enable-batch-process" not in app_config
     assert "config-file=smoke_infer_config.txt" in app_config
     assert "onnx_b1_gpu0_fp16.engine" in infer_config
     assert "_b30_" not in infer_config
     assert "batch-size=1" in infer_config
+
+
+def test_smoke_accepts_detector_frame_output_when_perf_text_is_absent(
+    tmp_path, monkeypatch
+):
+    runner = ScriptedRunner()
+
+    def write_frame_output():
+        staged = pathlib.Path(runner.calls[-1][-1]).parent / step2._SMOKE_OUTPUT_DIR_NAME
+        (staged / "00_000000.txt").write_text("car", encoding="utf-8")
+
+    runner.when(
+        lambda a: a[:1] == ("timeout",),
+        returncode=124,
+        side_effect=write_frame_output,
+    )
+    ctx = FakeContext(tmp_path, runner_root=runner)
+
+    passed, message = step2._run_smoke_test(ctx, docker=False)
+
+    assert passed is True
+    assert message == ""
+
+
+def test_smoke_progress_uses_bounded_runtime_and_observed_frame_count(
+    tmp_path, monkeypatch
+):
+    runner = ScriptedRunner()
+    runner.when(lambda a: a[:1] == ("timeout",), returncode=124, stdout=PERF_OK)
+    ctx = FakeContext(tmp_path, runner_root=runner)
+    percentages = []
+    ctx.progress.percent = lambda value, note=None: percentages.append((value, note))
+
+    def run_observed(run, observe):
+        states = iter((True, False))
+        observe(lambda: next(states))
+        return run()
+
+    ctx.run_observed = run_observed
+    ticks = iter((100.0, 101.0))
+    monkeypatch.setattr(step2.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(step2.time, "sleep", lambda _seconds: None)
+
+    passed, message = step2._run_smoke_test(ctx, docker=False)
+
+    assert passed is True
+    assert message == ""
+    assert percentages[0][0] == pytest.approx(100 / 35, rel=0.01)
+    assert percentages[0][1] == "0 frame outputs observed"
+    assert percentages[-1] == (100.0, "0 frame outputs observed")
 
 
 @pytest.mark.parametrize("phrase", ["open error", "OPEN ERROR"])
@@ -1114,6 +1167,12 @@ def _api_call(args):
     )
 
 
+def _api_size_call(args):
+    return args[:1] == ("env",) and any(
+        str(arg).startswith("NGC_MODEL_SIZE_URL=") for arg in args
+    )
+
+
 def test_ensure_peoplenet_skips_when_already_present(tmp_path):
     runner_user = ScriptedRunner()  # unconfigured: any real call would fail
     ctx = FakeContext(tmp_path, runner_user=runner_user)
@@ -1177,6 +1236,24 @@ def test_ensure_peoplenet_downloads_and_places_model(tmp_path):
     assert any(arg.startswith("NGC_ENV_FILE=") for arg in call)
     assert "a-fake-ngc-key" not in " ".join(call)
     assert call[-1] == step2._NGC_API_DOWNLOAD_SCRIPT
+
+
+def test_peoplenet_probes_authenticated_archive_size_for_progress(tmp_path):
+    runner_user = ScriptedRunner(default_returncode=0)
+    runner_user.when(_api_size_call, stdout="4096")
+    runner_user.when(
+        _api_call,
+        side_effect=_api_download_side_effect(runner_user),
+    )
+    ctx = FakeContext(tmp_path, runner_user=runner_user)
+
+    result = step2._ensure_peoplenet_model(ctx)
+
+    assert result is None
+    size_call = next(call for call in runner_user.calls if _api_size_call(call))
+    assert any(arg.startswith("NGC_ENV_FILE=") for arg in size_call)
+    assert "a-fake-ngc-key" not in " ".join(size_call)
+    assert size_call[-1] == step2._NGC_API_CONTENT_LENGTH_SCRIPT
 
 
 def test_ensure_peoplenet_uses_conf_override_tag(tmp_path):

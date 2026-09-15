@@ -405,6 +405,11 @@ the stock Quickstart assets. Sample configs live under
   `enable-perf-measurement=1`, and `perf-measurement-interval-sec=1`. The
   NVIDIA sample video therefore remains active long enough to emit measurable
   frame-flow evidence without requiring X/Wayland.
+- **PeopleNet transfer visibility:** before an absent model is downloaded,
+  curl makes an authenticated HEAD request through its stdin config. A valid
+  final `Content-Length` drives byte, rate and ETA progress; an omitted or
+  invalid length falls back to elapsed-time activity rather than inventing a
+  denominator. An already-present model performs neither request.
 - **Batch-one inference:** the bundled primary-GIE config pins both
   `batch-size=1` and the SDK sample model's
   `resnet18_trafficcamnet_pruned.onnx_b1_gpu0_fp16.engine` cache path. It must
@@ -412,16 +417,23 @@ the stock Quickstart assets. Sample configs live under
   every smoke run.
 - **Configured tracker:** `[tracker]` points `ll-config-file` at the SDK's
   supplied `config_tracker_IOU.yml`. An empty low-level tracker config and its
-  default-value warning are not an acceptable verification setup.
+  default-value warning are not an acceptable verification setup. The app
+  config does not pass the removed `enable-batch-process` compatibility key.
 - **Bounded, captured execution:** run `deepstream-app` under
   `timeout --signal=INT --kill-after=5s 30s` and
   `stdbuf -oL -eL`. The line buffering is inside the container for Method C.
   Exit `0` and timeout exit `124` are eligible for success; every other exit
-  is a failure.
-- **Success evidence:** require at least one numeric `**PERF:` sample whose
-  instantaneous FPS is greater than zero. A `PLAYING` string, the interactive
-  `Runtime commands:` prompt, model-load success, or a performance-header line
-  alone does not prove that frames traversed the pipeline.
+  is a failure. The UI labels this separately from the PeopleNet phase and
+  shows elapsed progress across the bounded 35-second run-and-termination
+  budget, with the observed detector-frame count beside the bar.
+- **Success evidence:** require either a numeric `**PERF:` sample whose
+  instantaneous FPS is greater than zero or at least one per-frame detector
+  output written through `gie-kitti-output-dir`. The latter is direct evidence
+  that a frame traversed decode and primary inference and avoids treating a
+  missing console performance line as a pipeline failure. A `PLAYING` string,
+  the interactive `Runtime commands:` prompt, model-load success, or a
+  performance-header line alone does not prove that frames traversed the
+  pipeline.
 - **Diagnostic gate:** reject GStreamer's prefixed `ERROR` severity field and
   DeepStream's `ERROR:`, `ERROR from`, and `[ERROR]` forms even if positive
   FPS was observed. Warning prose containing the word `error` — for example,
