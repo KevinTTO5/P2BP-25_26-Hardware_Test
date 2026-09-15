@@ -900,6 +900,24 @@ def test_run_launches_when_operator_confirms(tmp_path, monkeypatch):
     assert ctx.runner_user.called_with_prefix("git", "clone")
 
 
+def test_installer_launch_keeps_amc_up_for_step4(tmp_path, monkeypatch):
+    ctx = FakeContext(tmp_path, non_interactive=False, runner_user=_passing_runner())
+    monkeypatch.setattr(step3, "ensure_container_prerequisites", lambda ctx: None)
+    monkeypatch.setattr(step3, "_INPUT", lambda _prompt: "y")
+    captured = {}
+
+    def fake_launch(ctx, **kwargs):
+        captured.update(kwargs)
+        return step3.StepResult(status=StepStatus.COMPLETE)
+
+    monkeypatch.setattr(step3, "launch_amc", fake_launch)
+    result = step3.Step3AmcLauncher().run(ctx)
+
+    assert result.status is StepStatus.COMPLETE
+    assert captured["keep_up"] is True
+    assert captured["_prereqs_ready"] is True
+
+
 def test_run_fails_on_repo_isolation_violation(tmp_path, monkeypatch):
     monkeypatch.setattr(step3, "repo_root", lambda: tmp_path / "home" / "op")
     ctx = FakeContext(tmp_path)

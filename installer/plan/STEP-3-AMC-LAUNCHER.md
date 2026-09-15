@@ -29,8 +29,10 @@ UI. It does not upload camera media, run calibration, or ingest results. Current
 result retrieval belongs to Step 4.
 
 `launch_amc(...)` is shared by the optional installer launch and the
-`mv3dt-installer amc` subcommand. Declining the immediate launch still completes
-the durable launcher installation.
+`mv3dt-installer amc` subcommand. The installer launch keeps AMC running after
+the browser closes so Step 4 can consume its API. A standalone `amc` launch
+retains close-to-stop behavior unless `--keep-up` is explicit. Declining the
+immediate launch still completes the durable launcher installation.
 
 ---
 
@@ -228,11 +230,12 @@ sudo -u <invoking-user> -H env <desktop-environment> <browser> ...
 The browser must never run as root. `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`,
 and `DBUS_SESSION_BUS_ADDRESS` are propagated when present.
 
-Normal window close, `SIGINT`, `SIGTERM`, and process exit converge on a
-run-once `docker compose down` guard. `--keep-up` and `--no-open` intentionally
-leave services running and do not arm an exit teardown. Headless interactive
-runs print the URL and wait for Enter; headless non-interactive runs print the
-URL and leave AMC running.
+For standalone launches, normal window close, `SIGINT`, `SIGTERM`, and process
+exit converge on a run-once `docker compose down` guard. `--keep-up`,
+`--no-open`, and the installer lifecycle handoff to Step 4 intentionally leave
+services running and do not arm an exit teardown. Headless interactive runs
+print the URL and wait for Enter; headless non-interactive runs print the URL
+and leave AMC running.
 
 ---
 

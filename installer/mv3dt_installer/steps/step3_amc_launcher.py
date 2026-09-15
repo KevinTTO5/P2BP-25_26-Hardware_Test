@@ -1563,7 +1563,10 @@ class Step3AmcLauncher:
         ctx.progress.phase(3)
         ctx.progress.task("launching AutoMagicCalib")
         result = launch_amc(
-            ctx, non_interactive=ctx.non_interactive, _prereqs_ready=True
+            ctx,
+            keep_up=True,
+            non_interactive=ctx.non_interactive,
+            _prereqs_ready=True,
         )
         if result.status is not StepStatus.COMPLETE:
             return result
