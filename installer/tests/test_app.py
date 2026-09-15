@@ -77,6 +77,8 @@ def _bypass_onboarding(monkeypatch, tmp_path: Path) -> None:
         ),
     )
     monkeypatch.setenv("NGC_API_KEY", "nvapi-test-key-do-not-use")
+    monkeypatch.setenv("CAM_USER", "admin")
+    monkeypatch.setenv("CAM_PASSWORD", "camera-test-password")
 
 
 # ---------------------------------------------------------------------------
@@ -1102,6 +1104,8 @@ def test_scan_cameras_calls_refresh_and_never_dispatches(tmp_path, monkeypatch):
     assert rc == 0
     assert captured["install_dir"] == install_dir
     assert captured["kwargs"]["non_interactive"] is True
+    assert captured["kwargs"]["cam_user"] == "admin"
+    assert captured["kwargs"]["cam_password"] == "camera-test-password"
 
 
 def test_scan_cameras_persists_cidr_and_iface_flags(tmp_path, monkeypatch):

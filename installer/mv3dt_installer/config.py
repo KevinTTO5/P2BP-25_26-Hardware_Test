@@ -102,6 +102,7 @@ __all__ = [
     "Config",
     "load",
     "persist_value",
+    "remove_values",
 ]
 
 # Mirrored file under the install dir (doc 00 §11.2's layout tree).
@@ -211,6 +212,18 @@ def persist_value(install_dir: "pathlib.Path | str", key: str, value: str) -> No
     values = _read_conf(conf_path)
     values[key] = value
     _write_conf(conf_path, values)
+
+
+def remove_values(install_dir: "pathlib.Path | str", *keys: str) -> None:
+    """Remove legacy or retired keys while preserving the remaining config."""
+    conf_path = pathlib.Path(install_dir) / CONF_FILENAME
+    values = _read_conf(conf_path)
+    changed = False
+    for key in keys:
+        if values.pop(key, None) is not None:
+            changed = True
+    if changed:
+        _write_conf(conf_path, values)
 
 
 def _resolve_install_dir(

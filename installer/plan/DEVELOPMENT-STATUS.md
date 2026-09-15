@@ -15,8 +15,8 @@ connected across the step modules.** A reader who finds `report.py` can
 reasonably conclude the diagnostic work is done. It is not.
 [Section 5](#5-what-remains) is the honest list.
 
-Current release: **v0.4.3**. Current version string:
-`installer/mv3dt_installer/__init__.py` `__version__ = "0.4.3"`.
+Current release: **v0.4.7**. Current version string:
+`installer/mv3dt_installer/__init__.py` `__version__ = "0.4.7"`.
 
 ---
 
@@ -240,7 +240,10 @@ calibration result:
 - Step 4 polls the persisted AMC project through its API, reports calibration
   errors, downloads the MV3DT result, rejects unsafe or malformed archives,
   requires a root `transforms.yml`, and atomically replaces the installed
-  calibration. Timer-driven re-ingest uses the same API path.
+  calibration. Camera credentials are captured once through onboarding and
+  stored outside `installer.conf`; a missing inventory triggers the initial
+  camera scan and position-binding flow automatically. Timer-driven re-ingest
+  uses the same API path.
 
 The remaining acceptance milestone is a live Ubuntu 24.04 workstation run
 through Steps 2, 3 and 4: complete a real AMC calibration in the launched UI
@@ -325,7 +328,7 @@ before it needs code.
 
 For the current state to be what this document claims:
 
-- [x] `python3 -m pytest tests/ -q` from `installer/` gives 1312 passed,
+- [x] `python3 -m pytest tests/ -q` from `installer/` gives 1322 passed,
       7 skipped and exactly the one environmental failure in
       [section 2.1](#21-test-suite) on arm64 macOS.
 - [ ] `grep` for `follow_apt` and `follow_download` finds the Step 1 and
@@ -334,7 +337,7 @@ For the current state to be what this document claims:
       `phase(len(phases))` — pinned by
       `tests/test_steps_protocol.py::test_every_step_declares_phases_that_match_the_indices_it_uses`.
 - [ ] `__version__` equals the most recent `v*` tag.
-- [x] `gh pr list --state open` is empty at the v0.4.3 release cut.
+- [x] `gh pr list --state open` is empty at the v0.4.7 release cut.
 
 ---
 
@@ -359,7 +362,7 @@ Settled exclusions, carried from [`08` §11](08-PROGRESS-AND-OBSERVABILITY.md#11
 ## References
 
 Facts in this document are drawn from the repository through release
-`v0.4.3` and from the workstation install runs of `mv3dt-installer`
+`v0.4.7` and from the workstation install runs of `mv3dt-installer`
 0.1.2 through 0.1.9, which are the source of the observed-failure inventory
 in [`08` §2](08-PROGRESS-AND-OBSERVABILITY.md#2-observed-failures-this-doc-exists-to-fix).
 Test counts and the arm64 failure list were produced by running the suite,

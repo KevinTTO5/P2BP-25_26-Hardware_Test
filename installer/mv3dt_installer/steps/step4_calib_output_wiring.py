@@ -147,7 +147,7 @@ def _configuration_action(
         CONF_MS_PORT_KEY,
     }
     missing_step3 = [key for key in missing if key in step3_keys]
-    missing_operator = [key for key in missing if key not in step3_keys]
+    missing_credentials = [key for key in missing if key not in step3_keys]
     if missing:
         parts.append(f"missing installer configuration: {', '.join(missing)}")
     if missing_step3:
@@ -163,19 +163,27 @@ def _configuration_action(
                 ),
             )
         )
-    if missing_operator:
+    if missing_credentials:
         actions.append(
             UserAction(
-                text=f"Set {', '.join(missing_operator)} in installer.conf.",
-                path=str(ctx.install_dir / config_mod.CONF_FILENAME),
+                text=(
+                    "Re-run the installer interactively to capture the camera "
+                    f"credentials ({', '.join(missing_credentials)})."
+                ),
             )
         )
     if camera_missing:
         parts.append("camera inventory is unavailable")
         actions.append(
             UserAction(
-                text="Discover and validate the camera inventory.",
-                command="sudo mv3dt-installer --scan-cameras",
+                text=(
+                    "Connect and activate the cameras, then re-run the installer. "
+                    "Use the scan command later when explicitly refreshing the fleet."
+                ),
+                command=(
+                    f"sudo {ctx.install_dir / 'bin' / step3_mod.INSTALLER_BIN_NAME} "
+                    "--resume"
+                ),
             )
         )
     return StepResult(
@@ -703,7 +711,50 @@ def _install_reingest_units(ctx: "Context", *, inputs: ProjectInputs) -> None:
 
 def _camera_inventory_missing(ctx: "Context") -> bool:
     value = ctx.conf.get(config_mod.CAMERAS_FILE_KEY)
-    return not value or not pathlib.Path(value).is_file()
+    if not value or not pathlib.Path(value).is_file():
+        return True
+    try:
+        return not _load_enabled_cameras(ctx)
+    except OSError:
+        return True
+
+
+def _discover_camera_inventory(ctx: "Context", inputs: ProjectInputs) -> bool:
+    """Run the first camera scan automatically; later refreshes use the CLI flag."""
+    seed_path = ctx.asset_path("cameras", "cameras.yml")
+    try:
+        seed_text = seed_path.read_text(encoding="utf-8")
+    except OSError:
+        seed_text = ""
+    seed_header = seed_text.split("\n\ncameras:", 1)[0]
+    prime_ips = [cam.ip for cam in cameras_mod.parse_inventory(seed_text) if cam.ip]
+
+    ctx.progress.task("discovering cameras and validating RTSP streams")
+    result = cameras_mod.refresh(
+        ctx.install_dir,
+        seed_header=seed_header,
+        cam_user=inputs.cam_user,
+        cam_password=inputs.cam_password,
+        cidr=ctx.conf.get(
+            config_mod.CAMERA_SCAN_CIDR_KEY, cameras_mod.DEFAULT_SCAN_CIDR
+        ),
+        interfaces=(
+            [ctx.conf[config_mod.CAMERA_SCAN_IFACE_KEY]]
+            if ctx.conf.get(config_mod.CAMERA_SCAN_IFACE_KEY)
+            else None
+        ),
+        prime_ips=prime_ips,
+        non_interactive=ctx.non_interactive,
+    )
+    if not any(camera.enabled for camera in result.cameras):
+        return False
+
+    inventory_path = ctx.install_dir / "cameras.yml"
+    config_mod.persist_value(
+        ctx.install_dir, config_mod.CAMERAS_FILE_KEY, str(inventory_path)
+    )
+    ctx.conf[config_mod.CAMERAS_FILE_KEY] = str(inventory_path)
+    return True
 
 
 def _wire_download(
@@ -745,8 +796,18 @@ class Step4CalibOutputWiring:
         ctx.progress.task("resolving AMC project and camera inputs")
         inputs, missing = resolve_project_inputs(ctx)
         camera_missing = _camera_inventory_missing(ctx)
-        if inputs is None or camera_missing:
+        if inputs is None:
             return _configuration_action(ctx, missing, camera_missing=camera_missing)
+        if camera_missing:
+            try:
+                camera_missing = not _discover_camera_inventory(ctx, inputs)
+            except (OSError, ValueError) as exc:
+                return StepResult(
+                    status=StepStatus.FAILED,
+                    message=f"automatic camera discovery failed: {exc}",
+                )
+            if camera_missing:
+                return _configuration_action(ctx, [], camera_missing=True)
         try:
             _load_enabled_cameras(ctx)
         except OSError as exc:

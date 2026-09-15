@@ -58,16 +58,21 @@ The following values are **REQUIRED** before polling begins:
 | `PROJECT_NAME` | Step 3 | operator-facing label and unit slug |
 | `AMC_PROJECT_ID` | Step 3 API response | exact AMC API resource |
 | `AUTO_MAGIC_CALIB_MS_PORT` | Step 3 | localhost API port |
-| `CAM_USER` | installer configuration | rendered RTSP credentials |
-| `CAM_PASSWORD` | installer configuration | rendered RTSP credentials |
+| `CAM_USER` | first-run camera credential capture | rendered RTSP credentials |
+| `CAM_PASSWORD` | first-run no-echo camera credential capture | rendered RTSP credentials |
 | `CAMERAS_FILE` | [`00` §15](00-FRAMEWORK-AND-BOOTSTRAP.md#15-camera-discovery) | enabled camera inventory |
 | `AMC_EXPORT_WAIT_S` | optional, default `3600` | bounded interactive wait |
 
-Missing required configuration and a missing camera inventory are reported in
-one consolidated `USER_ACTION_REQUIRED` result. Missing Step 3-owned values
+Missing required configuration is reported in one consolidated
+`USER_ACTION_REQUIRED` result. Missing Step 3-owned values
 direct the operator back through the automated Step 3 flow; they must never be
-invented by editing `AMC_PROJECT_ID` or an API port manually. The inventory
-action points to the installer camera-discovery mode:
+invented by editing `AMC_PROJECT_ID` or an API port manually. Camera
+credentials are captured and stored securely during onboarding. When the
+inventory is missing, Step 4 automatically runs camera discovery, RTSP
+validation, and one-time guided position binding. If no camera is found, the
+operator is asked to connect and activate the cameras and rerun the installer.
+
+The standalone mode remains the explicit refresh path after initial setup:
 
 ```bash
 sudo mv3dt-installer --scan-cameras
