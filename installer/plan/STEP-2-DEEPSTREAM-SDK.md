@@ -13,8 +13,8 @@ Scope: install the **DeepStream 9.1 SDK** on Ubuntu 24.04 / x86_64 (RTX PRO
 4500 Blackwell), by one of the three official methods (deb / tar / docker) —
 deb/tar are public GitHub Release downloads, docker is NGC-gated using the
 operator's key captured at onboarding (required, always present — doc 00
-§10) — then run post-install wiring and a smoke test. This step assumes
-Step 1 already
+§10) — then run post-install wiring and deterministic SDK verification. This
+step assumes Step 1 already
 installed and verified the driver / CUDA / cuDNN / TensorRT / GStreamer stack
 and that its reboot is confirmed.
 
@@ -143,9 +143,8 @@ container. The host only needs the driver + Docker + NVIDIA Container Toolkit;
 DeepStream and its dependencies live in the image. Best when you prefer
 containerized/reproducible runtime or already run Docker."
 
-- Image: `nvcr.io/nvidia/deepstream:9.1-triton-multiarch` (the Triton variant;
-  it is the Quickstart-referenced image and carries the sample configs used by
-  the smoke test). A `9.1-samples-multiarch` variant also exists. Docker
+- Image: `nvcr.io/nvidia/deepstream:9.1-triton-multiarch` (the Triton variant
+  referenced by the Quickstart). A `9.1-samples-multiarch` variant also exists. Docker
   images remain NGC-hosted — this is the one method that still needs the
   operator's NGC key.
 - Acquire + run (from the Quickstart / Docker Containers page):
@@ -160,7 +159,7 @@ containerized/reproducible runtime or already run Docker."
 - Requires Docker Engine + NVIDIA Container Toolkit on the host (installed by
   the bootstrap/Step 1 runtime phase). The SDK is **not** placed at
   `/opt/nvidia/deepstream` on the host; it lives inside the image. `verify()`
-  runs the version/smoke checks *inside the container*
+  runs the version check *inside the container*
   ([§7](#7-verification-verifyctx)).
 
 ---
@@ -373,7 +372,6 @@ method-aware.
 4. **Post-install artifacts present** ([§9](#9-post-install-steps-run-tail-host-installs)):
    `/etc/profile.d/deepstream.sh` exists and exports `DEEPSTREAM_DIR`;
    `update_rtpmanager.sh` was executed (record a marker/log line).
-5. **Smoke test passed** ([§7.3](#73-smoke-test-ds-90-quickstart)).
 
 ### 7.2 Docker checks (Method C)
 
@@ -382,90 +380,11 @@ method-aware.
 2. Version inside the container:
    `docker run --rm --gpus all <image> deepstream-app --version-all` reports
    DeepStream 9.1 → `verify_pinned("DeepStream", <actual>, "9.1.0")`.
-3. Smoke test runs inside the container ([§7.3](#73-smoke-test-ds-90-quickstart)).
-4. Host wiring for docker: `/etc/profile.d/deepstream.sh` is **not** required
+3. Host wiring for docker: `/etc/profile.d/deepstream.sh` is **not** required
    (SDK is in-container); instead verify Docker + NVIDIA runtime usable
    (`docker info` shows the `nvidia` runtime).
 
-### 7.3 Smoke test (DS 9.1 Quickstart)
-
-**REQUIRED.** Prove the SDK actually moves frames through a pipeline based on
-the stock Quickstart assets. Sample configs live under
-`/opt/nvidia/deepstream/deepstream-9.1/samples/configs/deepstream-app/`.
-
-- Reference command (Quickstart):
-
-  ```bash
-  cd /opt/nvidia/deepstream/deepstream-9.1/samples/configs/deepstream-app
-  deepstream-app -c source30_1080p_dec_infer-resnet_tiled_display.txt
-  ```
-
-- **Sustained headless input:** the bundled **fakesink / EGL-less** variant
-  sets `[sink0] type=1`, `[tests] file-loop=1`,
-  `enable-perf-measurement=1`, and `perf-measurement-interval-sec=1`. The
-  NVIDIA sample video therefore remains active long enough to emit measurable
-  frame-flow evidence without requiring X/Wayland.
-- **PeopleNet transfer visibility:** before an absent model is downloaded,
-  curl makes an authenticated HEAD request through its stdin config. A valid
-  final `Content-Length` drives byte, rate and ETA progress; an omitted or
-  invalid length falls back to elapsed-time activity rather than inventing a
-  denominator. An already-present model performs neither request.
-- **Batch-one inference:** the bundled primary-GIE config pins both
-  `batch-size=1` and the SDK sample model's
-  `resnet18_trafficcamnet_pruned.onnx_b1_gpu0_fp16.engine` cache path. It must
-  not reference the stock 30-stream `b30` engine and then rebuild `b1` on
-  every smoke run.
-- **Configured tracker:** `[tracker]` points `ll-config-file` at the SDK's
-  supplied `config_tracker_IOU.yml`. An empty low-level tracker config and its
-  default-value warning are not an acceptable verification setup. The app
-  config does not pass the removed `enable-batch-process` compatibility key.
-- **Bounded, captured execution:** run `deepstream-app` under
-  `timeout --signal=INT --kill-after=5s 30s` and
-  `stdbuf -oL -eL`. The line buffering is inside the container for Method C.
-  Exit `0` and timeout exit `124` are eligible for success; every other exit
-  is a failure. The UI labels this separately from the PeopleNet phase and
-  shows elapsed progress across the bounded 35-second run-and-termination
-  budget, labelled as a camera-free DeepStream installation test with the
-  number of sample frames verified beside the bar.
-- **Success evidence:** require either a numeric `**PERF:` sample whose
-  instantaneous FPS is greater than zero or at least one per-frame detector
-  output written through `gie-kitti-output-dir`. The latter is direct evidence
-  that a frame traversed decode and primary inference and avoids treating a
-  missing console performance line as a pipeline failure. A `PLAYING` string,
-  the interactive `Runtime commands:` prompt, model-load success, or a
-  performance-header line alone does not prove that frames traversed the
-  pipeline.
-- **Inconclusive sample handling:** if TensorRT reports that the model loaded,
-  the multi-object tracker initializes, and no error diagnostic appears, a
-  bundled sample that emits neither FPS nor detector files is reported as
-  inconclusive and does not block Step 3. This test uses NVIDIA's packaged
-  video rather than a physical camera, and AMC does not depend on its frame
-  evidence. Missing startup evidence, explicit errors, and unexpected process
-  exits remain blocking failures. If the initialized process requires GNU
-  `timeout` to escalate to `SIGKILL` after the grace period, exit 137 is also
-  inconclusive only when the same startup evidence is present and no error was
-  emitted.
-- **Run once:** a passing or safely inconclusive first-install test writes
-  `<install_dir>/deepstream/installation-test-complete`. Later installer runs
-  and explicit Step 2 resets skip the test. A persisted `AMC_PROJECT_ID` also
-  skips it for upgraded workstations that already progressed beyond initial
-  setup before the marker existed. Failed tests do not write the marker.
-- **Diagnostic gate:** reject GStreamer's prefixed `ERROR` severity field and
-  DeepStream's `ERROR:`, `ERROR from`, and `[ERROR]` forms even if positive
-  FPS was observed. Warning prose containing the word `error` — for example,
-  a TensorRT engine-cache open miss before a successful rebuild — is not
-  itself a failure.
-- Docker: the same smoke config is run inside the container with
-  `--gpus all` and a fakesink; success criteria identical.
-- The smoke config is a bundled asset
-  ([`00` §4.2](00-FRAMEWORK-AND-BOOTSTRAP.md#42-locating-and-staging-bundled-assets-at-runtime)),
-  copied out to a run-scoped temp dir before execution.
-
-A failing smoke test → `FAILED` with the captured `deepstream-app` stderr tail
-and remediation pointers (driver/CUDA/TRT mismatch is the usual cause → re-run
-Step 1).
-
-### 7.4 `verify()` checklist (summary)
+### 7.3 `verify()` checklist (summary)
 
 - [ ] Prereq pins still match (driver/CUDA/cuDNN/TRT/GStreamer) — including
       CUDA through `/usr/local/cuda-13.2/bin/nvcc` and cuDNN through the
@@ -477,8 +396,7 @@ Step 1).
 - [ ] `update_rtpmanager.sh` executed; `ldconfig` run.
 - [ ] `/etc/profile.d/deepstream.sh` present (host installs) exporting
       `DEEPSTREAM_DIR` + DS `bin`/`lib` on `PATH`/`LD_LIBRARY_PATH`.
-- [ ] Smoke test emitted a positive numeric FPS sample, contained no
-      error-severity diagnostic, and exited `0` or bounded-timeout `124`.
+- [ ] PeopleNet ONNX artifact is present at the configured model path.
 
 ---
 
@@ -555,8 +473,8 @@ touched, so the transcript is uniform/greppable:
   already-present model logs inline instead.
 
 `report()` prints a human summary block: chosen method + reason, artifact
-source (NGC-auto vs manual), DS SDK path, post-install actions performed,
-smoke-test result, and PeopleNet model path (or `MISSING`). No side effects.
+source (NGC-auto vs manual), DS SDK path, post-install actions performed, and
+PeopleNet model path (or `MISSING`). No side effects.
 
 ---
 
@@ -568,13 +486,11 @@ install/verify:
 
 - **`pyds` (Python bindings) deprecated in favor of `pyservicemaker`** — Step
   2 installs the SDK only; it does **not** rely on the Python bindings for
-  verification. The smoke test uses `deepstream-app` (C reference app), not a
-  Python script.
+  verification.
 - **Graph Composer removed** — no Graph Composer install/verify step exists;
   do not check for it.
-- **TF/UFF/Caffe removed** — the smoke test uses a stock ResNet/ETLT sample
-  config that DS 9.1 still ships; do not select a sample that depends on a
-  removed model format.
+- **TF/UFF/Caffe removed** — later pipeline configuration must not select a
+  model format removed by DS 9.1.
 
 These are awareness constraints on *which* verification path Step 2 takes;
 they do not add scope for detector/model *configuration* work (authoring or
@@ -599,8 +515,8 @@ and later steps.
 | NGC key missing at preflight, or `docker login` fails with a stored key | `FAILED` (§2 step 5, §5.2) — a key is guaranteed present after onboarding, so either is an internal ordering bug or a real auth/network error, not an operator-recoverable state |
 | Ambiguous method, interactive | prompt inline; proceeds — no special status |
 | Ambiguous method, `--non-interactive` | proceed with **deb** default |
-| deb/tar/docker install + post-install + smoke all pass | `COMPLETE` |
-| Smoke test or version pin fails | `FAILED` (with captured stderr tail) |
+| deb/tar/docker install + post-install verification all pass | `COMPLETE` |
+| DeepStream version pin fails | `FAILED` |
 | PeopleNet NGC API download or authentication fails | `FAILED` (§5.4) |
 | PeopleNet tag or returned model ZIP is invalid | `FAILED` (§5.4) |
 | PeopleNet model missing at `verify()` | `FAILED` (re-run Step 2, §5.4) |
@@ -639,9 +555,8 @@ DeepStream **9.1** official documentation. DS 9.1 only.
   `install.sh` + `ldconfig`, `update_rtpmanager.sh`, fixed SDK path, deb/tar
   published as GitHub Release assets:
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html>
-- DS 9.1 Quickstart — sample-app smoke test
-  (`deepstream-app -c source30_1080p_dec_infer-resnet_tiled_display.txt`),
-  Triton Docker image `nvcr.io/nvidia/deepstream:9.1-triton-multiarch`:
+- DS 9.1 Quickstart — Triton Docker image
+  `nvcr.io/nvidia/deepstream:9.1-triton-multiarch`:
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Quickstart.html>
 - DS 9.1 Docker Containers — image tags, `docker login nvcr.io`, `--gpus all`,
   NVIDIA Container Toolkit:

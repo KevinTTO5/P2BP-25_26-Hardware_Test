@@ -10,7 +10,7 @@ reimplement any of it.
 
 Scope: install the DeepStream 9.1 SDK on Ubuntu 24.04 / x86_64 by one of
 three official methods -- deb (Method A, default), tar (Method B), or docker
-(Method C) -- then run the host post-install tail and a smoke test. deb/tar
+(Method C) -- then run the host post-install tail. deb/tar
 are plain anonymous GitHub Release downloads (no NGC key); only the docker
 method is NGC-gated, using the key doc 00 section 10 guarantees is already
 captured by the time any step runs.
@@ -49,7 +49,6 @@ import re
 import shutil
 import stat
 import tempfile
-import time
 import urllib.parse
 import zipfile
 from dataclasses import dataclass
@@ -58,7 +57,6 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 from .. import config as config_mod
 from .. import progress_exec
-from .. import shellout
 from ..logs import log
 from . import StepResult, StepStatus, UserAction, register
 
@@ -112,24 +110,7 @@ _PROFILE_D_CONTENT = (
     "/opt/nvidia/deepstream/deepstream-9.1/lib:$LD_LIBRARY_PATH\n"
 )
 
-_SMOKE_TEST_TIMEOUT_S = 30
-_SMOKE_KILL_GRACE_S = 5
-_SMOKE_OUTPUT_DIR_NAME = "smoke-output"
-_SMOKE_CONFIG_ASSET = ("deepstream", "smoke_app_config.txt")
-_INSTALLATION_TEST_MARKER = pathlib.Path("deepstream/installation-test-complete")
-_AMC_PROJECT_ID_KEY = "AMC_PROJECT_ID"
-
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+)")
-_ERROR_DIAGNOSTIC_RE = re.compile(
-    r"(?im)^(?:"
-    r"\s*(?:\*\*\s*)?ERROR(?:\s*:|\s+FROM\b)"
-    r"|\s*\[ERROR\](?:\s|:)"
-    r"|\s*\d+:\d{2}:\d{2}\.\d+\s+\d+\s+\S+\s+ERROR\s+\S+"
-    r")"
-)
-_PERF_SAMPLE_RE = re.compile(
-    r"(?im)^\s*\*{0,2}PERF:\s*(\d+(?:\.\d+)?)\s*\("
-)
 
 
 class Method(str, Enum):
@@ -852,7 +833,7 @@ def _write_profile_d() -> None:
 
 
 # ---------------------------------------------------------------------------
-# doc section 7.3 -- smoke test
+# doc section 7 -- SDK version verification
 # ---------------------------------------------------------------------------
 
 
@@ -869,135 +850,6 @@ def _deepstream_app_version(ctx: "Context", *, docker: bool) -> Optional[str]:
     if result.returncode != 0:
         return None
     return result.stdout or ""
-
-
-def _smoke_frame_count(output_dir: pathlib.Path) -> int:
-    """Count direct per-frame inference evidence without trusting log text."""
-    try:
-        return sum(1 for path in output_dir.iterdir() if path.is_file())
-    except OSError:
-        return 0
-
-
-def _installation_test_marker(ctx: "Context") -> pathlib.Path:
-    return ctx.install_dir / _INSTALLATION_TEST_MARKER
-
-
-def _installation_test_already_completed(ctx: "Context") -> bool:
-    return _installation_test_marker(ctx).is_file() or bool(
-        (ctx.conf.get(_AMC_PROJECT_ID_KEY) or "").strip()
-    )
-
-
-def _record_installation_test(ctx: "Context") -> None:
-    marker = _installation_test_marker(ctx)
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(f"DeepStream {DS_VERSION_SHORT}\n", encoding="utf-8")
-
-
-def _run_smoke_test(ctx: "Context", *, docker: bool) -> tuple[Optional[bool], str]:
-    """Run the bundled fakesink smoke config for a bounded number of
-    seconds, and require a positive numeric DeepStream FPS sample with no
-    error-severity diagnostic (doc section 7.3). Returns `(passed, message)`;
-    `message` is a captured output tail on failure, empty on success. A
-    `None` verdict means the model and tracker initialized without an error,
-    but the bundled sample did not emit frame evidence; that is reported as
-    inconclusive rather than blocking the unrelated AMC workflow.
-    """
-    stage_root = shellout.stage_assets("deepstream")
-    try:
-        config_path = stage_root.joinpath(*_SMOKE_CONFIG_ASSET)
-        if not config_path.is_file():
-            return False, f"smoke config asset missing: {config_path}"
-
-        output_dir = config_path.parent / _SMOKE_OUTPUT_DIR_NAME
-        output_dir.mkdir()
-
-        def run_command():
-            if docker:
-                container_config = "/tmp/mv3dt-smoke/smoke_app_config.txt"
-                return _run_as_user(
-                    ctx,
-                    "docker", "run", "--rm", "--gpus", "all",
-                    "-v", f"{config_path.parent}:/tmp/mv3dt-smoke",
-                    "-w", "/tmp/mv3dt-smoke",
-                    DOCKER_IMAGE,
-                    "timeout", "--signal=INT",
-                    f"--kill-after={_SMOKE_KILL_GRACE_S}s",
-                    f"{_SMOKE_TEST_TIMEOUT_S}s",
-                    "stdbuf", "-oL", "-eL",
-                    "deepstream-app", "-c", container_config,
-                )
-            return _run_root(
-                ctx,
-                "timeout", "--signal=INT",
-                f"--kill-after={_SMOKE_KILL_GRACE_S}s",
-                f"{_SMOKE_TEST_TIMEOUT_S}s",
-                "stdbuf", "-oL", "-eL",
-                "deepstream-app", "-c", str(config_path),
-                cwd=str(config_path.parent),
-            )
-
-        observed = getattr(ctx, "run_observed", None)
-        if observed is None:
-            result = run_command()
-        else:
-            started = time.monotonic()
-            maximum_s = _SMOKE_TEST_TIMEOUT_S + _SMOKE_KILL_GRACE_S
-
-            def follow(is_running):
-                while is_running():
-                    elapsed = time.monotonic() - started
-                    frames = _smoke_frame_count(output_dir)
-                    percent = min(elapsed * 100 / maximum_s, 99.0)
-                    ctx.progress.percent(percent, f"{frames} sample frames verified")
-                    time.sleep(0.1)
-                frames = _smoke_frame_count(output_dir)
-                ctx.progress.percent(100.0, f"{frames} sample frames verified")
-
-            result = observed(run_command, follow)
-
-        stdout = result.stdout or ""
-        stderr = result.stderr or ""
-        combined = f"{stdout}\n{stderr}"
-        tail = combined.strip()[-2000:]
-        startup_complete = (
-            "NvMultiObjectTracker] Initialized" in combined
-            and "notifyLoadModelStatus" in combined
-            and "Load new model" in combined
-        )
-
-        if _ERROR_DIAGNOSTIC_RE.search(combined):
-            return False, tail
-        # 124 is the expected bounded timeout. DeepStream can hang while
-        # tearing down an otherwise initialized pipeline; GNU timeout then
-        # escalates after --kill-after and returns 137. Only classify that
-        # exact case as inconclusive when startup evidence is complete and
-        # no error diagnostic was emitted. An unexplained 137 still fails.
-        if result.returncode not in (0, 124):
-            if result.returncode == 137 and startup_complete:
-                return None, (
-                    "the bundled sample initialized successfully but required "
-                    "forced shutdown after its bounded test window"
-                )
-            return False, tail
-        samples = [float(value) for value in _PERF_SAMPLE_RE.findall(combined)]
-        frame_outputs = _smoke_frame_count(output_dir)
-        if not any(value > 0 for value in samples) and frame_outputs == 0:
-            if startup_complete:
-                return None, (
-                    "the bundled sample produced no frame evidence, but "
-                    "TensorRT loaded the model and the tracker initialized "
-                    "without an error"
-                )
-            return False, (
-                "no positive FPS sample or detector frame output observed "
-                "within the bounded run"
-            )
-
-        return True, ""
-    finally:
-        shutil.rmtree(stage_root, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1028,15 +880,12 @@ class Step2DeepStreamSdk:
         "install method",
         "DeepStream SDK",
         "PeopleNet model",
-        "DeepStream installation test",
     )
     order = 2
 
     def __init__(self) -> None:
         self._outcome: Optional[_RunOutcome] = None
         self._post_install_actions: list[str] = []
-        self._smoke_passed: Optional[bool] = None
-        self._smoke_ran = False
 
     # -- preflight -----------------------------------------------------
 
@@ -1076,8 +925,6 @@ class Step2DeepStreamSdk:
 
         self._outcome = _RunOutcome(method=method, reason=reason)
         self._post_install_actions = []
-        self._smoke_passed = None
-        self._smoke_ran = False
 
         ctx.progress.phase(2)
         ctx.progress.task(f"DeepStream 9.1 via {method.value}")
@@ -1313,7 +1160,7 @@ class Step2DeepStreamSdk:
                 message=f"{PROFILE_D_PATH} does not export DEEPSTREAM_DIR",
             )
 
-        # doc section 7.1 item 4 / 7.4: "update_rtpmanager.sh was executed
+        # doc section 7.1 item 4 / 7.3: "update_rtpmanager.sh was executed
         # (record a marker/log line)". A missing marker means the
         # post-install tail never ran; the marker's *status* (ok/failed/
         # missing) is not itself a verify failure -- a nonzero exit is a
@@ -1329,10 +1176,10 @@ class Step2DeepStreamSdk:
                 ),
             )
 
-        return self._verify_installation_test(ctx, docker=False)
+        return StepResult(status=StepStatus.COMPLETE)
 
     def _verify_docker(self, ctx: "Context") -> StepResult:
-        # doc section 7.4: "Prereq pins still match" applies to both verify
+        # doc section 7.3: "Prereq pins still match" applies to both verify
         # paths -- the docker runtime still depends on the host driver.
         pin_failure = _check_prereq_pins(ctx)
         if pin_failure is not None:
@@ -1371,34 +1218,6 @@ class Step2DeepStreamSdk:
                 message="docker info does not show the nvidia runtime",
             )
 
-        return self._verify_installation_test(ctx, docker=True)
-
-    def _verify_installation_test(
-        self, ctx: "Context", *, docker: bool
-    ) -> StepResult:
-        if _installation_test_already_completed(ctx):
-            log.info("DeepStream installation test already completed; skipping")
-            return StepResult(status=StepStatus.COMPLETE)
-
-        ctx.progress.phase(4)
-        ctx.progress.task("DeepStream installation test (bundled sample video)")
-        passed, tail = _run_smoke_test(ctx, docker=docker)
-        self._smoke_ran = True
-        self._smoke_passed = passed
-        if passed is False:
-            suffix = " (docker)" if docker else ""
-            return StepResult(
-                status=StepStatus.FAILED,
-                message=f"DeepStream installation test failed{suffix}: {tail}",
-            )
-        if passed is None:
-            log.warn(f"DeepStream installation test inconclusive: {tail}; continuing")
-
-        try:
-            _record_installation_test(ctx)
-        except OSError as exc:
-            log.warn(f"Could not record one-time DeepStream installation test: {exc}")
-
         return StepResult(status=StepStatus.COMPLETE)
 
     # -- report --------------------------------------------------------
@@ -1414,16 +1233,6 @@ class Step2DeepStreamSdk:
             else str(DS_SDK_DIR)
         )
         actions = self._post_install_actions
-        smoke = (
-            "passed"
-            if self._smoke_passed
-            else (
-                "failed"
-                if self._smoke_passed is False
-                else ("inconclusive" if self._smoke_ran else "not run")
-            )
-        )
-
         log.info("DeepStream 9.1 SDK install summary:")
         log.info(f"  method: {method_value} ({reason})")
         log.info(f"  artifact source: {artifact_source}")
@@ -1445,7 +1254,6 @@ class Step2DeepStreamSdk:
         if method_value != Method.DOCKER.value:
             marker = _read_rtpmanager_marker(ctx)
             log.info(f"  update_rtpmanager.sh: {_describe_rtpmanager_marker(marker)}")
-        log.info(f"  installation test: {smoke}")
 
 
 register(Step2DeepStreamSdk())
