@@ -594,6 +594,7 @@ def _download_peoplenet(
                 stream=True,
             ),
             task="PeopleNet model archive",
+            probe_content_length=False,
         )
         if result.returncode != 0 or not archive.is_file():
             return (
@@ -627,7 +628,12 @@ def _download_peoplenet(
                     os.replace(staged, target_dir / PEOPLENET_ONNX_NAME)
                 finally:
                     staged.unlink(missing_ok=True)
-        except (OSError, zipfile.BadZipFile) as exc:
+        except (
+            OSError,
+            NotImplementedError,
+            RuntimeError,
+            zipfile.BadZipFile,
+        ) as exc:
             return f"could not extract PeopleNet model archive: {exc}"
 
         return None

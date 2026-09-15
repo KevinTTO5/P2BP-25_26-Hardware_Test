@@ -1071,6 +1071,37 @@ def test_ensure_peoplenet_archive_without_onnx_is_failed(tmp_path):
     assert "contained 0 copies" in result.message
 
 
+@pytest.mark.parametrize(
+    "archive_error",
+    [
+        RuntimeError("password required"),
+        NotImplementedError("unsupported compression method"),
+    ],
+)
+def test_ensure_peoplenet_archive_read_error_is_failed(
+    tmp_path, monkeypatch, archive_error
+):
+    runner_user = ScriptedRunner(default_returncode=0)
+    runner_user.when(
+        _api_call,
+        returncode=0,
+        side_effect=_api_download_side_effect(runner_user),
+    )
+    ctx = FakeContext(tmp_path, runner_user=runner_user)
+    monkeypatch.setattr(
+        step2.shutil,
+        "copyfileobj",
+        lambda source, dest: (_ for _ in ()).throw(archive_error),
+    )
+
+    result = step2._ensure_peoplenet_model(ctx)
+
+    assert result is not None
+    assert result.status is StepStatus.FAILED
+    assert "could not extract PeopleNet model archive" in result.message
+    assert str(archive_error) in result.message
+
+
 def test_run_deb_already_installed_still_fetches_peoplenet(tmp_path):
     """run()'s DS-install shortcut (already-installed deb) must not skip
     the PeopleNet fetch -- doc STEP-4 section 6.3 makes it Step 2's job

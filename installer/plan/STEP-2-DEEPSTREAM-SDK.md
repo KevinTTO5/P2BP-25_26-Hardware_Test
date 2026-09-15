@@ -308,7 +308,10 @@ method was chosen.
      the invoking-user child shell. Send the `Authorization: Bearer` header to
      `curl` through standard input via `--config -`; the key never appears in
      argv, Python source, or the transcript. No NGC CLI, org prompt,
-     `~/.ngc/config`, or second key entry is involved.
+     `~/.ngc/config`, or second key entry is involved. The progress adapter
+     intentionally skips its separate unauthenticated content-length probe,
+     so this authenticated download remains entirely in the invoking-user
+     process and displays an activity spinner instead of a percentage bar.
   3. Read only the single `resnet34_peoplenet.onnx` member from the returned
      ZIP and atomically place it at the target location. No archive paths are
      extracted, preventing traversal through an unexpected member name.

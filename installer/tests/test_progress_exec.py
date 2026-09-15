@@ -136,6 +136,32 @@ def test_download_without_length_uses_spinner_not_bar(tmp_path, monkeypatch):
     assert ctx.progress.ticks >= 1
 
 
+def test_download_can_skip_the_content_length_probe(tmp_path, monkeypatch):
+    ctx = ObservedContext()
+    destination = tmp_path / "artifact.part"
+    monkeypatch.setattr(
+        progress_exec.progress,
+        "content_length",
+        lambda url: (_ for _ in ()).throw(AssertionError("unexpected probe")),
+    )
+
+    def run():
+        destination.write_bytes(b"payload")
+        return subprocess.CompletedProcess(["curl"], 0, "", "")
+
+    result = progress_exec.download(
+        ctx,
+        destination,
+        "https://example.invalid/authenticated-artifact",
+        run,
+        probe_content_length=False,
+    )
+
+    assert result.returncode == 0
+    assert ctx.progress.byte_counts == [(0, None)]
+    assert ctx.progress.ticks >= 1
+
+
 def test_download_keeps_legacy_fake_context_off_the_network(tmp_path, monkeypatch):
     ctx = SimpleNamespace(progress=RecordingProgress())
     monkeypatch.setattr(
