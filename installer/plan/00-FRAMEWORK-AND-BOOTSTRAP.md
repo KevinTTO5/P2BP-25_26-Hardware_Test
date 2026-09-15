@@ -995,7 +995,7 @@ Each step doc defines its own internals but consumes only the contracts above:
   (auto-detect or prompt) — deb/tar are public GitHub Release downloads, the
   docker image is NGC-gated using the key from §10 (always present after
   onboarding) — install-path, post-install (`update_rtpmanager.sh`,
-  `ldconfig`, `/etc/profile.d/deepstream.sh`), smoke test.
+  `ldconfig`, `/etc/profile.d/deepstream.sh`), version and model verification.
 - **Step 3 — AMC launcher (DevC):** docker compose AMC bring-up, open the
   localhost UI, keep the service up until the browser closes; standalone AMC
   exe dropped in `<install_dir>/bin/` (§11).
@@ -1364,7 +1364,7 @@ current release.
   `sudo apt-get install ./deepstream-9.1_9.1.0-1_amd64.deb`; deb/tar
   published as GitHub Release assets):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Installation.html>
-- DS 9.1 Quickstart (sample-app smoke test; Triton Docker image
+- DS 9.1 Quickstart (Triton Docker image
   `nvcr.io/nvidia/deepstream:9.1-triton-multiarch`):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Quickstart.html>
 - DS 9.1 `deepstream-app` reference:

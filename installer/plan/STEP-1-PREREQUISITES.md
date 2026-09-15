@@ -843,7 +843,7 @@ DeepStream 9.1 official documentation only. Reference DS 9.1 only.
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Overview.html>
 - DS 9.1 Release Notes:
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Release_notes.html>
-- DS 9.1 Quickstart (post-install sample-app smoke test — Step 2's concern):
+- DS 9.1 Quickstart (DeepStream startup and SDK usage reference):
   <https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Quickstart.html>
 
 Facts confirmed directly against the pages above:

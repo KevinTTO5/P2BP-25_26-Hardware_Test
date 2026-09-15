@@ -30,9 +30,6 @@ from mv3dt_installer.steps import step2_deepstream_sdk as step2  # noqa: E402
 PINS_OK = {
     "nvidia-smi": ("595.58.03\n", 0),
 }
-PERF_OK = "**PERF: FPS 0 (Avg)\n**PERF: 30.0 (30.0)\n"
-
-
 @pytest.fixture(autouse=True)
 def _reset_transcript_state():
     logs._transcript_path = None
@@ -589,7 +586,6 @@ def _host_ready_runner(*, version_ok=True, app_version_ok=True) -> ScriptedRunne
         stdout=f"Version: {step2.DS_VERSION_DEB if version_ok else '9.0.0-1'}\n",
     )
     version_stdout = "deepstream-app version 9.1.0\nDeepStreamSDK 9.1.0\n" if app_version_ok else "unknown\n"
-    runner.when(lambda a: a[:1] == ("timeout",), stdout=PERF_OK)
     runner.when(lambda a: a[:1] == ("deepstream-app",), stdout=version_stdout)
     return runner
 
@@ -651,7 +647,7 @@ def test_verify_host_fails_on_version_mismatch(tmp_path, _sdk_paths):
 
 
 def test_verify_host_fails_when_rtpmanager_marker_missing(tmp_path, _sdk_paths):
-    """doc section 7.1 item 4 / 7.4: verify() must fail if the
+    """doc section 7.1 item 4 / 7.3: verify() must fail if the
     post-install tail never left a marker behind, even when everything
     else (SDK, symlink, version, profile.d) looks installed."""
     sdk_dir, symlink, profile = _sdk_paths
@@ -687,281 +683,6 @@ def test_verify_host_passes_with_failed_rtpmanager_marker(tmp_path, _sdk_paths):
     assert result.status is StepStatus.COMPLETE
 
 
-def test_verify_host_fails_on_smoke_test_error(tmp_path, _sdk_paths):
-    sdk_dir, symlink, profile = _sdk_paths
-    runner = _host_ready_runner()
-    runner.when(lambda a: a[:1] == ("timeout",), returncode=1, stderr="ERROR: pipeline failed")
-    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
-    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
-
-    step = step2.Step2DeepStreamSdk()
-    result = step.verify(ctx)
-
-    assert result.status is StepStatus.FAILED
-    assert "installation test failed" in result.message
-
-
-def test_initialized_sample_without_frame_evidence_does_not_block_amc(
-    tmp_path, _sdk_paths, capsys
-):
-    """Regression for the workstation transcripts from v0.3.9 and v0.4.1."""
-    sdk_dir, symlink, profile = _sdk_paths
-    runner = _host_ready_runner()
-    fixture = pathlib.Path(__file__).with_name("fixtures").joinpath(
-        "step2_v039_no_perf.txt"
-    )
-    runner.when(
-        lambda a: a[:1] == ("timeout",),
-        returncode=137,
-        stdout=fixture.read_text(encoding="utf-8"),
-    )
-    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
-    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
-
-    step = step2.Step2DeepStreamSdk()
-    result = step.verify(ctx)
-
-    assert result.status is StepStatus.COMPLETE
-    assert step._smoke_ran is True
-    assert step._smoke_passed is None
-    assert step2._installation_test_marker(ctx).is_file()
-    assert "installation test inconclusive" in capsys.readouterr().err
-
-
-def test_completed_installation_test_is_not_repeated_after_step_reset(
-    tmp_path, _sdk_paths
-):
-    sdk_dir, symlink, profile = _sdk_paths
-    runner = _host_ready_runner()
-    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
-    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
-    step2._record_installation_test(ctx)
-
-    result = step2.Step2DeepStreamSdk().verify(ctx)
-
-    assert result.status is StepStatus.COMPLETE
-    assert not any(call[:1] == ("timeout",) for call in runner.calls)
-
-
-def test_existing_amc_project_skips_legacy_workstation_installation_test(
-    tmp_path, _sdk_paths
-):
-    sdk_dir, symlink, profile = _sdk_paths
-    runner = _host_ready_runner()
-    ctx = FakeContext(
-        tmp_path,
-        conf={"ds_install_method": "deb", "AMC_PROJECT_ID": "project-123"},
-        runner_root=runner,
-    )
-    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
-
-    result = step2.Step2DeepStreamSdk().verify(ctx)
-
-    assert result.status is StepStatus.COMPLETE
-    assert not any(call[:1] == ("timeout",) for call in runner.calls)
-
-
-def test_forced_timeout_shutdown_without_startup_evidence_is_a_failure(tmp_path):
-    runner = ScriptedRunner()
-    runner.when(lambda a: a[:1] == ("timeout",), returncode=137)
-    ctx = FakeContext(tmp_path, runner_root=runner)
-
-    passed, _ = step2._run_smoke_test(ctx, docker=False)
-
-    assert passed is False
-
-
-def test_smoke_accepts_timeout_only_with_positive_fps(tmp_path):
-    runner = ScriptedRunner()
-    runner.when(
-        lambda a: a[:1] == ("timeout",),
-        returncode=124,
-        stdout="**PERF: FPS 0 (Avg)\n**PERF: 0.0 (0.0)\n",
-    )
-    ctx = FakeContext(tmp_path, runner_root=runner)
-
-    passed, message = step2._run_smoke_test(ctx, docker=False)
-
-    assert passed is False
-    assert "no positive FPS sample" in message
-
-
-@pytest.mark.parametrize("returncode", [1, 125, 137])
-def test_smoke_rejects_non_success_exit_even_with_positive_fps(tmp_path, returncode):
-    runner = ScriptedRunner()
-    runner.when(
-        lambda a: a[:1] == ("timeout",),
-        returncode=returncode,
-        stdout=PERF_OK,
-    )
-    ctx = FakeContext(tmp_path, runner_root=runner)
-
-    passed, _ = step2._run_smoke_test(ctx, docker=False)
-
-    assert passed is False
-
-
-def test_host_smoke_uses_bounded_line_buffered_command(tmp_path):
-    runner = ScriptedRunner()
-    runner.when(lambda a: a[:1] == ("timeout",), returncode=124, stdout=PERF_OK)
-    ctx = FakeContext(tmp_path, runner_root=runner)
-
-    passed, _ = step2._run_smoke_test(ctx, docker=False)
-
-    assert passed is True
-    smoke_call = next(call for call in runner.calls if call[:1] == ("timeout",))
-    assert smoke_call[:9] == (
-        "timeout",
-        "--signal=INT",
-        "--kill-after=5s",
-        "30s",
-        "stdbuf",
-        "-oL",
-        "-eL",
-        "deepstream-app",
-        "-c",
-    )
-
-
-def test_smoke_assets_pin_loop_perf_tracker_and_batch_one_engine():
-    assets = (
-        pathlib.Path(step2.__file__).resolve().parents[1] / "assets" / "deepstream"
-    )
-    app_config = (assets / "smoke_app_config.txt").read_text(encoding="utf-8")
-    infer_config = (assets / "smoke_infer_config.txt").read_text(encoding="utf-8")
-
-    assert "perf-measurement-interval-sec=1" in app_config
-    assert "gie-kitti-output-dir=smoke-output" in app_config
-    assert "file-loop=1" in app_config
-    assert "ll-config-file=" in app_config
-    assert "config_tracker_IOU.yml" in app_config
-    assert "enable-batch-process" not in app_config
-    assert "config-file=smoke_infer_config.txt" in app_config
-    assert "onnx_b1_gpu0_fp16.engine" in infer_config
-    assert "_b30_" not in infer_config
-    assert "batch-size=1" in infer_config
-
-
-def test_smoke_accepts_detector_frame_output_when_perf_text_is_absent(
-    tmp_path, monkeypatch
-):
-    runner = ScriptedRunner()
-
-    def write_frame_output():
-        staged = pathlib.Path(runner.calls[-1][-1]).parent / step2._SMOKE_OUTPUT_DIR_NAME
-        (staged / "00_000000.txt").write_text("car", encoding="utf-8")
-
-    runner.when(
-        lambda a: a[:1] == ("timeout",),
-        returncode=124,
-        side_effect=write_frame_output,
-    )
-    ctx = FakeContext(tmp_path, runner_root=runner)
-
-    passed, message = step2._run_smoke_test(ctx, docker=False)
-
-    assert passed is True
-    assert message == ""
-
-
-def test_smoke_progress_uses_bounded_runtime_and_observed_frame_count(
-    tmp_path, monkeypatch
-):
-    runner = ScriptedRunner()
-    runner.when(lambda a: a[:1] == ("timeout",), returncode=124, stdout=PERF_OK)
-    ctx = FakeContext(tmp_path, runner_root=runner)
-    percentages = []
-    ctx.progress.percent = lambda value, note=None: percentages.append((value, note))
-
-    def run_observed(run, observe):
-        states = iter((True, False))
-        observe(lambda: next(states))
-        return run()
-
-    ctx.run_observed = run_observed
-    ticks = iter((100.0, 101.0))
-    monkeypatch.setattr(step2.time, "monotonic", lambda: next(ticks))
-    monkeypatch.setattr(step2.time, "sleep", lambda _seconds: None)
-
-    passed, message = step2._run_smoke_test(ctx, docker=False)
-
-    assert passed is True
-    assert message == ""
-    assert percentages[0][0] == pytest.approx(100 / 35, rel=0.01)
-    assert percentages[0][1] == "0 sample frames verified"
-    assert percentages[-1] == (100.0, "0 sample frames verified")
-
-
-@pytest.mark.parametrize("phrase", ["open error", "OPEN ERROR"])
-def test_verify_host_passes_when_warning_prose_contains_open_error(
-    tmp_path, _sdk_paths, phrase
-):
-    sdk_dir, symlink, profile = _sdk_paths
-    runner = _host_ready_runner()
-    runner.when(
-        lambda a: a[:1] == ("timeout",),
-        returncode=124,
-        stdout=f"Successfully loaded model engine\n{PERF_OK}",
-        stderr=(
-            "WARNING: Deserialize engine failed because file path "
-            f"model.engine {phrase}\n"
-        ),
-    )
-    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
-    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
-
-    result = step2.Step2DeepStreamSdk().verify(ctx)
-
-    assert result.status is StepStatus.COMPLETE
-
-
-def test_verify_host_fails_on_error_diagnostic_after_pipeline_started(
-    tmp_path, _sdk_paths
-):
-    sdk_dir, symlink, profile = _sdk_paths
-    runner = _host_ready_runner()
-    runner.when(
-        lambda a: a[:1] == ("timeout",),
-        returncode=124,
-        stdout=PERF_OK,
-        stderr="** ERROR: <pipeline> streaming stopped unexpectedly\n",
-    )
-    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
-    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
-
-    result = step2.Step2DeepStreamSdk().verify(ctx)
-
-    assert result.status is StepStatus.FAILED
-    assert "installation test failed" in result.message
-
-
-@pytest.mark.parametrize(
-    "diagnostic",
-    [
-        "0:00:01.234567890 1234 0x7f00 ERROR GST_PIPELINE pipeline failed\n",
-        "[ERROR] DeepStream pipeline failed\n",
-    ],
-)
-def test_verify_host_fails_on_prefixed_error_diagnostic(
-    tmp_path, _sdk_paths, diagnostic
-):
-    sdk_dir, symlink, profile = _sdk_paths
-    runner = _host_ready_runner()
-    runner.when(
-        lambda a: a[:1] == ("timeout",),
-        returncode=124,
-        stdout=PERF_OK,
-        stderr=diagnostic,
-    )
-    ctx = FakeContext(tmp_path, conf={"ds_install_method": "deb"}, runner_root=runner)
-    _make_sdk_tree(ctx, sdk_dir, symlink, profile)
-
-    result = step2.Step2DeepStreamSdk().verify(ctx)
-
-    assert result.status is StepStatus.FAILED
-    assert "installation test failed" in result.message
-
-
 def test_verify_host_passes_end_to_end(tmp_path, _sdk_paths):
     sdk_dir, symlink, profile = _sdk_paths
     runner = _host_ready_runner()
@@ -972,7 +693,6 @@ def test_verify_host_passes_end_to_end(tmp_path, _sdk_paths):
     result = step.verify(ctx)
 
     assert result.status is StepStatus.COMPLETE
-    assert step._smoke_passed is True
 
 
 def test_verify_tar_uses_short_version_pin(tmp_path, _sdk_paths):
@@ -1030,10 +750,6 @@ def test_verify_docker_passes_end_to_end(tmp_path):
         lambda a: a[:2] == ("docker", "run") and "deepstream-app" in a,
         stdout="deepstream-app version 9.1.0\n",
     )
-    runner_user.when(
-        lambda a: a[:2] == ("docker", "run") and "timeout" in a,
-        stdout=PERF_OK,
-    )
     runner_user.when(lambda a: a[:2] == ("docker", "info"), stdout="Runtimes: nvidia runc\n")
     ctx = FakeContext(
         tmp_path,
@@ -1047,27 +763,6 @@ def test_verify_docker_passes_end_to_end(tmp_path):
     result = step.verify(ctx)
 
     assert result.status is StepStatus.COMPLETE
-
-
-def test_docker_smoke_line_buffers_inside_mounted_workdir(tmp_path):
-    runner = ScriptedRunner()
-    runner.when(
-        lambda a: a[:2] == ("docker", "run"),
-        returncode=124,
-        stdout=PERF_OK,
-    )
-    ctx = FakeContext(tmp_path, runner_user=runner)
-
-    passed, _ = step2._run_smoke_test(ctx, docker=True)
-
-    assert passed is True
-    call = runner.calls[0]
-    assert call[:4] == ("docker", "run", "--rm", "--gpus")
-    workdir_index = call.index("-w")
-    assert ("-w", "/tmp/mv3dt-smoke") == call[workdir_index : workdir_index + 2]
-    assert ("stdbuf", "-oL", "-eL") == call[
-        call.index("stdbuf") : call.index("stdbuf") + 3
-    ]
 
 
 def test_verify_unrecognized_method_is_failed(tmp_path):
@@ -1151,7 +846,7 @@ def test_report_docker_method_omits_rtpmanager_line(tmp_path, capsys):
 def test_full_lifecycle_all_pass_is_complete(tmp_path, _sdk_paths):
     """preflight -> run -> verify, all COMPLETE, for a DeepStream 9.1 deb
     install already present (idempotent re-run) -- doc section 12's
-    "deb/tar/docker install + post-install + smoke all pass" row."""
+    "deb/tar/docker install + post-install verification all pass" row."""
     sdk_dir, symlink, profile = _sdk_paths
     sdk_dir.mkdir(parents=True)
     (sdk_dir / "version").write_text("DeepStream 9.1.0\n")
@@ -1164,7 +859,6 @@ def test_full_lifecycle_all_pass_is_complete(tmp_path, _sdk_paths):
         lambda a: a[:2] == ("dpkg", "-s") and a[-1] == "deepstream-9.1",
         stdout=f"Version: {step2.DS_VERSION_DEB}\n",
     )
-    runner_root.when(lambda a: a[:1] == ("timeout",), stdout=PERF_OK)
     runner_root.when(lambda a: a[:1] == ("deepstream-app",), stdout="deepstream-app version 9.1.0\n")
 
     ngc = FakeNgc()

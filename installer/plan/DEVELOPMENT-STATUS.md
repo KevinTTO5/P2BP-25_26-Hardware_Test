@@ -71,7 +71,7 @@ python3 -m pytest tests/ -q
 Current result on an **arm64 macOS** development machine:
 
 ```
-1 failed, 1324 passed, 7 skipped
+1 failed, 1305 passed, 7 skipped
 ```
 
 **The single failure is environmental, not a regression (REQUIRED to know
@@ -97,7 +97,7 @@ and register into `STEP_REGISTRY` at import.
 | Step | Module | Lines | Tests | Spec |
 |---|---|---|---|---|
 | 1 | `step1_prerequisites.py` | 1536 | 76 | [`STEP-1`](STEP-1-PREREQUISITES.md) |
-| 2 | `step2_deepstream_sdk.py` | 1451 | 82 | [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) |
+| 2 | `step2_deepstream_sdk.py` | 1259 | 63 | [`STEP-2`](STEP-2-DEEPSTREAM-SDK.md) |
 | 3 | `step3_amc_launcher.py` | 1652 | 91 | [`STEP-3`](STEP-3-AMC-LAUNCHER.md) |
 | 4 | `step4_calib_output_wiring.py` | 963 | 43 | [`STEP-4`](STEP-4-CALIB-OUTPUT-WIRING.md) |
 | 5 | `step5_per_project_exes.py` | 1578 | 69 | [`STEP-5`](STEP-5-PER-PROJECT-EXES.md) |
@@ -218,20 +218,15 @@ that is not obvious.
 Release v0.4.0 hardens the path from an installed DeepStream SDK to a wired
 calibration result:
 
-- Step 2 uses deterministic looped input, a batch-one inference engine and
-  tracker configuration, and requires a positive numeric FPS value before
-  its DeepStream smoke test passes. Release v0.4.1 separates that smoke test
-  from the PeopleNet phase, displays its bounded runtime as a camera-free
-  DeepStream installation test with verified sample-frame counts, and accepts
-  per-frame inference output as direct frame-flow evidence when DeepStream
-  omits console FPS text. An actual PeopleNet download uses authenticated
-  byte, rate and ETA progress
-  when NVIDIA declares the archive size. If the bundled sample produces no
-  frame evidence after the model and tracker initialize without errors, the
-  result is reported as inconclusive and does not block AMC. A successful or
-  safely inconclusive attempt writes a durable marker so this first-install
-  test is not repeated, even after an explicit Step 2 reset; an existing AMC
-  project identity also suppresses it on upgraded workstations.
+- Step 2 verifies the pinned prerequisite stack, installed DeepStream SDK and
+  version, host profile/post-install wiring, Docker runtime when selected, and
+  the PeopleNet artifact. The camera-free sample pipeline test was removed
+  after repeated false failures on the target RTX PRO 4500 workstation; Step
+  2 no longer downloads sample media, counts frames, waits on a runtime
+  timeout, or writes an installation-test marker. Real frame-flow validation
+  belongs to the calibrated production pipeline, not the installer gate. An
+  actual PeopleNet download retains authenticated byte, rate and ETA progress
+  when NVIDIA declares the archive size.
 - Step 3 installs Docker Engine, Compose v2 and the NVIDIA Container Toolkit
   when needed, checks out the pinned AutoMagicCalib 3.2.1 commit, validates
   container readiness, and persists the AMC location, project and API
@@ -244,8 +239,8 @@ calibration result:
   calibration. Timer-driven re-ingest uses the same API path.
 
 The remaining acceptance milestone is a live Ubuntu 24.04 workstation run
-through Steps 2, 3 and 4: observe positive DeepStream FPS, complete a real
-AMC calibration in the launched UI, and verify that Step 4 installs the
+through Steps 2, 3 and 4: complete a real AMC calibration in the launched UI
+and verify that Step 4 installs the
 exported `transforms.yml`. Unit tests and frozen-build CI cover the known
 failure branches, but do not replace that GPU and browser-backed run.
 
@@ -326,7 +321,7 @@ before it needs code.
 
 For the current state to be what this document claims:
 
-- [x] `python3 -m pytest tests/ -q` from `installer/` gives 1324 passed,
+- [x] `python3 -m pytest tests/ -q` from `installer/` gives 1305 passed,
       7 skipped and exactly the one environmental failure in
       [section 2.1](#21-test-suite) on arm64 macOS.
 - [ ] `grep` for `follow_apt` and `follow_download` finds the Step 1 and
