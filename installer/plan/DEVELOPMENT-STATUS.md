@@ -15,8 +15,8 @@ connected across the step modules.** A reader who finds `report.py` can
 reasonably conclude the diagnostic work is done. It is not.
 [Section 5](#5-what-remains) is the honest list.
 
-Current release: **v0.3.4**. Current version string:
-`installer/mv3dt_installer/__init__.py` `__version__ = "0.3.4"`.
+Current release: **v0.3.5**. Current version string:
+`installer/mv3dt_installer/__init__.py` `__version__ = "0.3.5"`.
 
 ---
 
@@ -70,23 +70,18 @@ python3 -m pytest tests/ -q
 Current result on an **arm64 macOS** development machine:
 
 ```
-5 failed, 1262 passed, 7 skipped
+1 failed, 1289 passed, 7 skipped
 ```
 
-**The 5 failures are environmental, not regressions (REQUIRED to know before
-you start).** They are architecture assertions that cannot pass off x86_64.
-The same suite passes fully in CI on x86_64 — the `installer-tests` workflow
-run for the v0.3.4 tag is green. The five are:
+**The single failure is environmental, not a regression (REQUIRED to know
+before you start).** The same suite passes fully in CI on x86_64 — the
+`installer-tests` workflow run for the v0.3.5 tag is green. The failure is:
 
-| Test | Why it fails off x86_64 |
+| Test | Why it fails on this host |
 |---|---|
-| `test_config.py::test_persist_value_preserves_existing_keys_and_overwrites_its_own` | Pre-existing; unrelated to arch but fails only on this machine |
-| `test_step2_deepstream_sdk.py::test_preflight_fails_on_prereq_pin_mismatch` | Step 2 preflight short-circuits on `x86_64 required (found arm64)` before reaching the assertion |
-| `test_step2_deepstream_sdk.py::test_preflight_fails_when_ngc_key_missing` | Same short-circuit |
-| `test_step2_deepstream_sdk.py::test_preflight_passes_when_everything_pinned` | Same short-circuit |
-| `test_step2_deepstream_sdk.py::test_full_lifecycle_all_pass_is_complete` | Same short-circuit |
+| `test_config.py::test_persist_value_preserves_existing_keys_and_overwrites_its_own` | The macOS temporary path contains `folders`, while the assertion rejects the substring `old` anywhere in the generated configuration |
 
-Treat **any sixth failure** as a regression you introduced.
+Treat **any second failure** as a regression you introduced.
 
 ---
 
@@ -327,7 +322,7 @@ Settled exclusions, carried from [`08` §11](08-PROGRESS-AND-OBSERVABILITY.md#11
 ## References
 
 Facts in this document are drawn from the repository through release
-`v0.3.4` and from the workstation install runs of `mv3dt-installer`
+`v0.3.5` and from the workstation install runs of `mv3dt-installer`
 0.1.2 through 0.1.9, which are the source of the observed-failure inventory
 in [`08` §2](08-PROGRESS-AND-OBSERVABILITY.md#2-observed-failures-this-doc-exists-to-fix).
 Test counts and the arm64 failure list were produced by running the suite,
